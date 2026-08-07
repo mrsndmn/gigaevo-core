@@ -23,6 +23,8 @@ class WatchdogConfig:
         model_drift_check: Whether to verify model identity each cycle.
         redis_host: Redis server hostname.
         redis_port: Redis server port.
+        redis_socket: Unix socket path; overrides host/port when set.
+            Defaults to $GIGAEVO_REDIS_SOCKET.
     """
 
     poll_interval_s: int = 3600
@@ -34,6 +36,7 @@ class WatchdogConfig:
     model_drift_check: bool = True
     redis_host: str = "localhost"
     redis_port: int = 6379
+    redis_socket: str | None = None
     plot_retries: int = 3
     plot_retry_delay_s: int = 30
     rolling_comment_threshold_hours: int = 24

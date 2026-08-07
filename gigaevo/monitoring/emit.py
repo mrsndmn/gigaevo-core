@@ -27,6 +27,7 @@ from typing import Any
 from loguru import logger
 
 from gigaevo.monitoring.events import BaseEvent
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 # Process-scoped counter configuration. Populated by
 # ``configure_event_counters`` at run startup; cleared by
@@ -76,9 +77,9 @@ def configure_event_counters_from_cfg(cfg: Any) -> None:
     import redis
 
     client = redis.Redis(
-        host=cfg.redis.host,
-        port=cfg.redis.port,
-        db=cfg.redis.db,
+        **redis_connect_kwargs(
+            cfg.redis.host, cfg.redis.port, cfg.redis.db, cfg.redis.get("socket")
+        )
     )
     configure_event_counters(client=client, prefix=prefix)
 

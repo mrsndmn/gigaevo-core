@@ -12,7 +12,7 @@ tb_config:
 
 redis_metrics_config:
   _target_: gigaevo.utils.trackers.configs.RedisMetricsConfig
-  redis_url: redis://${redis.host}:${redis.port}/${redis.db}
+  redis_url: ${redis_url:${redis.host},${redis.port},${redis.db},${redis.socket}}
   key_prefix: ${problem.name}:metrics
 
 writer:

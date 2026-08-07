@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from gigaevo.experiment.dry_run import dry_run
 from gigaevo.experiment.manifest import load_manifest
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 PROJ = Path(__file__).resolve().parent.parent.parent
 
@@ -235,7 +236,7 @@ def _check_redis_empty(results: list[CheckResult], m) -> None:
         redis_host = os.environ.get("REDIS_HOST", "localhost")
         redis_port = int(os.environ.get("REDIS_PORT", "6379"))
         for run in m.contract.runs:
-            r = redis.Redis(host=redis_host, port=redis_port, db=run.db)
+            r = redis.Redis(**redis_connect_kwargs(redis_host, redis_port, run.db))
             size = r.dbsize()
             if size > 0:
                 issues.append(f"DB {run.db}: {size} keys (flush first)")

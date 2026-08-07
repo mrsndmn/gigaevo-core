@@ -22,6 +22,7 @@ from gigaevo.problems.initial_loaders import InitialProgramLoader
 from gigaevo.programs.stages.python_executors.wrapper import default_exec_runner_pool
 from gigaevo.runner.dag_runner import DagRunner
 from gigaevo.utils.logger_setup import setup_logger
+from gigaevo.utils.redis_conn import build_redis_url, resolve_socket_path
 from gigaevo.utils.serve import serve_until_signal
 from gigaevo.utils.trackers.base import LogWriter
 
@@ -40,9 +41,13 @@ async def run_experiment(cfg: DictConfig) -> None:
         evolution_engine: EvolutionEngine = config_with_instances.evolution_engine
         writer: LogWriter = config_with_instances.writer
 
-        logger.info(
-            "Redis DB {} at {}:{}", cfg.redis.db, cfg.redis.host, cfg.redis.port
-        )
+        redis_socket = resolve_socket_path(cfg.redis.get("socket"))
+        if redis_socket:
+            logger.info("Redis DB {} at socket {}", cfg.redis.db, redis_socket)
+        else:
+            logger.info(
+                "Redis DB {} at {}:{}", cfg.redis.db, cfg.redis.host, cfg.redis.port
+            )
         configure_event_counters_from_cfg(cfg)
 
         await redis_storage.acquire_instance_lock()
@@ -51,9 +56,14 @@ async def run_experiment(cfg: DictConfig) -> None:
         resume = cfg.redis.get("resume", False)
 
         if has_data and not resume:
+            target = (
+                f"-s {redis_socket}"
+                if redis_socket
+                else f"-h {cfg.redis.host} -p {cfg.redis.port}"
+            )
             raise RuntimeError(
                 f"Redis database {cfg.redis.db} is not empty. "
-                f"Flush with: redis-cli -h {cfg.redis.host} -p {cfg.redis.port} "
+                f"Flush with: redis-cli {target} "
                 f"-n {cfg.redis.db} FLUSHDB  — or set redis.resume=true"
             )
 
@@ -163,7 +173,9 @@ def _maybe_start_live_frontier_compare(cfg: DictConfig, output_dir: Path) -> Non
             frontier_source,
         )
 
-    redis_url = f"redis://{cfg.redis.host}:{cfg.redis.port}/{cfg.redis.db}"
+    redis_url = build_redis_url(
+        cfg.redis.host, cfg.redis.port, cfg.redis.db, cfg.redis.get("socket")
+    )
     # The metrics tracker writes under "${problem.name}:metrics" — same as
     # the RedisMetricsConfig.key_prefix in config/logging/{tensorboard,wandb}.yaml.
     key_prefix = f"{cfg.problem.name}:metrics"

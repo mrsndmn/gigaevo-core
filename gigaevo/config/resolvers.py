@@ -4,6 +4,8 @@ import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from gigaevo.utils.redis_conn import build_redis_url
+
 
 def _ref_resolver(path, *, _root_):
     """
@@ -52,3 +54,8 @@ def register_resolvers() -> None:
     OmegaConf.register_new_resolver("merge", lambda x, y: x + y, replace=True)
     OmegaConf.register_new_resolver("len", lambda arr: len(arr), replace=True)
     OmegaConf.register_new_resolver("ref", _ref_resolver, replace=True)
+    # ``${redis_url:${redis.host},${redis.port},${redis.db},${redis.socket}}``
+    # yields a unix:// URL when redis.socket is set and redis:// otherwise.
+    # A plain string, so it round-trips through OmegaConf.to_container and
+    # needs no dry-run stub (unlike ${ref:...}).
+    OmegaConf.register_new_resolver("redis_url", build_redis_url, replace=True)

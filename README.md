@@ -94,6 +94,45 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 redis-server
 ```
 
+#### Connecting over a unix socket
+
+On a shared machine a Redis listening on loopback is reachable by every local
+user, so isolating it means setting a password. Connecting over a unix domain
+socket instead makes access a filesystem question: put the socket in a
+directory only you can enter and no password is needed anywhere.
+
+```conf
+# redis.conf — no TCP listener at all
+port 0
+unixsocket /home/me/.local/state/redis/gigaevo.sock
+unixsocketperm 700
+dir /home/me/.local/state/redis          # chmod 700; the RDB dump lands here
+maxmemory 256mb
+maxmemory-policy noeviction              # never silently drop stored programs
+```
+
+Point a run at it with `redis.socket`, which overrides `redis.host`/`redis.port`:
+
+```bash
+python run.py problem.name=heilbron \
+    redis.socket=/home/me/.local/state/redis/gigaevo.sock
+```
+
+The CLI takes `--redis-socket`, and both it and `redis.socket` fall back to the
+`GIGAEVO_REDIS_SOCKET` environment variable:
+
+```bash
+export GIGAEVO_REDIS_SOCKET=/home/me/.local/state/redis/gigaevo.sock
+gigaevo status
+redis-cli -s "$GIGAEVO_REDIS_SOCKET" ping
+```
+
+Exporting the variable is the recommended way to run socket-only, because it
+also covers components that take no connection config of their own (the LLM
+endpoint pool, the migration bus, `tools/`). With `port 0` set, anything still
+opening a TCP connection fails immediately rather than reaching some other
+server, so a missed component is loud rather than silent.
+
 ### 4. Run Evolution
 
 ```bash

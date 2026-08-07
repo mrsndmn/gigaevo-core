@@ -26,6 +26,7 @@ from gigaevo.monitoring.notifications import PlotAttachment, StatusUpdate
 from gigaevo.monitoring.snapshot import RunSnapshot
 from gigaevo.monitoring.watchdog_config import WatchdogConfig
 from gigaevo.monitoring.watchdog_plugin import WatchdogPlugin
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 _log = logger.bind(component="watchdog_engine")
 
@@ -219,9 +220,12 @@ class WatchdogEngine:
         if self._heartbeat_redis is None:
             try:
                 self._heartbeat_redis = redis_lib.Redis(
-                    host=self.config.redis_host,
-                    port=self.config.redis_port,
-                    db=0,
+                    **redis_connect_kwargs(
+                        self.config.redis_host,
+                        self.config.redis_port,
+                        0,
+                        self.config.redis_socket,
+                    ),
                     decode_responses=True,
                     socket_connect_timeout=5,
                 )

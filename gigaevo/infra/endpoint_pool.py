@@ -27,7 +27,18 @@ from loguru import logger
 import redis
 import redis.asyncio as aioredis
 
-_DEFAULT_REDIS_URL = "redis://localhost:6379/15"
+from gigaevo.utils.redis_conn import build_redis_url
+
+# DB 15 is this pool's own namespace, separate from the evolution run's DB.
+# Resolved lazily (not a module constant) so GIGAEVO_REDIS_SOCKET set after
+# import still routes the pool over the socket.
+_DEFAULT_REDIS_DB = 15
+
+
+def _default_redis_url() -> str:
+    return build_redis_url(db=_DEFAULT_REDIS_DB)
+
+
 _DEFAULT_COOLDOWN_SECS = 60
 
 # Lua script: atomically read inflight counts, filter cooldowns, pick
@@ -108,7 +119,7 @@ class EndpointPool:
         self,
         pool_name: str,
         endpoints: list[str],
-        redis_url: str = _DEFAULT_REDIS_URL,
+        redis_url: str | None = None,
         cooldown_secs: int = _DEFAULT_COOLDOWN_SECS,
         latency_weight: float = _DEFAULT_LATENCY_WEIGHT,
     ) -> None:
@@ -117,7 +128,7 @@ class EndpointPool:
         self._pool_name = pool_name
         self._endpoints = list(endpoints)
         self._cooldown_secs = cooldown_secs
-        self._redis_url = redis_url
+        self._redis_url = redis_url or _default_redis_url()
 
         # Keys
         self._inflight_key = f"llm_pool:{pool_name}:inflight"

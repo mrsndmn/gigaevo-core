@@ -24,6 +24,7 @@ import click
 import redis as redis_lib
 
 from gigaevo.cli.run_resolver import RunResolver
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 KIND_CHOICES = ("scalar", "hist", "text", "all")
 FORMAT_CHOICES = ("plain", "tsv", "json")
@@ -233,7 +234,8 @@ def metrics(
             r = redis_factory(spec.db)
         else:
             r = redis_lib.Redis(
-                host=redis_host, port=redis_port, db=spec.db, decode_responses=True
+                **redis_connect_kwargs(redis_host, redis_port, spec.db),
+                decode_responses=True,
             )
         try:
             key_prefix = f"{spec.prefix}:metrics"

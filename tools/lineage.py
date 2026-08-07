@@ -31,6 +31,7 @@ from gigaevo.database.redis_program_storage import (  # noqa: E402
 )
 from gigaevo.monitoring.run_spec import RunSpec  # noqa: E402
 from gigaevo.programs.program import Program  # noqa: E402
+from gigaevo.utils.redis_conn import build_redis_url
 
 
 async def _fetch_programs(url: str, prefix: str) -> list[Program]:
@@ -197,7 +198,7 @@ if memory is constrained.
 
     spec = RunSpec.parse(args.run)
     prefix, db, label = spec.prefix, spec.db, spec.label
-    url = f"redis://{args.redis_host}:{args.redis_port}/{db}"
+    url = build_redis_url(args.redis_host, args.redis_port, db)
 
     programs = asyncio.run(_fetch_programs(url, prefix))
     if not programs:

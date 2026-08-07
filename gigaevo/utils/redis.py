@@ -11,6 +11,7 @@ from gigaevo.database.redis_program_storage import (
     RedisProgramStorageConfig,
 )
 from gigaevo.programs.program import EXCLUDE_STAGE_RESULTS
+from gigaevo.utils.redis_conn import build_redis_url
 
 
 @dataclass
@@ -20,9 +21,12 @@ class RedisRunConfig:
     redis_db: int = 0
     redis_prefix: str = ""
     label: str = ""
+    redis_socket: str | None = None
 
     def url(self) -> str:
-        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
+        return build_redis_url(
+            self.redis_host, self.redis_port, self.redis_db, self.redis_socket
+        )
 
     def display_label(self) -> str:
         return self.label or f"{self.redis_prefix}@{self.redis_db}"

@@ -27,6 +27,7 @@ from gigaevo.programs.program import Program
 from gigaevo.programs.program_state import ProgramState
 from gigaevo.programs.stages.base import Stage
 from gigaevo.programs.stages.cache_handler import NO_CACHE
+from gigaevo.utils.redis_conn import SOCKET_ENV
 from gigaevo.utils.trackers.base import LogWriter
 
 register_resolvers()
@@ -179,6 +180,24 @@ class NeverCachedStage(Stage):
 
     async def compute(self, program: Program) -> MockOutput:
         return MockOutput(value=42)
+
+
+# ---------------------------------------------------------------------------
+# Connection-target isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _tcp_connection_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide a developer's GIGAEVO_REDIS_SOCKET from the suite.
+
+    Connection targets fall back to that variable (see gigaevo.utils.
+    redis_conn), so anyone running the tests while pointed at a socket-only
+    Redis would otherwise see unrelated assertions about default
+    ``redis://localhost:6379/0`` URLs fail. Tests that exercise socket mode
+    set the variable themselves.
+    """
+    monkeypatch.delenv(SOCKET_ENV, raising=False)
 
 
 # ---------------------------------------------------------------------------

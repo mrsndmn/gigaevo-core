@@ -5,6 +5,12 @@ redis:
   host: localhost
   port: 6379
   db: 0
+  # Path to a Redis unix domain socket. When set, host/port are ignored and
+  # every connection in the process goes over the socket, so access is
+  # governed by filesystem permissions instead of requirepass. Equivalent to
+  # exporting GIGAEVO_REDIS_SOCKET, which additionally covers call sites that
+  # hardcode a default URL (endpoint pool, balanced chat, tools/).
+  socket: null
   resume: false
   # Namespace for this run's Redis keys. Defaults to ${problem.name} so that
   # pipelines can write `${redis.prefix}` and get the same key-prefix used by
@@ -16,7 +22,7 @@ redis_storage:
   _target_: gigaevo.database.redis_program_storage.RedisProgramStorage
   config:
     _target_: gigaevo.database.redis_program_storage.RedisProgramStorageConfig
-    redis_url: redis://${redis.host}:${redis.port}/${redis.db}
+    redis_url: ${redis_url:${redis.host},${redis.port},${redis.db},${redis.socket}}
     key_prefix: ${problem.name}
     max_connections: ${redis_max_connections}
     connection_pool_timeout: ${redis_connection_pool_timeout}

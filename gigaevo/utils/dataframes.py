@@ -15,6 +15,7 @@ import pandas as pd
 import redis
 
 from gigaevo.utils.redis import RedisRunConfig  # noqa: F401
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 class OutlierMethod(StrEnum):
@@ -288,13 +289,19 @@ def prepare_iteration_dataframe(
 
 
 def fetch_frontier_from_redis(
-    redis_host: str, redis_port: int, redis_db: int, redis_prefix: str, metric_key: str
+    redis_host: str,
+    redis_port: int,
+    redis_db: int,
+    redis_prefix: str,
+    metric_key: str,
+    redis_socket: str | None = None,
 ) -> dict[int, float] | None:
     import json
 
     try:
         r = redis.Redis(
-            host=redis_host, port=redis_port, db=redis_db, decode_responses=True
+            **redis_connect_kwargs(redis_host, redis_port, redis_db, redis_socket),
+            decode_responses=True,
         )
         history_key = f"{redis_prefix}:metrics:history:program_metrics:valid/frontier/{metric_key}"
         entries = r.lrange(history_key, 0, -1)

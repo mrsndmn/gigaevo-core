@@ -9,6 +9,7 @@ import redis as redis_lib
 from gigaevo.monitoring.redis_queries import collect_snapshot
 from gigaevo.monitoring.run_spec import RunSpec
 from gigaevo.monitoring.snapshot import RunSnapshot
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 _log = logger.bind(component="experiment_monitor")
 
@@ -74,9 +75,9 @@ class ExperimentMonitor:
                 r = self._redis_factory(run_cfg.run_spec.db)
             else:
                 r = redis_lib.Redis(
-                    host=self._redis_host,
-                    port=self._redis_port,
-                    db=run_cfg.run_spec.db,
+                    **redis_connect_kwargs(
+                        self._redis_host, self._redis_port, run_cfg.run_spec.db
+                    ),
                     decode_responses=True,
                     socket_connect_timeout=5,
                 )

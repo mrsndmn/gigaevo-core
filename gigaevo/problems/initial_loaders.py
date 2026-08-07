@@ -11,6 +11,7 @@ from gigaevo.database.redis_program_storage import (
     RedisProgramStorageConfig,
 )
 from gigaevo.programs.program import Program
+from gigaevo.utils.redis_conn import build_redis_url
 
 
 class InitialProgramLoader(Protocol):
@@ -53,11 +54,13 @@ class RedisTopProgramsLoader:
         key_prefix: str,
         metric_key: str,
         higher_is_better: bool,
+        source_socket: str | None = None,
         top_n: int = 50,
         max_connections: int = 50,
         connection_pool_timeout: float = 30.0,
         health_check_interval: int = 60,
     ):
+        self.source_socket = source_socket
         self.source_host = source_host
         self.source_port = source_port
         self.source_db = source_db
@@ -72,7 +75,12 @@ class RedisTopProgramsLoader:
     async def load(self, storage: RedisProgramStorage) -> list[Program]:
         source = RedisProgramStorage(
             RedisProgramStorageConfig(
-                redis_url=f"redis://{self.source_host}:{self.source_port}/{self.source_db}",  # type: ignore[arg-type]  # pydantic validates str -> AnyUrl
+                redis_url=build_redis_url(
+                    self.source_host,
+                    self.source_port,
+                    self.source_db,
+                    self.source_socket,
+                ),
                 key_prefix=self.key_prefix,
                 max_connections=self.max_connections,
                 connection_pool_timeout=self.connection_pool_timeout,

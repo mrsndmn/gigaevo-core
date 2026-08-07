@@ -21,6 +21,7 @@ from loguru import logger
 from redis import asyncio as aioredis
 
 from gigaevo.adversarial.structured_logging import emit_tracker_write
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 @dataclass
@@ -69,7 +70,7 @@ class DGImprovementTracker:
         ttl_seconds: int = 86400,
     ):
         self._redis: aioredis.Redis = aioredis.Redis(
-            host=host, port=port, db=db, decode_responses=True
+            **redis_connect_kwargs(host, port, db), decode_responses=True
         )
         self._prefix = prefix
         self._ttl = ttl_seconds

@@ -37,6 +37,7 @@ from loguru import logger
 from redis import asyncio as aioredis
 
 from gigaevo.evolution.engine.snapshot import ENGINE_SNAPSHOT_KEY, EngineSnapshot
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 class ProgressBasedSyncHook:
@@ -146,9 +147,7 @@ class ProgressBasedSyncHook:
     def _get_redis(self, db: int) -> aioredis.Redis:  # type: ignore[type-arg]
         if db not in self._redis_clients:
             self._redis_clients[db] = aioredis.Redis(
-                host=self._host,
-                port=self._port,
-                db=db,
+                **redis_connect_kwargs(self._host, self._port, db),
                 decode_responses=True,
             )
         return self._redis_clients[db]

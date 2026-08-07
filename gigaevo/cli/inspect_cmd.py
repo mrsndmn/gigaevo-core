@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import click
 import redis
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 _LOCK_SUFFIX = ":__instance_lock__"
 
@@ -14,7 +15,9 @@ def discover_prefixes(
     db: int,
 ) -> list[str]:
     """Return experiment prefixes in a Redis DB by finding instance lock keys."""
-    r = redis.Redis(host=redis_host, port=redis_port, db=db, decode_responses=True)
+    r = redis.Redis(
+        **redis_connect_kwargs(redis_host, redis_port, db), decode_responses=True
+    )
     try:
         keys = r.keys(f"*{_LOCK_SUFFIX}")
     finally:

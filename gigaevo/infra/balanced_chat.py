@@ -23,9 +23,6 @@ from gigaevo.infra.endpoint_pool import EndpointPool
 from gigaevo.infra.pool_metrics import PoolMetricsTracker
 from gigaevo.utils.trackers.base import LogWriter
 
-_DEFAULT_REDIS_URL = "redis://localhost:6379/15"
-
-
 class BalancedChatOpenAI(ChatOpenAI):
     """ChatOpenAI that load-balances across multiple endpoints via Redis.
 
@@ -48,7 +45,7 @@ class BalancedChatOpenAI(ChatOpenAI):
         *,
         endpoints: list[str],
         pool_name: str = "mutation",
-        redis_url: str = _DEFAULT_REDIS_URL,
+        redis_url: str | None = None,
         cooldown_secs: int = 60,
         writer: LogWriter | None = None,
         **kwargs: Any,
