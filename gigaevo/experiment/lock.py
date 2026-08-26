@@ -21,6 +21,7 @@ from typing import Any
 import redis
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 def _make_rt_yaml() -> YAML:
@@ -73,7 +74,7 @@ def get_redis() -> redis.Redis:
         ) from None
 
     try:
-        r = redis.Redis(host=host, port=port, db=0)
+        r = redis.Redis(**redis_connect_kwargs(host, port, 0))
         r.ping()
         return r
     except (redis.ConnectionError, redis.TimeoutError, OSError) as e:

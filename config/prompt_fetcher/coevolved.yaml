@@ -17,5 +17,6 @@ prompt_fetcher:
   prompt_prefix: prompt_evolution         # prefix of the prompt evolution run
   host: ${redis.host}
   port: ${redis.port}
+  socket: ${redis.socket}
   cache_ttl_seconds: 30.0
   fallback_prompts_dir: ${prompts.dir}

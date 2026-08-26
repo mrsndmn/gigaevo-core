@@ -24,6 +24,7 @@ from gigaevo.adversarial.structured_logging import (
     emit_hof_rotate,
 )
 from gigaevo.evolution.strategies.utils import weighted_sample_without_replacement
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 def _softmax_weights(fitnesses: list[float]) -> list[float]:
@@ -168,9 +169,7 @@ class RedisOpponentArchiveProvider(OpponentArchiveProvider):
     def _get_redis(self, db: int) -> aioredis.Redis:  # type: ignore[type-arg]
         if db not in self._redis_clients:
             self._redis_clients[db] = aioredis.Redis(
-                host=self._host,
-                port=self._port,
-                db=db,
+                **redis_connect_kwargs(self._host, self._port, db),
                 decode_responses=True,
             )
         return self._redis_clients[db]

@@ -14,6 +14,7 @@ import yaml
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 def _load_metrics_yaml(problem_dir: str) -> dict[str, dict]:
@@ -43,7 +44,7 @@ def _fetch_trajectory_data(
 
     Returns (gen_mean_entries, frontier_entries) as lists of parsed JSON dicts.
     """
-    r = redis_lib.Redis(host=host, port=port, db=db)
+    r = redis_lib.Redis(**redis_connect_kwargs(host, port, db))
     try:
         gen_mean_entries: list[dict] = []
         raw_mean = r.lrange(

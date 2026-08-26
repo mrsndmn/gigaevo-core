@@ -11,6 +11,7 @@ import subprocess
 import time
 
 import redis as redis_lib
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 _REDIS_DB_RE = re.compile(r"redis\.db=(\d+)")
 
@@ -169,7 +170,7 @@ def warn_if_not_archived(db: int, before: int) -> None:
 
 
 def flush_db(db: int, host: str, port: int, dry_run: bool) -> bool:
-    r = redis_lib.Redis(host=host, port=port, db=db)
+    r = redis_lib.Redis(**redis_connect_kwargs(host, port, db))
     try:
         before = r.dbsize()
         if dry_run:

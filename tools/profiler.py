@@ -35,6 +35,7 @@ from gigaevo.programs.program import Program
 from gigaevo.programs.stages.python_executors.execution import (
     CallProgramFunctionWithFixedArgs,
 )
+from gigaevo.utils.redis_conn import build_redis_url
 
 # Configure minimal logging
 logger.remove()
@@ -1051,8 +1052,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GigaEvo Performance Profiler")
     parser.add_argument(
         "--redis-url",
-        default="redis://localhost:6379/15",
-        help="Redis URL for benchmarks (default: redis://localhost:6379/15)",
+        default=None,
+        help=(
+            "Redis URL for benchmarks (default: DB 15 on localhost, or the "
+            "unix socket in $GIGAEVO_REDIS_SOCKET when set)."
+        ),
     )
     parser.add_argument(
         "--skip-redis",
@@ -1061,4 +1065,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    asyncio.run(main(args.redis_url, args.skip_redis))
+    redis_url = args.redis_url or build_redis_url(db=15)
+    asyncio.run(main(redis_url, args.skip_redis))

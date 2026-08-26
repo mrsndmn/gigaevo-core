@@ -3,6 +3,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from gigaevo.utils.redis_conn import build_redis_url
+
 
 class TBConfig(BaseModel):
     logdir: Path
@@ -22,7 +24,7 @@ class WBConfig(BaseModel):
 class RedisMetricsConfig(BaseModel):
     """Configuration for Redis metrics backend."""
 
-    redis_url: str = Field(default="redis://localhost:6379/0")
+    redis_url: str = Field(default_factory=build_redis_url)
     key_prefix: str = Field(default="gigaevo:metrics")
 
     # Storage options

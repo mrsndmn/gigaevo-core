@@ -9,6 +9,7 @@ import pandas as pd
 import redis
 
 from gigaevo.utils.redis import RedisRunConfig, fetch_evolution_dataframe  # noqa: F401
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 class OutlierMethod(StrEnum):
@@ -413,7 +414,8 @@ def fetch_frontier_from_redis(
 
     try:
         r = redis.Redis(
-            host=redis_host, port=redis_port, db=redis_db, decode_responses=True
+            **redis_connect_kwargs(redis_host, redis_port, redis_db),
+            decode_responses=True,
         )
         # Format: program_metrics:valid:frontier:{metric_key}
         history_key = f"{redis_prefix}:metrics:history:program_metrics:valid/frontier/{metric_key}"

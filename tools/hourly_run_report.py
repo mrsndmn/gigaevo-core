@@ -21,6 +21,7 @@ import subprocess
 import sys
 
 import httpx
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 GIGAEVO = "/home/jovyan/.mlspace/envs/evo/bin/gigaevo"
 TECTONIC = "/home/user/conda/bin/tectonic"
@@ -76,7 +77,7 @@ def query_run(run: dict) -> dict:
     try:
         import redis
 
-        r = redis.Redis(host="localhost", port=6379, db=run["db"], socket_timeout=5)
+        r = redis.Redis(**redis_connect_kwargs(db=run["db"]), socket_timeout=5)
         dbsize = r.dbsize()
     except Exception as e:
         dbsize = f"err:{type(e).__name__}"

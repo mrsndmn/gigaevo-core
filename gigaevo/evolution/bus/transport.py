@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from pydantic import BaseModel
 import redis.asyncio as aioredis
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 if TYPE_CHECKING:
     from gigaevo.evolution.bus.topology import Topology
@@ -120,9 +121,7 @@ class RedisStreamTransport(Transport):
 
     async def start(self) -> None:
         self._redis = aioredis.Redis(
-            host=self._host,
-            port=self._port,
-            db=self._db,
+            **redis_connect_kwargs(self._host, self._port, self._db)
         )
         logger.info(
             "[MigrationBus] Transport started | run_id={} stream={} db={}",

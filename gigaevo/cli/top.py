@@ -10,6 +10,7 @@ import redis as redis_lib
 
 from gigaevo.cli.output_formatter import OutputFormatter
 from gigaevo.cli.run_resolver import RunResolver
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 def _fetch_top_programs(
@@ -128,7 +129,8 @@ def top(
             r = redis_factory(spec.db)
         else:
             r = redis_lib.Redis(
-                host=redis_host, port=redis_port, db=spec.db, decode_responses=True
+                **redis_connect_kwargs(redis_host, redis_port, spec.db),
+                decode_responses=True,
             )
         try:
             progs = _fetch_top_programs(r, spec.prefix, metric, top_n, minimize)

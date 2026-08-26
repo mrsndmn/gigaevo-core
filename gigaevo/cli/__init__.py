@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 import click
 
 from gigaevo.cli.output_formatter import OutputFormatter
+from gigaevo.utils.redis_conn import SOCKET_ENV, resolve_socket_path
 
 # Lazy subcommand registry: name -> (module_path, attr_name)
 _LAZY_SUBCOMMANDS: dict[str, tuple[str, str]] = {
@@ -117,6 +119,14 @@ class LazyGroup(click.Group):
 @click.option(
     "--redis-port", type=int, default=6379, help="Redis server port (default: 6379)."
 )
+@click.option(
+    "--redis-socket",
+    default=None,
+    help=(
+        "Path to a Redis unix socket; overrides --redis-host/--redis-port. "
+        f"Defaults to ${SOCKET_ENV}."
+    ),
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -127,6 +137,7 @@ def main(
     verbose: bool,
     redis_host: str,
     redis_port: int,
+    redis_socket: str | None,
 ) -> None:
     """GigaEvo CLI -- unified experiment monitoring and analysis.
 
@@ -174,4 +185,10 @@ def main(
     ctx.obj["runs"] = run
     ctx.obj["redis_host"] = redis_host
     ctx.obj["redis_port"] = redis_port
+    # Exported rather than threaded through ctx.obj: subcommands reach Redis
+    # via a dozen different helpers, and the environment variable is the one
+    # channel all of them already consult (gigaevo.utils.redis_conn).
+    if redis_socket:
+        os.environ[SOCKET_ENV] = redis_socket
+    ctx.obj["redis_socket"] = resolve_socket_path(redis_socket)
     ctx.obj["verbose"] = verbose

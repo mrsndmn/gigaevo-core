@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from gigaevo.prompts import load_prompt
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 from gigaevo.prompts.coevolution.stats import prompt_text_to_id
 
 if TYPE_CHECKING:
@@ -168,6 +169,7 @@ class GigaEvoArchivePromptFetcher(PromptFetcher):
         archive_prefix: str = "island_fitness_island",
         host: str = "localhost",
         port: int = 6379,
+        socket: str | None = None,
         cache_ttl_seconds: float = 30.0,
         fallback_prompts_dir: str | Path | None = None,
         fitness_key: str = "fitness",
@@ -178,6 +180,7 @@ class GigaEvoArchivePromptFetcher(PromptFetcher):
         self._archive_prefix = archive_prefix
         self._host = host
         self._port = port
+        self._socket = socket
         self._cache_ttl = cache_ttl_seconds
         self._fallback = FixedDirPromptFetcher(fallback_prompts_dir)
         self._fitness_key = fitness_key
@@ -200,9 +203,7 @@ class GigaEvoArchivePromptFetcher(PromptFetcher):
             import redis as sync_redis
 
             self._redis_main_sync: Any = sync_redis.Redis(
-                host=host,
-                port=port,
-                db=main_redis_db,
+                **redis_connect_kwargs(host, port, main_redis_db, socket),
                 decode_responses=True,
                 socket_connect_timeout=2,
                 socket_timeout=2,
@@ -236,9 +237,9 @@ class GigaEvoArchivePromptFetcher(PromptFetcher):
             import redis as sync_redis
 
             self._redis_sync = sync_redis.Redis(
-                host=self._host,
-                port=self._port,
-                db=self._prompt_redis_db,
+                **redis_connect_kwargs(
+                    self._host, self._port, self._prompt_redis_db, self._socket
+                ),
                 decode_responses=True,
                 socket_connect_timeout=2,
                 socket_timeout=2,

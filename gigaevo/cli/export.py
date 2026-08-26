@@ -17,6 +17,7 @@ import click
 import pandas as pd
 
 from gigaevo.cli.run_resolver import RunResolver
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 def _build_redis_config(run_config, redis_host: str, redis_port: int):
@@ -118,7 +119,8 @@ def _verify_prefixes_exist(
         import redis as redis_lib
 
         r = redis_lib.Redis(
-            host=redis_host, port=redis_port, db=spec.db, decode_responses=True
+            **redis_connect_kwargs(redis_host, redis_port, spec.db),
+            decode_responses=True,
         )
         try:
             probe = r.scan(0, match=f"{spec.prefix}:*", count=1)

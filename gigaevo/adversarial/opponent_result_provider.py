@@ -47,6 +47,7 @@ from gigaevo.programs.stages.python_executors.wrapper import (
     run_exec_runner,
 )
 from gigaevo.programs.utils import pickle_b64_deserialize
+from gigaevo.utils.redis_conn import redis_connect_kwargs
 
 
 class OpponentResultProvider(ABC):
@@ -171,9 +172,7 @@ class CachedOpponentResultProvider(OpponentResultProvider):
     def _get_redis(self, db: int) -> aioredis.Redis:
         if db not in self._clients:
             self._clients[db] = aioredis.Redis(
-                host=self._host,
-                port=self._port,
-                db=db,
+                **redis_connect_kwargs(self._host, self._port, db),
                 decode_responses=True,
             )
         return self._clients[db]
