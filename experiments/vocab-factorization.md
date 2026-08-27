@@ -174,6 +174,75 @@ Protocol caveat: the byte arm's 1.1110 is not a like-for-like win. Under the
 fixed-data protocol it received 5x the tokens and 5x the compute of every other
 arm, and it sees 1024 bytes of context against ~4,100-5,500 for the rest.
 
+## Study 2 — transplant onto a frozen Qwen3-1.7B
+
+Directly attacks the scale caveat above. Qwen3-1.7B's transformer body is
+frozen; only a new embedding table and heads train, on 241 MB of the same
+corpus (~56M tokens, ~51 min/arm on one A100). Grid in `configs.TRANSPLANTS`,
+runner `train_transplant.py`. Figure: `results/vocab_transplant.png`.
+
+| arm | init | BPB step0 | BPB final | d upper | d title | d lower | d randcase | embed | total params |
+|---|---|---|---|---|---|---|---|---|---|
+| orig-frozen | native | 0.7125 | 0.7125 | 0.305 | 0.118 | 0.039 | 1.001 | 311.2M | 1.721B |
+| orig-reinit | random | 4.9866 | 1.3318 | 2.770 | 0.534 | 0.118 | 1.680 | 311.2M | 1.721B |
+| bpe8k-t-random | random | 4.3854 | 1.3130 | 1.517 | 0.486 | 0.089 | 1.532 | 16.4M | 1.426B |
+| **bpe8k-t** | mean-of-pieces | 2.7078 | **0.7031** | 0.698 | 0.196 | 0.047 | 0.974 | 16.4M | 1.426B |
+| fact8k-nosuf-t | mean-of-pieces | 4.1309 | 0.7390 | 0.460 | **0.073** | **0.015** | 1.796 | 16.4M | 1.426B |
+
+**1. The transplant works, and beats the model it replaced.** `bpe8k-t` reaches
+0.7031 against the untouched pretrained 0.7125 — 1.3% *better* — with a 19x
+smaller embedding table, 295M fewer parameters (17% of the model), and one
+GPU-hour of embedding-only training. A domain-fit 8k vocabulary is enough to
+serve a frozen 1.7B body on this corpus.
+
+**2. Initialisation dominates, and "on the fly" does not work.** `bpe8k-t`
+(0.7031) vs `bpe8k-t-random` (1.3130) differ only in init: mean-of-pieces is
+worth 0.61 BPB, more than any vocabulary effect measured in either study. But
+zero-training transplant is not viable — the best step-0 BPB is 2.7078 against
+a 0.7125 reference. The heuristic init is a starting point, not an answer.
+
+**3. The control earned its place.** `orig-reinit` lands at 1.3318, nearly
+double the pretrained 0.7125. Measured against the pretrained model alone every
+transplant looks like a catastrophe; measured against the matched-init control,
+`bpe8k-t-random` already *wins* with 19x fewer embedding parameters. The
+pretrained embedding table is worth ~0.62 BPB that 53M tokens cannot rebuild —
+and that has nothing to do with which vocabulary is used.
+
+**4. Case factorization still buys robustness, at a higher price than at 33M.**
+`fact8k-nosuf-t` vs `bpe8k-t`: +5.1% clean BPB (0.739 vs 0.703) for d upper
+1.5x better, d title 2.7x better, d lower 3.1x better. Its d title (0.073) and
+d lower (0.015) beat even the untouched pretrained model.
+
+**5. Scale shrinks the headroom.** At 33M every baseline had d upper ≈ 2.0;
+pretrained Qwen3-1.7B has d upper = 0.305. A large pretrained model has already
+learned most of the case robustness the factorization supplies by construction.
+The factorization still beats a *retrofitted* vocabulary, but no longer beats
+the original model on ALL-UPPER — only on Title and lower.
+
+**6. randcase regressed and is now the worst arm** (1.796 vs 0.974 for
+`bpe8k-t`), the same verbatim-fallback limitation as study 1, and more costly
+here because the rest of the field improved.
+
+### Study 2 conclusions
+
+For shrinking an existing model's vocabulary: transplant a domain-fit BPE with
+mean-of-pieces init. 17% of parameters removed, BPB slightly *better*, about a
+GPU-hour. That is the deployable result, and it needs none of the factorization.
+
+The case factorization is a second-order effect at this scale: worth its 5% BPB
+only if Title/lower robustness is specifically valuable, or if the body will be
+unfrozen afterwards so the clean-BPB gap can close.
+
+Caveats specific to study 2: one seed. Qwen3 has near-certainly trained on ru/en
+Wikipedia, so `orig-frozen` is optimistic — but the body is shared across arms,
+so relative comparisons hold. Loss curves were still descending slowly at 53-59M
+tokens, so the gaps to the pretrained reference are upper bounds. **Only BPB was
+measured**: a transplanted model's downstream task quality is untested and is
+the obvious next check, since good BPB does not guarantee preserved
+instruction-following. Finally, freezing the body is a strict constraint;
+unfreezing LayerNorms or the top blocks is standard in transplant work and would
+likely close the remaining gap.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -214,3 +283,9 @@ stems into paradigm classes loses information rather than sharing it
 this corpus scale there is no generalization gap for a morphological prior to
 fill. It should only start paying in low-resource settings or on genuinely
 unseen words.
+- 2026-08-27 — Study 2: vocabulary transplant onto a frozen Qwen3-1.7B (5 arms,
+  ~4.5 GPU-hours). An 8k BPE with mean-of-pieces init beats the untouched
+  pretrained model on BPB (0.7031 vs 0.7125) with 295M fewer parameters. Init,
+  not vocabulary, is the dominant factor; zero-training transplant does not
+  work. Case factorization costs 5% BPB at this scale for 1.5-3x better case
+  robustness. Figure: `results/vocab_transplant.png`.

@@ -120,11 +120,54 @@ def runs_table(runs_dir: Path) -> tuple[str, str]:
     )
 
 
+def transplant_table(runs_dir: Path) -> str:
+    from experiments.vocab_factorization.configs import TRANSPLANTS
+
+    order = [t.name for t in TRANSPLANTS]
+    found = {}
+    for p in runs_dir.glob("*.json"):
+        d = json.loads(p.read_text())
+        found[d["experiment"]] = d
+    names = [n for n in order if n in found] + [n for n in found if n not in order]
+    if not names:
+        return ""
+
+    suites = ["typo1", "typo5", "lower", "upper", "title", "randcase"]
+    head = [
+        "experiment", "init", "BPB step0", "BPB final",
+        *[f"d {s}" for s in suites],
+        "vocab", "embed params", "total params", "steps", "minutes",
+    ]
+    rows = []
+    for n in names:
+        d = found[n]
+        p = d["params"]
+        rows.append([
+            n,
+            d["init"],
+            d["step0_clean_bpb"],
+            d["eval.clean"]["bpb"],
+            *[d[f"delta.{s}"] for s in suites],
+            d["heads"]["stem"],
+            p["embedding"] + p["output_heads"],
+            p["total"],
+            d["steps"],
+            round(d["train_seconds"] / 60, 1),
+        ])
+    return _table(head, rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--screen", type=Path, default=Path("results/screen.json"))
     ap.add_argument("--runs", type=Path, default=Path("results/runs"))
+    ap.add_argument("--transplant", type=Path, default=Path("results/transplant"))
     args = ap.parse_args()
+
+    if args.transplant.exists() and any(args.transplant.glob("*.json")):
+        print("## Transplant onto frozen Qwen3-1.7B\n")
+        print(transplant_table(args.transplant))
+        print()
 
     if args.screen.exists():
         print("## Training-free screen\n")
