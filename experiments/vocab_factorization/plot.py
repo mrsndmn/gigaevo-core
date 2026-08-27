@@ -80,7 +80,9 @@ def main() -> None:
         b.set_linewidth(1.5)
         b.set_edgecolor(SURFACE)
     for i, v in enumerate(vals):
-        ax1.text(v + max(vals) * 0.015, i, f"{v:.3f}", va="center", color=INK, fontsize=11)
+        ax1.text(
+            v + max(vals) * 0.015, i, f"{v:.3f}", va="center", color=INK, fontsize=11
+        )
     ax1.set_yticks(list(y))
     ax1.set_yticklabels([LABELS[a] for a in arms], fontsize=10.5, color=INK)
     ax1.invert_yaxis()
@@ -112,15 +114,25 @@ def main() -> None:
         # Direct labels are the relief for the contrast WARN on slots 3-5.
         for x, v in zip(xs, vs, strict=True):
             ax2.text(
-                x, v + 0.035, f"{v:.2f}", ha="center", va="bottom",
-                fontsize=7.4, color=INK2, rotation=90,
+                x,
+                v + 0.035,
+                f"{v:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=7.4,
+                color=INK2,
+                rotation=90,
             )
     ax2.set_xticks(range(len(SUITES)))
     ax2.set_xticklabels([SUITE_LABELS[s] for s in SUITES], fontsize=10.5, color=INK)
     ax2.set_ylabel("Δ bits per byte vs clean", fontsize=10.5, color=INK2)
     ax2.set_title(
         "B · Cost of corruption (lower is more robust)",
-        fontsize=13, color=INK, loc="left", pad=12, fontweight="bold",
+        fontsize=13,
+        color=INK,
+        loc="left",
+        pad=12,
+        fontweight="bold",
     )
     ax2.grid(axis="y", color=GRID, linewidth=0.8)
     ax2.set_axisbelow(True)
@@ -129,23 +141,30 @@ def main() -> None:
         ax2.spines[s].set_visible(False)
     ax2.spines["bottom"].set_color(GRID)
     ax2.tick_params(colors=INK2, length=0)
-    ax2.legend(
-        frameon=False, fontsize=10, ncol=2, loc="upper left", labelcolor=INK
+    ax2.legend(frameon=False, fontsize=10, ncol=2, loc="upper left", labelcolor=INK)
+    top = max(data[a][f"delta.{s}"] for a in arms for s in SUITES)
+    ax2.set_ylim(
+        min(0, min(data[a][f"delta.{s}"] for a in arms for s in SUITES)) - 0.05,
+        top * 1.30,
     )
-    top = max(
-        data[a][f"delta.{s}"] for a in arms for s in SUITES
-    )
-    ax2.set_ylim(min(0, min(data[a][f"delta.{s}"] for a in arms for s in SUITES)) - 0.05, top * 1.30)
 
     fig.suptitle(
         "Vocabulary factorization: case robustness is nearly free, morphology is not",
-        fontsize=14.5, color=INK, x=0.011, ha="left", y=0.985, fontweight="bold",
+        fontsize=14.5,
+        color=INK,
+        x=0.011,
+        ha="left",
+        y=0.985,
+        fontweight="bold",
     )
     fig.text(
-        0.011, 0.925,
+        0.011,
+        0.925,
         "33M-param LM, ru+en Wikipedia, identical 400 MB x 3 epochs per arm. "
         "Bits per byte sums every prediction head.",
-        fontsize=10, color=INK2, ha="left",
+        fontsize=10,
+        color=INK2,
+        ha="left",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.90))
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -184,3 +184,33 @@ arm, and it sees 1024 bytes of context against ~4,100-5,500 for the rest.
   less case damage. Suffix head and n-gram bag are negative results; added
   `fact8k-nosuf` after the first 9 runs showed it was the configuration the
   data pointed at. Figure: `results/vocab_factorization.png`.
+- 2026-08-27 — Post-hoc diagnosis of the suffix head (`dump_example.py`, plus
+  the entropy probes recorded below) and a methods figure built from real
+  tokenizer output: `results/vocab_factorization_method.png`.
+
+### Why the suffix head failed — measured, not guessed
+
+Three separable problems, only the first two of which are bugs:
+
+1. The head is **2.6x worse than a count table**. A plug-in `stem -> P(suffix)`
+   lookup scores 0.1114 bits/byte held-out; the trained head paid 0.2854 while
+   having strictly more information (context *and* stem). Cause: the head
+   computes `W·(h + E_stem[target])`, so the stem's contribution is a rank-512
+   read-off of a *tied* embedding table shaped almost entirely by the stem
+   loss. The head owns no parameters for the stem->suffix map.
+2. It **fires at every position**. 24.2% of tokens carry a real suffix
+   decision, yet ~35% of the head's budget goes to predicting "none here" at
+   the other 76%. Gating it to word-final positions would recover ~0.038.
+3. **The premise does not hold.** Splitting suffixes out made the stem head
+   only 0.034 bits/byte easier (1.1519 -> 1.1181), which is less than any
+   achievable suffix cost. Even an oracle count-quality head lands at 1.2871
+   against 1.2137 for no suffix head at all. Fixing (1) and (2) turns a -0.251
+   loss into roughly break-even; it never becomes a win.
+
+The morphology *inductive bias* framing also fails its own test: clustering
+stems into paradigm classes loses information rather than sharing it
+(H(suffix|stem) = 1.51 bits, H(suffix|128 classes) = 2.77), and only 4.0k of
+1.93M held-out suffix decisions involve a stem seen fewer than 50 times. At
+this corpus scale there is no generalization gap for a morphological prior to
+fill. It should only start paying in low-resource settings or on genuinely
+unseen words.
