@@ -71,8 +71,15 @@ def main() -> None:
         b.set_linewidth(1.5)
         b.set_edgecolor(SURFACE)
     ax1.scatter(
-        pre, y, marker="D", s=46, facecolors="none",
-        edgecolors=INK, linewidths=1.4, zorder=5, label="before training (step 0)",
+        pre,
+        y,
+        marker="D",
+        s=46,
+        facecolors="none",
+        edgecolors=INK,
+        linewidths=1.4,
+        zorder=5,
+        label="before training (step 0)",
     )
     for i, (v, p) in enumerate(zip(final, pre, strict=True)):
         # Nudge past the step-0 diamond when the two nearly coincide.
@@ -82,8 +89,12 @@ def main() -> None:
     if ref:
         ax1.axvline(ref, color=INK2, linewidth=1.1, linestyle=(0, (4, 3)), zorder=1)
         ax1.text(
-            ref + 0.07, -0.62, "pretrained reference",
-            fontsize=8.8, color=INK2, va="center",
+            ref + 0.07,
+            -0.62,
+            "pretrained reference",
+            fontsize=8.8,
+            color=INK2,
+            va="center",
         )
     ax1.set_yticks(y)
     ax1.set_yticklabels([LABELS[a] for a in arms], fontsize=10, color=INK)
@@ -116,15 +127,25 @@ def main() -> None:
             b.set_edgecolor(SURFACE)
         for x, v in zip(xs, vs, strict=True):
             ax2.text(
-                x, v + 0.03, f"{v:.2f}", ha="center", va="bottom",
-                fontsize=7.2, color=INK2, rotation=90,
+                x,
+                v + 0.03,
+                f"{v:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=7.2,
+                color=INK2,
+                rotation=90,
             )
     ax2.set_xticks(range(len(SUITES)))
     ax2.set_xticklabels([SUITE_LABELS[s] for s in SUITES], fontsize=10.5, color=INK)
     ax2.set_ylabel("Δ bits per byte vs clean", fontsize=10.5, color=INK2)
     ax2.set_title(
         "B · Cost of corruption (lower is more robust)",
-        fontsize=13, color=INK, loc="left", pad=12, fontweight="bold",
+        fontsize=13,
+        color=INK,
+        loc="left",
+        pad=12,
+        fontweight="bold",
     )
     ax2.grid(axis="y", color=GRID, linewidth=0.8)
     ax2.set_axisbelow(True)
@@ -140,13 +161,21 @@ def main() -> None:
     fig.suptitle(
         "Vocabulary transplant onto a frozen Qwen3-1.7B: 19x smaller embedding, "
         "no loss in bits-per-byte",
-        fontsize=14.5, color=INK, x=0.011, ha="left", y=0.985, fontweight="bold",
+        fontsize=14.5,
+        color=INK,
+        x=0.011,
+        ha="left",
+        y=0.985,
+        fontweight="bold",
     )
     fig.text(
-        0.011, 0.925,
+        0.011,
+        0.925,
         "Transformer body frozen; only the embedding table and heads train, on "
         "241 MB of ru+en Wikipedia (~56M tokens, ~51 min on one A100).",
-        fontsize=10, color=INK2, ha="left",
+        fontsize=10,
+        color=INK2,
+        ha="left",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.90))
     args.out.parent.mkdir(parents=True, exist_ok=True)

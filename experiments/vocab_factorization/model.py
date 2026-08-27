@@ -191,8 +191,10 @@ class FactorizedLM(nn.Module):
             hf = h
             if self.condition_on_stem:
                 # Teacher-forced conditioning on the stem actually being
-                # predicted at this position.
-                hf = h + self.emb["stem"](targets["stem"])
+                # predicted at this position. clamp() keeps masked targets
+                # (-100, used by the corrupted-context evaluator) in range;
+                # their loss is discarded by cross_entropy's ignore_index.
+                hf = h + self.emb["stem"](targets["stem"].clamp(min=0))
             for name in self.head_names:
                 if name == "stem":
                     continue

@@ -87,8 +87,46 @@ def restore_case(case: int, lowered: str) -> str:
     return lowered
 
 
-def segment(text: str) -> list[Span]:
-    """Split text into feature-annotated spans that concatenate back exactly."""
+def split_case_runs(word: str) -> list[tuple[int, str]] | None:
+    """Split a mixed-case word into maximal restorable case runs.
+
+    Greedy longest-restorable-prefix, so ``iPhone`` becomes
+    ``[(lower,'i'), (title,'Phone')]`` and ``rAnDoM`` becomes
+    ``[(lower,'r'), (title,'An'), (title,'Do'), (title,'M')]``.
+
+    Why this exists: classifying case per *word* forces anything unrestorable
+    onto the verbatim byte path, which shatters the word out of the stem
+    vocabulary entirely -- measured as the worst failure of the whole scheme
+    (d randcase 1.80, worse than plain BPE). Per-run classification keeps every
+    piece inside the vocabulary and stays byte-exact, because each run is
+    verified by ``classify_case`` before it is accepted.
+
+    Returns None only if some single character is itself unrestorable, which
+    keeps the verbatim path available as a last resort.
+    """
+    out: list[tuple[int, str]] = []
+    i, n = 0, len(word)
+    while i < n:
+        end = 0
+        case = CASE_LOWER
+        for j in range(n, i, -1):  # longest first; whole word hits on try one
+            c = classify_case(word[i:j])
+            if c != CASE_OTHER:
+                end, case = j, c
+                break
+        if end == 0:
+            return None
+        out.append((case, word[i:end]))
+        i = end
+    return out
+
+
+def segment(text: str, piece_case: bool = True) -> list[Span]:
+    """Split text into feature-annotated spans that concatenate back exactly.
+
+    ``piece_case`` selects per-run case classification for mixed-case words
+    (the default) rather than dropping the whole word to the verbatim path.
+    """
     spans: list[Span] = []
     for m in _PAT.finditer(text):
         raw = m.group()
@@ -97,16 +135,30 @@ def segment(text: str) -> list[Span]:
         if body and body[0].isalpha():
             case = classify_case(body)
             if case == CASE_OTHER:
-                # Not restorable from the lowercase form -- keep verbatim.
-                spans.append(
-                    Span(
-                        text=raw,
-                        kind=KIND_OTHER,
-                        space=space,
-                        case=CASE_OTHER,
-                        core=body,
+                runs = split_case_runs(body) if piece_case else None
+                if runs is None:
+                    # Not restorable at all -- keep verbatim.
+                    spans.append(
+                        Span(
+                            text=raw,
+                            kind=KIND_OTHER,
+                            space=space,
+                            case=CASE_OTHER,
+                            core=body,
+                        )
                     )
-                )
+                else:
+                    for k, (c, piece) in enumerate(runs):
+                        sp = space if k == 0 else 0
+                        spans.append(
+                            Span(
+                                text=(" " if sp else "") + piece,
+                                kind=KIND_WORD,
+                                space=sp,
+                                case=c,
+                                core=piece.lower(),
+                            )
+                        )
             else:
                 spans.append(
                     Span(
@@ -133,9 +185,9 @@ def rebuild_word(space: int, case: int, core: str) -> str:
     return (" " if space else "") + restore_case(case, core)
 
 
-def check_roundtrip(text: str) -> None:
+def check_roundtrip(text: str, piece_case: bool = True) -> None:
     """Raise if segmentation is not byte-exact. Cheap enough to run per corpus."""
-    spans = segment(text)
+    spans = segment(text, piece_case=piece_case)
     if desegment(spans) != text:
         raise AssertionError("segmentation is not lossless")
     for s in spans:

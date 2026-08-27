@@ -101,6 +101,45 @@ def _train_bpe(tok, corpus_iter: Iterable[str], vocab_size: int):
     return tok
 
 
+# Separator used only while training the stem BPE. It never occurs in NFC
+# Wikipedia text, so encode-time inputs are unaffected.
+_SEP = "\x00"
+
+
+def _train_bpe_spans(tok, span_iter: Iterable[str], vocab_size: int):
+    """Train the stem BPE on the exact span stream the encoder will emit.
+
+    The previous version fed the trainer a *type inventory* with multiplicity
+    capped at ``min(f, 32)``. BPE merge selection is frequency-driven, so
+    capping a word that occurs ten million times to look like one occurring 32
+    times scrambles the merge order -- and the plain-BPE arms were meanwhile
+    trained on raw text at natural frequency. That asymmetry cost the
+    factorized arms ~5% in tokens per byte.
+
+    Batching many spans into one string keeps the iterator cheap; a Split
+    pre-tokenizer on ``_SEP`` restores the one-span-per-unit boundary during
+    training, and the inference pre-tokenizer is put back before returning.
+    """
+    from tokenizers import Regex, pre_tokenizers, trainers
+
+    inference_pre = tok.pre_tokenizer
+    tok.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(Regex(_SEP), behavior="removed"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        show_progress=False,
+        special_tokens=[],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    )
+    tok.train_from_iterator(span_iter, trainer=trainer)
+    tok.pre_tokenizer = inference_pre
+    return tok
+
+
 # ---------------------------------------------------------------------------
 # Arms
 # ---------------------------------------------------------------------------
@@ -201,11 +240,19 @@ class FactorizedArm:
 
     kind = "factorized"
 
-    def __init__(self, tok, suffixes: list[str], name: str, use_suffix: bool = True):
+    def __init__(
+        self,
+        tok,
+        suffixes: list[str],
+        name: str,
+        use_suffix: bool = True,
+        piece_case: bool = True,
+    ):
         self.tok = tok
         self.suffixes = suffixes
         self.name = name
         self.use_suffix = use_suffix
+        self.piece_case = piece_case
         self.vocab_size = tok.get_vocab_size()
         self._suffix_id = {s: i + 1 for i, s in enumerate(suffixes)}
         self._by_len: dict[int, set[str]] = {}
@@ -233,8 +280,9 @@ class FactorizedArm:
         use_suffix: bool = True,
         min_distinct_stems: int = 50,
         name: str | None = None,
+        piece_case: bool = True,
     ) -> FactorizedArm:
-        word_freq, raw_freq = count_spans(corpus)
+        word_freq, _ = count_spans(corpus, piece_case=piece_case)
 
         suffixes = (
             _build_suffix_inventory(word_freq, n_suffix, min_distinct_stems)
@@ -243,28 +291,19 @@ class FactorizedArm:
         )
         suffix_set = set(suffixes)
 
-        # Stem BPE is trained on suffix-stripped cores plus raw spans, each as
-        # its own line so merges never cross a span boundary.
-        # Feed the trainer the type inventory with capped multiplicity: the
-        # cap keeps the iterator small while preserving the rough frequency
-        # ordering that decides which merges are learned.
-        def lines() -> Iterable[str]:
-            for w, f in word_freq.items():
-                stem = _strip_suffix(w, suffix_set) if use_suffix else w
-                for _ in range(min(f, 32)):
-                    yield stem
-            for r, f in raw_freq.items():
-                for _ in range(min(f, 32)):
-                    yield r
-
         tok = _new_bpe(use_regex=False)
-        _train_bpe(tok, lines(), vocab_size)
+        _train_bpe_spans(
+            tok,
+            _span_stream(corpus, use_suffix, suffix_set, piece_case),
+            vocab_size,
+        )
         suffix_tag = "" if use_suffix else "-nosuf"
         return cls(
             tok,
             suffixes,
             name or f"fact{vocab_size // 1000}k{suffix_tag}",
             use_suffix=use_suffix,
+            piece_case=piece_case,
         )
 
     # -- encode / decode ----------------------------------------------------
@@ -299,7 +338,7 @@ class FactorizedArm:
         stem: list[int] = []
         role: list[int] = []
         suffix: list[int] = []
-        for sp in segment(text):
+        for sp in segment(text, piece_case=self.piece_case):
             if sp.kind == KIND_WORD:
                 pieces, suf = self._split_word(sp.core)
                 if not pieces:  # empty core cannot happen, but stay total
@@ -380,6 +419,7 @@ class FactorizedArm:
                     "name": self.name,
                     "suffixes": self.suffixes,
                     "use_suffix": self.use_suffix,
+                    "piece_case": self.piece_case,
                 },
                 ensure_ascii=False,
             )
@@ -395,6 +435,7 @@ class FactorizedArm:
             meta["suffixes"],
             meta["name"],
             use_suffix=meta.get("use_suffix", True),
+            piece_case=meta.get("piece_case", True),
         )
 
 
@@ -446,12 +487,37 @@ def iter_chunks(text: str, size: int = 1 << 20) -> Iterable[str]:
         start = end + 1
 
 
-def count_spans(corpus: str) -> tuple[Counter, Counter]:
+def _span_stream(
+    corpus: str,
+    use_suffix: bool,
+    suffix_set: set[str],
+    piece_case: bool,
+    batch: int = 4096,
+) -> Iterable[str]:
+    """Yield the exact unit stream the encoder emits, NUL-separated in batches."""
+    buf: list[str] = []
+    for chunk in iter_chunks(corpus):
+        for s in segment(chunk, piece_case=piece_case):
+            if s.kind == KIND_WORD:
+                unit = _strip_suffix(s.core, suffix_set) if use_suffix else s.core
+            else:
+                unit = s.text
+            if _SEP in unit:  # cannot happen in NFC text; stay total anyway
+                continue
+            buf.append(unit)
+            if len(buf) >= batch:
+                yield _SEP.join(buf)
+                buf = []
+    if buf:
+        yield _SEP.join(buf)
+
+
+def count_spans(corpus: str, piece_case: bool = True) -> tuple[Counter, Counter]:
     """(word core frequencies, raw span frequencies) over a corpus."""
     word_freq: Counter[str] = Counter()
     raw_freq: Counter[str] = Counter()
     for chunk in iter_chunks(corpus):
-        for s in segment(chunk):
+        for s in segment(chunk, piece_case=piece_case):
             if s.kind == KIND_WORD:
                 word_freq[s.core] += 1
             else:

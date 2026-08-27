@@ -64,12 +64,19 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
 
     budget = args.train_mb * 1024 * 1024 if args.train_mb else tspec.train_bytes
     enc, train_bytes = get_tokens(
-        spec.arm, "train", budget, args.corpus, args.arms_dir, args.tokens_dir,
+        spec.arm,
+        "train",
+        budget,
+        args.corpus,
+        args.arms_dir,
+        args.tokens_dir,
         workers=args.workers,
     )
     n_tokens = len(enc)
 
-    model = transplant.TransplantLM(body, heads, d_model, tie_embeddings=True).to(device)
+    model = transplant.TransplantLM(body, heads, d_model, tie_embeddings=True).to(
+        device
+    )
     if spec.init == "native":
         init_stats = transplant.native_init(model, host_emb)
     elif spec.init == "random":
@@ -83,9 +90,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     seq = tspec.seq_len
     micro = spec.micro_batch
     accum = max(1, tspec.batch_tokens // (micro * seq))
-    steps = 0 if not spec.train else (
-        args.steps or int(n_tokens / tspec.batch_tokens)
-    )
+    steps = 0 if not spec.train else (args.steps or int(n_tokens / tspec.batch_tokens))
     print(
         f"[{spec.name}] arm={spec.arm} init={spec.init} heads={heads} "
         f"tokens={n_tokens / 1e6:.1f}M bytes={train_bytes / 1e6:.0f}MB "
@@ -209,8 +214,7 @@ def main() -> None:
     args = ap.parse_args()
 
     todo = (
-        TRANSPLANTS if args.all
-        else [TRANSPLANTS_BY_NAME[n] for n in (args.exp or [])]
+        TRANSPLANTS if args.all else [TRANSPLANTS_BY_NAME[n] for n in (args.exp or [])]
     )
     if not todo:
         raise SystemExit("pass --exp NAME [NAME ...] or --all")

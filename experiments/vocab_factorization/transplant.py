@@ -39,7 +39,9 @@ _CHUNK_VOCAB_THRESHOLD = 32000
 _CE_CHUNK = 4096
 
 
-def _ce_sum(h: torch.Tensor, weight: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _ce_sum(
+    h: torch.Tensor, weight: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
     """Summed cross-entropy of ``h @ weight.T`` against ``target``.
 
     For a large vocabulary the logits are produced in slices under
@@ -115,11 +117,17 @@ class TransplantLM(nn.Module):
             return {n: self.out[n](h) for n in self.head_names}
 
         hf = h.reshape(-1, self.d_model)
-        losses = {"stem": _ce_sum(hf, self.out["stem"].weight, targets["stem"].reshape(-1))}
+        losses = {
+            "stem": _ce_sum(hf, self.out["stem"].weight, targets["stem"].reshape(-1))
+        }
         if len(self.head_names) > 1:
             # Same teacher-forced conditioning as the from-scratch study, so the
             # two sets of numbers mean the same thing.
-            hc = (h + self.emb["stem"](targets["stem"])).reshape(-1, self.d_model)
+            # clamp() keeps masked targets (-100) in range; cross_entropy's
+            # ignore_index discards their loss.
+            hc = (h + self.emb["stem"](targets["stem"].clamp(min=0))).reshape(
+                -1, self.d_model
+            )
             for name in self.head_names:
                 if name != "stem":
                     losses[name] = _ce_sum(
@@ -197,7 +205,9 @@ def mean_of_pieces_init(
 
 
 @torch.no_grad()
-def random_init(model: TransplantLM, host_emb: torch.Tensor, verbose: bool = True) -> dict:
+def random_init(
+    model: TransplantLM, host_emb: torch.Tensor, verbose: bool = True
+) -> dict:
     """Gaussian init matched to the host table's per-element std."""
     std = float(host_emb.float().std())
     model.emb["stem"].weight.normal_(0.0, std)

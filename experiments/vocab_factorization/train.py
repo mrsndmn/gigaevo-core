@@ -40,6 +40,7 @@ from experiments.vocab_factorization.configs import (
     EXPERIMENTS_BY_NAME,
     Experiment,
 )
+from experiments.vocab_factorization.context_eval import eval_context_bpb
 from experiments.vocab_factorization.model import (
     LN2,
     FactorizedLM,
@@ -48,6 +49,9 @@ from experiments.vocab_factorization.model import (
 from experiments.vocab_factorization.prepare import build_text, encode_text, get_tokens
 
 EVAL_SUITES = ("clean", "typo1", "typo5", "lower", "upper", "title", "randcase")
+# Corrupted-context evaluation only makes sense for corruptions that leave the
+# text legible; whole-document case transforms are not "context damage".
+CTX_SUITES = ("clean", "typo1", "typo5", "typo10", "randcase")
 
 
 def _heads_arrays(enc, heads: dict[str, int]) -> dict[str, np.ndarray]:
@@ -280,6 +284,19 @@ def run(exp: Experiment, args) -> dict:
     clean = results["eval.clean"]["bpb"]
     for suite in EVAL_SUITES:
         results[f"delta.{suite}"] = results[f"eval.{suite}"]["bpb"] - clean
+
+    # Corrupted-context BPB: score CLEAN text after a corrupted prefix, so the
+    # model is never charged for reproducing noise. This is the only one of the
+    # robustness numbers that an input-side mechanism could move.
+    for suite in CTX_SUITES:
+        m = eval_context_bpb(
+            model, arm, valid_text, suite, seq, device, args.eval_batch
+        )
+        results[f"ctx.{suite}"] = m
+        print(f"[{exp.name}] ctx {suite:9s} bpb={m['bpb']:.4f}", flush=True)
+    ctx_clean = results["ctx.clean"]["bpb"]
+    for suite in CTX_SUITES:
+        results[f"ctxdelta.{suite}"] = results[f"ctx.{suite}"]["bpb"] - ctx_clean
 
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"{exp.name}.json").write_text(json.dumps(results, indent=2))

@@ -54,6 +54,7 @@ def build_arm(spec: ArmSpec, corpus: str):
             spec.vocab_size,
             n_suffix=spec.n_suffix,
             use_suffix=spec.use_suffix,
+            piece_case=spec.piece_case,
             name=spec.name,
         )
     raise ValueError(f"unknown arm kind {spec.kind!r}")

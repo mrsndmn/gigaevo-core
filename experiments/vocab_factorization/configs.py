@@ -24,6 +24,9 @@ class ArmSpec:
     vocab_size: int = 0
     n_suffix: int = 256
     use_suffix: bool = True
+    # Per-run case classification for mixed-case words instead of dropping the
+    # whole word to the verbatim byte path. False reproduces the original arms.
+    piece_case: bool = False
     note: str = ""
 
 
@@ -49,6 +52,27 @@ ARMS: list[ArmSpec] = [
         note="space + case only at half the vocab -- added after the first "
         "grid showed vocab size barely moves BPB while the suffix head costs "
         "a lot, which makes this the configuration the results point at",
+    ),
+    # --- round 2: the two fixes, isolated then combined ---------------------
+    # Both are rebuilt with the corrected stem-BPE training (natural span
+    # frequency instead of min(f,32)-capped types). fact8k-nosuf above keeps
+    # the old cached tokenizer, so it remains the honest before-picture.
+    ArmSpec(
+        "fact8k-freqfix",
+        "factorized",
+        8000,
+        use_suffix=False,
+        piece_case=False,
+        note="fix 1 only: stem BPE trained at natural span frequency",
+    ),
+    ArmSpec(
+        "fact8k-v2",
+        "factorized",
+        8000,
+        use_suffix=False,
+        piece_case=True,
+        note="fix 1 + fix 2: natural-frequency BPE and per-run case, which "
+        "removes the verbatim fallback that made randcase the worst suite",
     ),
 ]
 
@@ -143,6 +167,9 @@ EXPERIMENTS: list[Experiment] = [
     _exp("byte", "byte", "robustness ceiling"),
     # --- follow-up: the config the first grid's results point at -----------
     _exp("fact8k-nosuf", "fact8k-nosuf", "half vocab, case+space, no suffix head"),
+    # --- round 2: the two tokenizer fixes ----------------------------------
+    _exp("fact8k-freqfix", "fact8k-freqfix", "fix 1: natural-frequency stem BPE"),
+    _exp("fact8k-v2", "fact8k-v2", "fix 1 + fix 2: + per-run case classification"),
 ]
 
 EXPERIMENTS_BY_NAME = {e.name: e for e in EXPERIMENTS}
@@ -195,23 +222,39 @@ class TransplantSpec:
 # isolates the init itself.
 TRANSPLANTS: list[TransplantSpec] = [
     TransplantSpec(
-        "orig-frozen", HOST_ARM, "native", train=False, micro_batch=8,
+        "orig-frozen",
+        HOST_ARM,
+        "native",
+        train=False,
+        micro_batch=8,
         note="pretrained model untouched — gold reference, eval only",
     ),
     TransplantSpec(
-        "orig-reinit", HOST_ARM, "random", micro_batch=8,
+        "orig-reinit",
+        HOST_ARM,
+        "random",
+        micro_batch=8,
         note="native vocab, embeddings retrained from scratch — THE control",
     ),
     TransplantSpec(
-        "bpe8k-t-random", "bpe8k", "random", micro_batch=16,
+        "bpe8k-t-random",
+        "bpe8k",
+        "random",
+        micro_batch=16,
         note="matched-init comparison against orig-reinit",
     ),
     TransplantSpec(
-        "bpe8k-t", "bpe8k", "mean_of_pieces", micro_batch=16,
+        "bpe8k-t",
+        "bpe8k",
+        "mean_of_pieces",
+        micro_batch=16,
         note="null hypothesis: just transplant a smaller BPE",
     ),
     TransplantSpec(
-        "fact8k-nosuf-t", "fact8k-nosuf", "mean_of_pieces", micro_batch=16,
+        "fact8k-nosuf-t",
+        "fact8k-nosuf",
+        "mean_of_pieces",
+        micro_batch=16,
         note="the proposal: 8k stems + case/space role head",
     ),
 ]

@@ -134,26 +134,35 @@ def transplant_table(runs_dir: Path) -> str:
 
     suites = ["typo1", "typo5", "lower", "upper", "title", "randcase"]
     head = [
-        "experiment", "init", "BPB step0", "BPB final",
+        "experiment",
+        "init",
+        "BPB step0",
+        "BPB final",
         *[f"d {s}" for s in suites],
-        "vocab", "embed params", "total params", "steps", "minutes",
+        "vocab",
+        "embed params",
+        "total params",
+        "steps",
+        "minutes",
     ]
     rows = []
     for n in names:
         d = found[n]
         p = d["params"]
-        rows.append([
-            n,
-            d["init"],
-            d["step0_clean_bpb"],
-            d["eval.clean"]["bpb"],
-            *[d[f"delta.{s}"] for s in suites],
-            d["heads"]["stem"],
-            p["embedding"] + p["output_heads"],
-            p["total"],
-            d["steps"],
-            round(d["train_seconds"] / 60, 1),
-        ])
+        rows.append(
+            [
+                n,
+                d["init"],
+                d["step0_clean_bpb"],
+                d["eval.clean"]["bpb"],
+                *[d[f"delta.{s}"] for s in suites],
+                d["heads"]["stem"],
+                p["embedding"] + p["output_heads"],
+                p["total"],
+                d["steps"],
+                round(d["train_seconds"] / 60, 1),
+            ]
+        )
     return _table(head, rows)
 
 
