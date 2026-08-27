@@ -146,3 +146,74 @@ EXPERIMENTS: list[Experiment] = [
 ]
 
 EXPERIMENTS_BY_NAME = {e.name: e for e in EXPERIMENTS}
+
+
+# ---------------------------------------------------------------------------
+# Study 2: vocabulary transplant onto a frozen pretrained body
+# ---------------------------------------------------------------------------
+
+HOST_MODEL = "Qwen/Qwen3-1.7B"
+HOST_ARM = "qwen"  # the host's native tokenizer, wrapped as an HFArm
+
+
+@dataclass(frozen=True)
+class TransplantTrainSpec:
+    # Same fixed-bytes protocol as study 1. 230 MB is chosen so the *host's
+    # native* tokenizer sees ~50M tokens (measured 0.2169 tok/byte on this
+    # corpus); the other arms land at 55-57M on the same text.
+    train_bytes: int = 230 * 1024 * 1024
+    seq_len: int = 1024
+    batch_tokens: int = 65536
+    # Higher than study 1: only the embedding/head parameters train, and the
+    # random-init arms have to move a long way in ~760 steps.
+    lr: float = 1e-3
+    min_lr_frac: float = 0.1
+    warmup_frac: float = 0.05
+    weight_decay: float = 0.0
+    grad_clip: float = 1.0
+    seed: int = 0
+    log_every: int = 25
+
+
+@dataclass(frozen=True)
+class TransplantSpec:
+    name: str
+    arm: str
+    init: str  # native | random | mean_of_pieces
+    train: bool = True
+    micro_batch: int = 8
+    note: str = ""
+
+
+# ``orig-reinit`` is the load-bearing control: without it, a gap between a
+# transplant and the pretrained model conflates "different vocabulary" with
+# "embeddings trained for an hour instead of trillions of tokens".
+#
+# The init pairing is deliberate. orig-reinit and bpe8k-t-random are both
+# random, so they compare cleanly; bpe8k-t and fact8k-nosuf-t are both
+# mean-of-pieces, so *they* compare cleanly; and bpe8k-t vs bpe8k-t-random
+# isolates the init itself.
+TRANSPLANTS: list[TransplantSpec] = [
+    TransplantSpec(
+        "orig-frozen", HOST_ARM, "native", train=False, micro_batch=8,
+        note="pretrained model untouched — gold reference, eval only",
+    ),
+    TransplantSpec(
+        "orig-reinit", HOST_ARM, "random", micro_batch=8,
+        note="native vocab, embeddings retrained from scratch — THE control",
+    ),
+    TransplantSpec(
+        "bpe8k-t-random", "bpe8k", "random", micro_batch=16,
+        note="matched-init comparison against orig-reinit",
+    ),
+    TransplantSpec(
+        "bpe8k-t", "bpe8k", "mean_of_pieces", micro_batch=16,
+        note="null hypothesis: just transplant a smaller BPE",
+    ),
+    TransplantSpec(
+        "fact8k-nosuf-t", "fact8k-nosuf", "mean_of_pieces", micro_batch=16,
+        note="the proposal: 8k stems + case/space role head",
+    ),
+]
+
+TRANSPLANTS_BY_NAME = {t.name: t for t in TRANSPLANTS}

@@ -60,8 +60,20 @@ def build_arm(spec: ArmSpec, corpus: str):
 
 
 def get_arm(spec: ArmSpec | str, arms_dir: Path, corpus_dir: Path):
-    """Load a cached arm, training and saving it on first use."""
+    """Load a cached arm, training and saving it on first use.
+
+    A name that is not in ``ARMS`` but exists on disk is loaded directly: that
+    is how externally-built arms (a host model's native tokenizer, saved as an
+    HFArm) enter the pipeline without needing a build recipe here.
+    """
     if isinstance(spec, str):
+        if spec not in ARMS_BY_NAME:
+            path = arms_dir / spec
+            if (path / "arm.json").exists():
+                if spec not in _CACHE:
+                    _CACHE[spec] = load_arm(path)
+                return _CACHE[spec]
+            raise KeyError(f"unknown arm {spec!r} and nothing cached at {path}")
         spec = ARMS_BY_NAME[spec]
     if spec.name in _CACHE:
         return _CACHE[spec.name]

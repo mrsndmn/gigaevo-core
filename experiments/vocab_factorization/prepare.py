@@ -77,6 +77,12 @@ def encode_text(
     import multiprocessing as mp
 
     chunks = list(iter_chunks(text, 1 << 22))
+    if len(chunks) <= 1:
+        # Evaluation texts are a few MB and get encoded once per suite; a pool
+        # spawn costs far more than the encode itself.
+        _init_worker(arm_name, str(arms_dir))
+        stem, role, suffix = _encode_chunk(chunks[0] if chunks else "")
+        return Encoding(stem=stem, role=role, suffix=suffix)
     ctx = mp.get_context("fork")
     with ctx.Pool(
         processes=min(workers, len(chunks)),

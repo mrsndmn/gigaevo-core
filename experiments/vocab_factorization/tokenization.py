@@ -505,8 +505,74 @@ def _build_suffix_inventory(
     return [s for _, s in scored[:n_suffix]]
 
 
+class HFArm:
+    """A pretrained HuggingFace tokenizer wrapped in the study's arm contract.
+
+    Exists so a transplant host's native vocabulary goes through exactly the
+    same BPB machinery, perturbation suites, and invertibility gate as the arms
+    built here — no special-casing anywhere downstream.
+    """
+
+    kind = "hf"
+
+    def __init__(self, tok, name: str, model_id: str):
+        self.tok = tok
+        self.name = name
+        self.model_id = model_id
+        self.vocab_size = len(tok)
+
+    @property
+    def heads(self) -> dict[str, int]:
+        return {"stem": self.vocab_size}
+
+    def encode(self, text: str) -> Encoding:
+        ids = self.tok(text, add_special_tokens=False)["input_ids"]
+        n = len(ids)
+        return Encoding(
+            stem=np.asarray(ids, dtype=np.int32),
+            role=np.zeros(n, dtype=np.int8),
+            suffix=np.zeros(n, dtype=np.int16),
+        )
+
+    def decode(self, enc: Encoding) -> str:
+        return self.tok.decode(enc.stem.tolist(), skip_special_tokens=False)
+
+    def save(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "arm.json").write_text(
+            json.dumps({"kind": "hf", "name": self.name, "model_id": self.model_id})
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> HFArm:
+        from transformers import AutoTokenizer
+
+        meta = json.loads((path / "arm.json").read_text())
+        return cls(
+            AutoTokenizer.from_pretrained(meta["model_id"]),
+            meta["name"],
+            meta["model_id"],
+        )
+
+    @classmethod
+    def build(cls, model_id: str, name: str) -> HFArm:
+        from transformers import AutoTokenizer
+
+        return cls(AutoTokenizer.from_pretrained(model_id), name, model_id)
+
+
+def piece_string(arm, vid: int) -> str:
+    """Surface string of one stem-vocabulary entry, used for transplant init."""
+    if getattr(arm, "kind", "") == "byte":
+        return bytes([vid]).decode("utf-8", errors="replace")
+    return arm.tok.decode([vid], skip_special_tokens=False)
+
+
 def load_arm(path: Path):
     kind = json.loads((path / "arm.json").read_text())["kind"]
-    return {"bpe": BPEArm, "byte": ByteArm, "factorized": FactorizedArm}[kind].load(
-        path
-    )
+    return {
+        "bpe": BPEArm,
+        "byte": ByteArm,
+        "factorized": FactorizedArm,
+        "hf": HFArm,
+    }[kind].load(path)
