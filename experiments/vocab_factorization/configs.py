@@ -41,6 +41,15 @@ ARMS: list[ArmSpec] = [
         use_suffix=False,
         note="ablation: space + case only, isolates the morphology head",
     ),
+    ArmSpec(
+        "fact8k-nosuf",
+        "factorized",
+        8000,
+        use_suffix=False,
+        note="space + case only at half the vocab -- added after the first "
+        "grid showed vocab size barely moves BPB while the suffix head costs "
+        "a lot, which makes this the configuration the results point at",
+    ),
 ]
 
 ARMS_BY_NAME = {a.name: a for a in ARMS}
@@ -132,6 +141,8 @@ EXPERIMENTS: list[Experiment] = [
     _exp("bpe16k-ngram", "bpe16k", "n-gram bag on a plain BPE", ngram_bag=True),
     # --- robustness ceiling / compression floor ----------------------------
     _exp("byte", "byte", "robustness ceiling"),
+    # --- follow-up: the config the first grid's results point at -----------
+    _exp("fact8k-nosuf", "fact8k-nosuf", "half vocab, case+space, no suffix head"),
 ]
 
 EXPERIMENTS_BY_NAME = {e.name: e for e in EXPERIMENTS}
