@@ -686,6 +686,49 @@ path translations, the env prefix, the shared HF cache and the cached active
 set are therefore all confirmed working inside a real container rather than
 argued to. A re-launch now skips the arm on its result marker.
 
+### W1 strand A — transplant-hardening (2026-08-29)
+
+The downstream evaluator exists and its reference is measured.
+`hellaswag.py` scores loglikelihood MC over the four endings, summing **every**
+head so a factorized arm cannot move its case cost into a side head, and
+normalising `acc_norm` by continuation **bytes** rather than tokens — the
+endings are the same strings for every arm, so a byte denominator is identical
+across arms while a token denominator would make the comparison partly about
+tokenization.
+
+**Native reference: `acc` 0.4610 / `acc_norm` 0.6035** over the full 10,042-example
+validation split. That number is itself the harness's correctness check:
+Qwen3-1.7B's published zero-shot HellaSwag is ≈0.60, and a hand-written scorer
+that lands on the published value is very unlikely to be wrong in a way that
+matters.
+
+**The mask is deliberately lifted for this benchmark.** It exists to make
+per-arm BPB on *this* ru+en corpus comparable; HellaSwag is a different
+distribution, and scoring its tokens under the mask would make them impossible
+rather than unlikely. What the mask would have hidden is reported instead: the
+fraction of scored tokens outside each arm's active set. For the native arm
+that is **712 of 1,182,755 (0.06%)** — the corpus-derived active vocabulary
+covers the benchmark almost exactly, so the mask is not what any arm's score
+will turn on. For the 8k arms it is the number to read first.
+
+**The unfrozen-body arm** (`bpe8k-t-unfrozen`) isolates whether the residual
+BPB gap is the embedding's fault or the body's refusal to move. It is the only
+arm that trains the body, at a quarter of `bpe8k-t`'s micro-batch: AdamW over
+1.7B parameters adds ~13.6 GB of moments and ~6.8 GB of fp32 gradients, while
+activation cost is unchanged because gradients already traversed the whole body
+to reach layer 0. It also broke a checkpoint assumption — a saved arm's body
+was documented as recoverable from HF, which stops being true the moment one
+trains it, so `_save_checkpoint` now stores the body for unfrozen arms only and
+`load_checkpoint` refuses an unfrozen checkpoint that lacks one rather than
+silently pairing a pristine body with an embedding trained against a different
+one.
+
+Jobs are registered as the `hellaswag` group. `orig-frozen` is launchable now
+(`--native`, no checkpoint, since `train=False` means it never writes one); the
+other five carry a `requires` on their training checkpoint and are skipped with
+"waiting on an earlier wave" until it exists — which is what makes the wave
+schedule enforce itself rather than rely on launch order.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one

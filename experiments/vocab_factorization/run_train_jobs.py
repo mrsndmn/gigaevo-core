@@ -44,6 +44,7 @@ from experiments.vocab_factorization.jobs import (
     Layout,
     collect_jobs,
     missing_inputs,
+    missing_requirements,
     prewarm_command,
     to_job_path,
     to_local_path,
@@ -124,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         "--groups",
         nargs="*",
         default=["transplant"],
-        help="job groups to launch (transplant, distill)",
+        help="job groups to launch (transplant, distill, hellaswag)",
     )
     return p.parse_args()
 
@@ -191,6 +192,14 @@ def main() -> int:
         marker_local = Path(to_local_path(spec.marker))
         if marker_local.exists() and not args.force:
             print(f"\033[33mSkip (result exists):\033[0m {marker_local}")
+            continue
+
+        waiting = missing_requirements(spec)
+        if waiting:
+            print(
+                f"\033[33mSkip (waiting on an earlier wave):\033[0m {spec.name} "
+                f"needs {', '.join(waiting)}"
+            )
             continue
 
         results_dir = str(Path(spec.marker).parent)

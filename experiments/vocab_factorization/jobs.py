@@ -97,6 +97,10 @@ class JobSpec:
     arms: tuple[str, ...] = ()  # token caches this job reads
     num_gpus: int = NUM_GPUS
     marker: str = ""  # container path whose existence means "done"
+    # Artifacts an *earlier wave* must have produced. Unlike ``arms``, a missing
+    # one is not an error: it means the upstream job has not finished yet, which
+    # is the normal state of a wave schedule. The launcher skips and says so.
+    requires: tuple[str, ...] = ()
     priority_class: str | None = None
 
     def command(self, data_dir: str, results_dir: str) -> list[str]:
@@ -164,13 +168,53 @@ def distill_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
     ]
 
 
+def hellaswag_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
+    """Transplant-hardening: the downstream task, one job per arm.
+
+    ``orig-frozen`` is scored from the host table with ``--native`` because it
+    writes no checkpoint (``train=False``), and it is the arm every other one is
+    compared against. The trained arms are scored from the checkpoints their
+    training jobs saved — which is the whole point of the hardening track
+    budgeting no dedicated re-runs.
+    """
+    out = f"{results_root}/hellaswag"
+    jobs = [
+        JobSpec(
+            name="hellaswag-orig-frozen",
+            module="experiments.vocab_factorization.hellaswag",
+            description="hellaswag orig-frozen (native host, no checkpoint)",
+            args=("--native", "--reserve-gb", "24"),
+            arms=(HOST_ARM,),
+            marker=f"{out}/orig-frozen.json",
+        )
+    ]
+    jobs += [
+        JobSpec(
+            name=f"hellaswag-{t.name}",
+            module="experiments.vocab_factorization.hellaswag",
+            description=f"hellaswag {t.name} ({t.arm})",
+            args=("--ckpt", f"{CKPT_ROOT}/{t.name}.pt", "--reserve-gb", "24"),
+            arms=(t.arm,),
+            marker=f"{out}/{t.name}.json",
+            requires=(f"{CKPT_ROOT}/{t.name}.pt",),
+        )
+        for t in TRANSPLANTS
+        if t.train
+    ]
+    return jobs
+
+
 def collect_jobs(
     filter_name: str | None = None,
     groups: tuple[str, ...] = ("transplant",),
     results_root: str = RESULTS_ROOT,
 ) -> list[JobSpec]:
     """The launchable set. ``distill`` is off by default — stage 0 is closed."""
-    builders = {"transplant": transplant_jobs, "distill": distill_jobs}
+    builders = {
+        "transplant": transplant_jobs,
+        "distill": distill_jobs,
+        "hellaswag": hellaswag_jobs,
+    }
     jobs: list[JobSpec] = []
     for g in groups:
         if g not in builders:
@@ -203,6 +247,11 @@ def missing_inputs(spec: JobSpec, data_dir_local: Path) -> list[str]:
         ]
         missing += [str(p) for p in want if not p.exists()]
     return missing
+
+
+def missing_requirements(spec: JobSpec) -> list[str]:
+    """Upstream artifacts this job needs that do not exist yet."""
+    return [r for r in spec.requires if not Path(to_local_path(r)).exists()]
 
 
 def prewarm_command(arm: str) -> str:

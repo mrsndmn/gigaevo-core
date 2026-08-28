@@ -172,3 +172,60 @@ def test_checkpoint_round_trips_the_parameters(tmp_path):
     # The tie has to survive too: an untied reload would double the parameters
     # and silently break the "output side is composed from the same table" claim.
     assert restored.out["stem"].weight is restored.emb["stem"].weight
+
+
+# --- the unfrozen-body arm (W1) -------------------------------------------
+
+
+def test_freeze_body_controls_what_trains():
+    frozen = transplant.TransplantLM(StubBody(), {"stem": VOCAB}, D_MODEL)
+    thawed = transplant.TransplantLM(
+        StubBody(), {"stem": VOCAB}, D_MODEL, freeze_body=False
+    )
+    assert not any(p.requires_grad for p in frozen.body.parameters())
+    assert all(p.requires_grad for p in thawed.body.parameters())
+    assert len(thawed.trainable_parameters()) > len(frozen.trainable_parameters())
+
+
+def test_only_an_unfrozen_arm_stores_the_body(tmp_path):
+    """A frozen body is bit-identical to HF, so storing it wastes 3.4 GB; an
+    unfrozen one is the thing that changed, so omitting it would reload a
+    different model than the one that was scored."""
+    from dataclasses import replace
+
+    from experiments.vocab_factorization.configs import (
+        TRANSPLANTS_BY_NAME,
+        TransplantTrainSpec,
+    )
+    from experiments.vocab_factorization.train_transplant import _save_checkpoint
+
+    heads = {"stem": VOCAB}
+    tspec = TransplantTrainSpec()
+    spec = TRANSPLANTS_BY_NAME["bpe8k-t"]
+    assert spec.freeze_body
+
+    frozen_path = tmp_path / "frozen.pt"
+    _save_checkpoint(_model(heads), spec, tspec, heads, 1, frozen_path)
+    assert "body" not in torch.load(frozen_path, weights_only=False)
+
+    thawed = transplant.TransplantLM(StubBody(), heads, D_MODEL, freeze_body=False)
+    thawed_path = tmp_path / "thawed.pt"
+    _save_checkpoint(
+        thawed, replace(spec, freeze_body=False), tspec, heads, 1, thawed_path
+    )
+    blob = torch.load(thawed_path, weights_only=False)
+    assert "body" in blob and blob["freeze_body"] is False
+
+
+def test_an_unfrozen_checkpoint_without_a_body_is_refused(tmp_path):
+    """The dangerous case: it would otherwise load the pristine HF body next to
+    an embedding trained against a different one, and report that as the score."""
+    from experiments.vocab_factorization.configs import HOST_MODEL
+    from experiments.vocab_factorization.eval_transplant import load_checkpoint
+
+    path = tmp_path / "bad.pt"
+    torch.save(
+        {"host": HOST_MODEL, "freeze_body": False, "heads": {"stem": VOCAB}}, path
+    )
+    with pytest.raises(ValueError, match="no body weights"):
+        load_checkpoint(path, "cpu")

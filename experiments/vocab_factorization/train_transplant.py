@@ -65,29 +65,37 @@ def _heads_for(arm, host_vocab: int) -> dict[str, int]:
 
 
 def _save_checkpoint(model, spec, tspec, heads, steps, path: Path) -> str:
-    """Persist the trained parameters. The frozen body reloads from HF.
+    """Persist the trained parameters. A frozen body reloads from HF instead.
 
     Round 1 of this study saved nothing, so five arms' worth of trained tables
     were unrecoverable and any downstream question about them required a full
     re-train first. ``emb`` and ``out`` *are* the transplant; ``torch.save``
     keeps ``out.stem`` sharing storage with ``emb.stem`` while they are tied,
     so a tied arm costs one table on disk, not two.
+
+    The body is stored **only** when the arm trained it. For every frozen arm
+    it is bit-identical to the HF weights and storing it would cost 3.4 GB per
+    arm to duplicate a file that already exists; for the unfrozen arm it is the
+    thing that changed, and omitting it would produce a checkpoint that reloads
+    silently into the wrong model — the pristine body paired with an embedding
+    trained against a different one.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "experiment": spec.name,
-            "arm": spec.arm,
-            "host": HOST_MODEL,
-            "init": spec.init,
-            "heads": heads,
-            "steps": steps,
-            "seed": tspec.seed,
-            "emb": model.emb.state_dict(),
-            "out": model.out.state_dict(),
-        },
-        path,
-    )
+    blob = {
+        "experiment": spec.name,
+        "arm": spec.arm,
+        "host": HOST_MODEL,
+        "init": spec.init,
+        "heads": heads,
+        "steps": steps,
+        "seed": tspec.seed,
+        "freeze_body": spec.freeze_body,
+        "emb": model.emb.state_dict(),
+        "out": model.out.state_dict(),
+    }
+    if not spec.freeze_body:
+        blob["body"] = model.body.state_dict()
+    torch.save(blob, path)
     return str(path)
 
 
@@ -119,9 +127,9 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     )
     n_tokens = len(enc)
 
-    model = transplant.TransplantLM(body, heads, d_model, tie_embeddings=True).to(
-        device
-    )
+    model = transplant.TransplantLM(
+        body, heads, d_model, tie_embeddings=True, freeze_body=spec.freeze_body
+    ).to(device)
     if spec.init == "native":
         init_stats = transplant.native_init(model, host_emb)
     elif spec.init == "random":
@@ -222,7 +230,8 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
 
         sampler = WindowSampler(_heads_arrays(enc, heads), seq, tspec.seed, device)
         model.train()
-        body.eval()  # frozen body stays in eval mode (no dropout)
+        if spec.freeze_body:
+            body.eval()  # frozen body stays in eval mode (no dropout)
         t0 = time.time()
         for step in range(steps):
             for g in opt.param_groups:

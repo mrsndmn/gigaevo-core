@@ -39,21 +39,36 @@ SEQ_LEN = 1024
 def load_checkpoint(path: Path, device) -> tuple[torch.nn.Module, dict]:
     """Rebuild the model a checkpoint describes. Returns (model, metadata)."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    # Both checks run before ``load_host``: loading a 1.7B model takes the best
+    # part of a minute, and a checkpoint that cannot be reconstructed should say
+    # so immediately rather than after it.
     if ckpt.get("host") != HOST_MODEL:
         raise ValueError(
             f"{path} was trained against host {ckpt.get('host')!r}, not "
             f"{HOST_MODEL!r} — the frozen body would not match the embedding"
         )
+    frozen = ckpt.get("freeze_body", True)
+    if not frozen and "body" not in ckpt:
+        # An arm that trained the body must restore it. Falling back to the HF
+        # weights here would pair a pristine body with an embedding trained
+        # against a different one and report the result as that arm's score.
+        raise ValueError(
+            f"{path} is an unfrozen-body arm but carries no body weights — "
+            "it was written by a version that did not save them, and the "
+            "model it describes cannot be reconstructed"
+        )
     body, host_emb, _tok, d_model = transplant.load_host(ckpt["host"])
     model = transplant.TransplantLM(
-        body, ckpt["heads"], d_model, tie_embeddings=True
+        body, ckpt["heads"], d_model, tie_embeddings=True, freeze_body=frozen
     ).to(device)
     model.emb.load_state_dict(ckpt["emb"])
     # The tied arm's ``out.stem`` shares storage with ``emb.stem``; loading it
     # again is a no-op there and load-bearing for an untied one.
     model.out.load_state_dict(ckpt["out"])
+    if not frozen:
+        model.body.load_state_dict(ckpt["body"])
     del host_emb
-    meta = {k: v for k, v in ckpt.items() if k not in ("emb", "out")}
+    meta = {k: v for k, v in ckpt.items() if k not in ("emb", "out", "body")}
     return model, meta
 
 

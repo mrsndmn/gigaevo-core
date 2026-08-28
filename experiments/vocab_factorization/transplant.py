@@ -79,6 +79,39 @@ def _ce_sum(
     return total
 
 
+def _ce_tokens(
+    h: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-position cross-entropy, same arithmetic as ``_ce_sum`` unreduced.
+
+    A corpus-level BPB only ever needs the sum, so ``_ce_sum`` reduces inside
+    the chunk loop and never materializes the per-token vector. A multiple-
+    choice benchmark needs the likelihood of one *sequence* at a time, so the
+    reduction has to stay per-position. Slicing here is purely about the size
+    of the fp32 logits (a 151,936-wide row per token); there is no backward, so
+    unlike ``_ce_sum`` this does not need ``checkpoint`` to recompute them.
+
+    ``ignore_index=-100`` carries padding through: batching choices of
+    different lengths is unavoidable here, and a padded position must
+    contribute exactly zero rather than a small wrong number.
+    """
+    floor = torch.finfo(torch.float32).min
+    parts = []
+    for i in range(0, h.shape[0], _CE_CHUNK):
+        lg = F.linear(h[i : i + _CE_CHUNK], weight).float()
+        if mask is not None:
+            lg = lg.masked_fill(~mask, floor)
+        parts.append(
+            F.cross_entropy(
+                lg, target[i : i + _CE_CHUNK], reduction="none", ignore_index=-100
+            )
+        )
+    return torch.cat(parts)
+
+
 class TransplantLM(nn.Module):
     """Frozen pretrained body + trainable factorized embedding and heads.
 
@@ -93,14 +126,23 @@ class TransplantLM(nn.Module):
         heads: dict[str, int],
         d_model: int,
         tie_embeddings: bool = True,
+        freeze_body: bool = True,
     ):
         super().__init__()
         self.body = body
         self.heads = dict(heads)
         self.head_names = list(heads)
         self.d_model = d_model
+        self.freeze_body = freeze_body
+        # Freezing is the study's default and the thing every published number
+        # here assumes: it is what makes "retrofit a vocabulary onto a model you
+        # did not train" a meaningful claim. Unfreezing is one deliberate arm,
+        # asking whether the residual BPB gap is the embedding's fault or the
+        # body's refusal to move — and it changes the memory profile completely
+        # (optimizer state for 1.7B rather than 0.3B parameters), so it carries
+        # its own micro-batch in ``configs.TRANSPLANTS``.
         for p in self.body.parameters():
-            p.requires_grad_(False)
+            p.requires_grad_(not freeze_body)
         self._body_dtype = next(self.body.parameters()).dtype
 
         self.emb = nn.ModuleDict(
@@ -181,6 +223,43 @@ class TransplantLM(nn.Module):
                         hc, self.out[name].weight, targets[name].reshape(-1)
                     )
         return losses
+
+    @torch.no_grad()
+    def token_nll(self, inputs: dict, targets: dict) -> dict[str, torch.Tensor]:
+        """Per-position NLL ``[B, T]`` per head, conditioned exactly as ``forward``.
+
+        The feature heads are scored on ``h + emb_stem(target_stem)``, the same
+        teacher-forced conditioning the training loss and the BPB evaluator use.
+        Scoring them on ``h`` alone — which is what the ``targets=None`` branch
+        returns, since that path exists to hand back raw logits — would quietly
+        change what a factorized arm's likelihood *means* and make it
+        incomparable with its own BPB.
+        """
+        x = self.emb["stem"](inputs["stem"])
+        for name in self.head_names:
+            if name != "stem":
+                x = x + self.emb[name](inputs[name])
+        h = self.body(inputs_embeds=x.to(self._body_dtype)).last_hidden_state
+        B, T, _ = h.shape
+
+        out = {
+            "stem": _ce_tokens(
+                h.reshape(-1, self.d_model),
+                self.out["stem"].weight,
+                targets["stem"].reshape(-1),
+                mask=self.stem_mask,
+            ).view(B, T)
+        }
+        if len(self.head_names) > 1:
+            hc = (h + self.emb["stem"](targets["stem"].clamp(min=0))).reshape(
+                -1, self.d_model
+            )
+            for name in self.head_names:
+                if name != "stem":
+                    out[name] = _ce_tokens(
+                        hc, self.out[name].weight, targets[name].reshape(-1)
+                    ).view(B, T)
+        return out
 
     def param_counts(self) -> dict[str, int]:
         emb = sum(p.numel() for p in self.emb.parameters())

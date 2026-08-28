@@ -238,6 +238,9 @@ class TransplantSpec:
     init: str  # native | random | mean_of_pieces
     train: bool = True
     micro_batch: int = 8
+    # Freezing every transformer weight is what makes the study's claim a
+    # *retrofit* claim. One arm lifts it; see ``bpe8k-t-unfrozen``.
+    freeze_body: bool = True
     note: str = ""
 
 
@@ -285,6 +288,25 @@ TRANSPLANTS: list[TransplantSpec] = [
         "mean_of_pieces",
         micro_batch=16,
         note="the proposal: 8k stems + case/space role head",
+    ),
+    # --- transplant-hardening (W1) ------------------------------------------
+    # The frozen arms answer "can a vocabulary be retrofitted?". This one asks
+    # what the residual gap is made of: with the body free to move, does the
+    # transplant close it, and does downstream quality follow BPB or diverge
+    # from it? It is the only arm here that trains the body, which is why it
+    # gets a quarter of bpe8k-t's micro-batch: AdamW over 1.7B parameters costs
+    # ~13.6 GB of moments and ~6.8 GB of fp32 gradients on top of everything
+    # the frozen arms already hold, and the activation cost is unchanged
+    # because gradients already traversed the whole body to reach layer 0.
+    TransplantSpec(
+        "bpe8k-t-unfrozen",
+        "bpe8k",
+        "mean_of_pieces",
+        micro_batch=4,
+        freeze_body=False,
+        note="hardening: bpe8k-t with the body unfrozen, so the clean-BPB gap "
+        "can close — isolates 'the embedding is wrong' from 'the body will "
+        "not move'",
     ),
 ]
 
