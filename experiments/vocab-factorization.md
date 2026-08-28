@@ -429,44 +429,120 @@ cheap 33M-scale alternative from study 3's conclusion — the joint
 (stem x case) softmax — is unaffected by this result and remains the other
 open thread.
 
-### Stage 1 plan — train the tree, don't distill it (pre-registered, not run)
+### Stage 1 plan v2 — feature-routed trees, trained through the body (pre-registered, not run)
 
-Stage 0's lesson dictates the design: the tree supplies *structure* (which
-parameters a token touches); gradients through the frozen body supply the
-values. Four commitments, fixed before any code runs:
+Supersedes the same-day v1 registration (k-means routing) before any code was
+written; the success/kill gates are unchanged. Three changes and their
+reasons: routing moves from k-means-in-embedding-space to **interpretable
+token features** (boosted vector-leaf trees); optimization and accounting are
+restricted to the **active vocabulary**; and the plan now includes the
+evolution fitness ladder and the progressive-shrink track. This section is
+written to be self-contained for an implementing session that has not seen
+the discussion.
 
-1. **Trainable path composition.** A token's embedding is the sum of node
-   shift vectors along its fixed root-to-leaf path plus a per-token low-rank
-   residual; node vectors and residual factors train through the frozen
-   Qwen3-1.7B body under the study-2 transplant protocol. The softmax stays
-   *flat* over the vocabulary with the output embedding composed from the
-   same tied tree — stage 0's in/out ablation showed the output side is the
-   sensitive one, so prediction never goes hierarchical.
-2. **Routing is fixed before training, from mean-of-pieces vectors.** Stage 0
-   clustered a table stage 1 does not have; the mean-of-pieces vectors
-   (study 2's init, worth 0.61 BPB there) are computed per token, clustered
-   hierarchically to assign paths, then discarded. Optional surface-rule
-   upper levels (script, case shape, leading space) keep the top of the tree
-   interpretable. Learned routing (periodic re-clustering) is an ablation to
-   run only if fixed routing is the measured bottleneck — it imports
-   codebook-collapse failure modes.
-3. **A multiplicative-composition ablation.** The additive path-sum is
-   representationally flat-VQ-plus-residual (see method note above); one arm
-   gives each node a FiLM pair (elementwise scale + shift applied down the
-   path) so depth can buy expressivity. The additive arm stays the default
-   so the baseline remains clean.
-4. **Small vocabulary, matched control.** The comparison is against the
-   trained flat table `bpe8k-t` (0.7031, 16.4M embedding floats) on the same
-   bpe8k vocabulary, with tree arms at ~x2/x4 fewer embedding floats plus
-   the FiLM and re-clustering ablations. Open-vocabulary routing over
-   arbitrary strings is stage 2, contingent on stage 1 surviving.
+**Unchanged commitments (from v1, with stage-0 reasons).** The tree supplies
+structure, gradients through the frozen Qwen3-1.7B body supply the values
+(stage 0: offline fits of any structure cost +1.4 BPB minimum; matching the
+matrix is not matching the function). The softmax stays *flat* over the
+vocabulary, output embedding composed from the same tied structure (stage
+0's in/out ablation: the output side is the more sensitive one). Additive
+composition is the default arm; a FiLM arm (per-node elementwise scale +
+shift) is the ablation that lets depth buy expressivity, since an additive
+path-sum is representationally flat-VQ-plus-residual (method note above).
+Training protocol is study 2's (`TransplantTrainSpec`, ~1 GPU-hour/arm,
+loop in `train_transplant.py`; keep `distill_embed._reserve`'s
+grab-peak-memory-once pattern — the GPU is contended and two stage-0
+launches died to the allocation race).
 
-Success criterion: clean BPB within ~0.005 of `bpe8k-t` at >=x2 fewer
-embedding floats, robustness suites unchanged. Kill criterion: worse than
-+0.05 BPB at x2. Estimated cost ~4-5 GPU-hours. The concrete grid lands in
-`configs.py` (`TREE_TRANSPLANTS`) when implementation starts; per this
-file's convention the code, not this section, will then be the source of
-truth for hyperparameters.
+**Routing v2: vector-leaf boosted trees over token features.** A GBDT whose
+leaves hold vectors *is* the additive-codes family with named rule paths:
+each shallow tree (depth ~6-8, ensemble of many) routes a token by feature
+tests and contributes its leaf vector; the sum is the embedding. Structure
+is fit once, offline, to mean-of-pieces vectors (targets define the
+*partition only* — study 2 measured mean-of-pieces worth 0.61 BPB as an
+init, and stage 0 says fitted *values* must not be trusted, so the leaf
+vectors are re-learned through the body). Implementation: sklearn 1.9 is in
+the env and its multi-output `DecisionTreeRegressor` + a manual residual
+boosting loop suffices; `pip install catboost` (MultiRMSE) is the
+alternative — neither catboost nor xgboost is currently installed. One
+optional arm does **functional gradient boosting**: each round fits trees to
+the loss gradient w.r.t. token embeddings collected through the frozen body
+— boosting on the true objective instead of matrix MSE, which is exactly the
+correction stage 0 demands.
+
+**Feature set v0 (later the evolution genome).** Per token id, computed once:
+- *surface*: script class (latin/cyrillic/digit/punct/other), case shape
+  (lower/Title/UPPER/mixed), byte length, leading-space flag, digit/punct
+  content flags;
+- *decomposition*: number of host-tokenizer pieces of the surface string,
+  bucketed first/last piece id (machinery exists in
+  `transplant.mean_of_pieces_init` / `tokenization.piece_string`);
+- *char n-grams*: hashed 3-5-gram presence buckets (reuse
+  `model.build_ngram_table`'s FNV-1a hashing);
+- *corpus n-gram statistics* from the cached stream
+  `data/tokens/qwen/train.230mb.npz`: log unigram frequency, left- and
+  right-neighbor entropy, top-neighbor bigram PMI, document frequency /
+  burstiness.
+Study 1 killed char n-grams as an *additive input embedding* under an
+emission-dominated metric; here they are *routing features* for parameter
+sharing — a different role, and that metric objection does not transfer.
+
+**Active-vocabulary convention (fairness).** Measured in stage 0: only
+72,304 of 151,936 host tokens occur in the 230 MB train stream; the rest is
+mostly other-language mass this ru+en corpus never exercises. Convention,
+applied to *every* arm including the native reference: (a) *active* = ids
+occurring in the train stream or the full valid split; (b) only active
+tokens are parameterized and optimized; (c) inactive tokens are **masked out
+of the softmax in both training and evaluation** — without the shared mask
+they leak into every number through the normalizer, so per-arm deltas would
+be incomparable; (d) compression ratios are quoted against the *active*
+flat table, 72,304 x 2048 = 148.1M floats, not 311M. The native reference
+must be re-evaluated under the mask (expect slightly below the unmasked
+0.7801; that masked number becomes the stage-1 reference). Deployment of a
+masked-vocab model is out of scope for stage 1. Arms on the corpus-trained
+bpe8k vocabulary satisfy the convention trivially.
+
+**Grid sketch** (lands in `configs.py` as `TREE_TRANSPLANTS`; code becomes
+the source of truth for hyperparameters once written):
+- `bpe8k-t` control re-run under the active-vocab convention (its 0.7031
+  predates the mask);
+- tree arms on the bpe8k vocabulary at ~x2 and ~x4 fewer embedding floats
+  than the 16.4M flat control;
+- the FiLM arm and the functional-gradient-boosting arm at the x2 budget;
+- one bridge arm on the *active host vocabulary* (72k): tree fit offline to
+  the native active rows as init, then trained — directly tests whether
+  training rescues the distilled init that stage 0 showed fails zero-shot.
+
+**Gates (unchanged).** Success: clean BPB within ~0.005 of the flat control
+at >=x2 fewer embedding floats, robustness suites unchanged. Kill: worse
+than +0.05 BPB at x2. Estimated ~5-7 GPU-hours for the grid.
+
+**Fitness ladder (built during stage 1, used by the evolution phase
+after).** L0, seconds: frequency-weighted explained variance of
+mean-of-pieces vectors under the candidate partition. L1, ~1 min: step-0
+clean BPB on a small eval slice under the active-vocab mask (study 2 showed
+step-0 BPB discriminates inits). L2, ~13 min: one 33M from-scratch run. L3,
+~1 h: full transplant. The evolution phase — GigaEvo mutating the
+feature-extractor *program* (`token_features.py` is the genome) — runs on
+L0/L1 with periodic promotion of elites to L2/L3; this study was misled by
+cheap proxies twice (study 3's methodological correction), so no
+evolutionary conclusion is accepted from L0/L1 alone.
+
+**Progressive-shrink track (independent; composes with the tree).** Start
+from the intact native table; rule 0 is the active-vocab mask itself (an
+instant 152k -> 72k shrink); subsequent interpretable rules (merge
+case/space variants of one lexeme into stem + role bit — the fact
+factorization applied to a live vocabulary; re-piece the frequency tail)
+each followed by a short healing train. Output: the study's first BPB vs
+vocab-size curve on a pretrained body, and a warm-started small vocabulary
+for the tree parameterization. One-shot replacement is what stage 0 killed;
+a curriculum of small healed edits is the change the evidence permits.
+
+**Suggested module layout.** `token_features.py` (pure feature extractor,
+unit-testable), `tree_embed.py` (boosted-partition fit + a `TreeEmbedding`
+module with fixed routing and trainable leaf/residual parameters),
+`TREE_TRANSPLANTS` in `configs.py`, reusing `train_transplant.py`'s loop
+with two hooks: the softmax mask and the embedding-module swap.
 
 ## Changelog
 
@@ -534,3 +610,13 @@ unseen words.
   embedding floats; kill: +0.05 at x2. Recorded stage-0 tree-construction
   method note (path-sum = leaf mean = flat-VQ equivalence; leaf collapse
   2,104 / 1,249 of nominal 4,096).
+- 2026-08-28 — Stage 1 plan revised to v2 before implementation (gates
+  unchanged): routing by interpretable token features (surface + char
+  n-gram + corpus n-gram statistics) via boosted vector-leaf trees instead
+  of k-means in embedding space; optimization, softmax, and accounting
+  restricted to the active vocabulary (72,304/151,936 ids seen in the
+  corpus — masking shared by every arm including the native reference);
+  added the functional-gradient-boosting arm, the active-host-vocab bridge
+  arm, the L0-L3 fitness ladder for the later GigaEvo feature-evolution
+  phase, and the progressive-shrink track. Written self-contained for a
+  fresh implementing session.
