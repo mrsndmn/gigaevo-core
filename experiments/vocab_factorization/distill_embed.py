@@ -290,6 +290,10 @@ class Fitter:
             bits = V * math.ceil(math.log2(max(2, n_leaves)))
         else:
             raise ValueError(spec.method)
+        if spec.renorm:
+            target = self.W.norm(dim=1, keepdim=True)
+            W_hat = W_hat / W_hat.norm(dim=1, keepdim=True).clamp(min=1e-6) * target
+            floats += V  # the stored per-row norms
         acct = {
             "float_params": floats,
             "index_bits": bits,
@@ -356,11 +360,27 @@ def evaluate_table(
         arrays, nb = eval_sets[suite]
         res[suite] = eval_bpb(model, arrays, nb, SEQ_LEN, device, eval_batch)
     del model
-    torch.cuda.empty_cache()
+    # Deliberately no empty_cache(): on a shared GPU, memory returned to the
+    # driver is snapped up by neighbor processes and never comes back.
     return res
 
 
 # ---------------------------------------------------------------------------
+
+
+def _reserve(gb: float) -> None:
+    """Grab the run's peak memory once, up front.
+
+    This node's GPU is shared and neighbor processes expand into any memory
+    the moment it frees; per-allocation the race is unwinnable (two sweeps
+    died to it). A large allocation that is immediately deleted stays in the
+    caching allocator's pool, so the whole run then serves every allocation
+    from memory it already owns. Pairs with never calling ``empty_cache``.
+    """
+    if gb <= 0:
+        return
+    buf = torch.empty(int(gb * (1 << 30)), dtype=torch.uint8, device="cuda")
+    del buf
 
 
 def main() -> None:
@@ -376,6 +396,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=40)
     ap.add_argument("--kmeans-iters", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--reserve-gb", type=float, default=24.0)
     args = ap.parse_args()
 
     todo = DISTILLS if args.all else [DISTILLS_BY_NAME[n] for n in (args.exp or [])]
@@ -384,6 +405,11 @@ def main() -> None:
 
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
+    _reserve(args.reserve_gb)
+    # Halve the transient fp32 logits chunk (4096 x 151936 x 4B = 2.3 GB is
+    # the single biggest allocation in the eval); 2048 rows keeps the peak
+    # comfortably inside the reserved pool.
+    transplant._CE_CHUNK = 2048
     print(f"loading host {HOST_MODEL} ...", flush=True)
     body, host_emb, _host_tok, d_model = transplant.load_host(HOST_MODEL)
     W = host_emb.float().to(device)
@@ -454,7 +480,12 @@ def main() -> None:
     for s in suites_all:
         ref[f"eval.{s}"] = native[s]
         ref[f"delta.{s}"] = native[s]["bpb"] - native["clean"]["bpb"]
-    (args.out / "native.json").write_text(json.dumps(ref, indent=2))
+    # A clean-only follow-up run must not clobber a full-suite native record:
+    # merge new keys over whatever is already there.
+    native_path = args.out / "native.json"
+    if native_path.exists():
+        ref = {**json.loads(native_path.read_text()), **ref}
+    native_path.write_text(json.dumps(ref, indent=2))
     print(f"native clean bpb={native['clean']['bpb']:.4f}", flush=True)
 
     fitter = Fitter(W, {"none": None, "freq": freq_w}, args.kmeans_iters, args.seed)
@@ -476,7 +507,6 @@ def main() -> None:
             args.eval_batch,
         )
         del W_hat
-        torch.cuda.empty_cache()
         out = {
             "experiment": spec.name,
             "method": spec.method,

@@ -284,6 +284,10 @@ class DistillSpec:
     depth: int = 0  # tree/tree_res: depth
     weight: str = "none"  # none | freq -- row weights for the fit objective
     apply: str = "both"  # both | input | output -- which side is reconstructed
+    # Rescale reconstructed rows to the native per-row norms (V extra floats).
+    # Controls for the softmax-temperature artifact: low-rank fits shrink row
+    # norms, which damages logit scale independently of direction error.
+    renorm: bool = False
     full_suites: bool = False  # evaluate all perturbation suites, not just clean
     note: str = ""
 
@@ -334,6 +338,24 @@ DISTILLS: list[DistillSpec] = [
     # --- which side of the model is sensitive? -----------------------------
     DistillSpec("svd128-in", "svd", rank=128, apply="input", note="exact output head"),
     DistillSpec("svd128-out", "svd", rank=128, apply="output", note="exact input emb"),
+    # --- softmax-temperature control: native row norms restored ------------
+    DistillSpec(
+        "svd128-freq-norm",
+        "svd",
+        rank=128,
+        weight="freq",
+        renorm=True,
+        note="rules out row-norm shrinkage as the damage mechanism",
+    ),
+    DistillSpec(
+        "tree64x2-r64-freq-norm",
+        "tree_res",
+        codes=64,
+        depth=2,
+        rank=64,
+        weight="freq",
+        renorm=True,
+    ),
 ]
 
 DISTILLS_BY_NAME = {s.name: s for s in DISTILLS}
