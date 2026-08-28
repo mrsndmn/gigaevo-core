@@ -6,11 +6,19 @@ Two levels:
 ``EXPERIMENTS`` training runs  -- one small LM per row of the ablation grid
 
 Nothing about the grid lives in the plan markdown; the markdown points here.
+
+This module deliberately imports **nothing but the standard library**. The
+MLSpace launchers (``jobs.py``, ``run_train_jobs.py``) run under the ``arkhip``
+environment, which is where ``mls`` is installed and which has neither
+``regex`` nor ``transformers``; they read the grid and the on-disk cache
+conventions from here, so keeping this file dependency-free is what lets one
+process decide *what to launch* and another actually run it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Tokenizer arms
@@ -81,6 +89,27 @@ ARMS_BY_NAME = {a.name: a for a in ARMS}
 # Bytes of training text used to fit the tokenizers. 50 MB is far more than a
 # 32k vocabulary needs and keeps arm construction to a couple of minutes.
 TOKENIZER_TRAIN_BYTES = 50 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# On-disk cache conventions
+# ---------------------------------------------------------------------------
+#
+# Where the shared, read-through caches live. Both the code that *builds* them
+# (``prepare``, ``active_vocab``) and the launcher that must check they exist
+# before fanning out jobs that would otherwise race to write them agree on
+# these two functions rather than on a format string typed twice.
+
+
+def token_cache_path(
+    tokens_dir: Path, arm_name: str, split: str, nbytes: int | None
+) -> Path:
+    tag = "full" if nbytes is None else f"{nbytes // (1024 * 1024)}mb"
+    return tokens_dir / arm_name / f"{split}.{tag}.npz"
+
+
+def active_cache_path(tokens_dir: Path, arm_name: str) -> Path:
+    return tokens_dir / arm_name / "active_vocab.npz"
 
 
 # ---------------------------------------------------------------------------

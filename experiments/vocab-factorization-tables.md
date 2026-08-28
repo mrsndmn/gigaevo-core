@@ -2,7 +2,7 @@
 
 Generated snapshot of every metric in the study. The underlying JSON lives under `results/`, which is gitignored; this file is the tracked record. Interpretation and conclusions live in `experiments/vocab-factorization.md` — this file is data only.
 
-- Generated: 2026-08-28 08:50
+- Generated: 2026-08-28 19:35
 - Transplant host: `Qwen/Qwen3-1.7B`
 - Corpus: ru+en Wikipedia, NFC, document-hash split (`data.py`)
 - Regenerate: `python -m experiments.vocab_factorization.report --out experiments/vocab-factorization-tables.md`
@@ -145,3 +145,11 @@ No LM training: each method fits the frozen Qwen3-1.7B table offline, the recons
 | svd128-out | svd | 19,709,952 | x15.8 | 0.8089 | 0.7927 | 0.8266 | 3.6703 | 2.8902 | - | - | - |
 | svd128-freq-norm | svd | 19,861,888 | x15.7 | 1.3302 | 0.6767 | 1.3428 | 6.7925 | 6.0123 | - | - | - |
 | tree64x2-r64-freq-norm | tree_res | 12,693,888 | x24.5 | 1.3953 | 0.5655 | 1.3768 | 7.6406 | 6.8605 | - | - | - |
+
+## 6. Under the active-vocabulary mask (W0 / P0)
+
+Only ids the corpus exercises stay in the stem softmax — in training and in evaluation, identically for every arm — so a per-arm BPB delta is about the arm's embedding rather than about how its rows happen to sit near the half of the host table this ru+en corpus never touches. `d ... vs unmasked` compares against the same harness with the mask lifted; masking removes terms from the normalizer, so it can only lower BPB, and the question is whether it does so by more than the 0.0016 noise floor. Compression ratios downstream are quoted against `flat floats`.
+
+| experiment | active / table | flat floats | clean masked | typo1 masked | typo5 masked | lower masked | upper masked | title masked | randcase masked | d clean vs unmasked | d typo1 vs unmasked | d typo5 vs unmasked | d lower vs unmasked | d upper vs unmasked | d title vs unmasked | d randcase vs unmasked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| orig-frozen | 74957 / 151936 | 153.5M | 0.7796 | 0.9358 | 1.3905 | 0.8243 | 1.0702 | 0.8885 | 1.8151 | -0.0005 | -0.0007 | -0.0016 | -0.0006 | -0.0009 | -0.0006 | -0.0014 |

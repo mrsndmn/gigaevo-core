@@ -496,11 +496,17 @@ tokens are parameterized and optimized; (c) inactive tokens are **masked out
 of the softmax in both training and evaluation** — without the shared mask
 they leak into every number through the normalizer, so per-arm deltas would
 be incomparable; (d) compression ratios are quoted against the *active*
-flat table, 72,304 x 2048 = 148.1M floats, not 311M. The native reference
+flat table, not 311M. The native reference
 must be re-evaluated under the mask (expect slightly below the unmasked
 0.7801; that masked number becomes the stage-1 reference). Deployment of a
 masked-vocab model is out of scope for stage 1. Arms on the corpus-trained
 bpe8k vocabulary satisfy the convention trivially.
+
+*Superseded by measurement (W0 below): the active set is **74,957**, not the
+72,304 estimated here, because the perturbation suites emit ids the train
+stream and clean valid split do not; the flat table is therefore 153.5M
+floats, and the masked native reference is **0.7796**. `active_vocab.py` is
+the implementation and the source of these numbers.*
 
 **Grid sketch** (lands in `configs.py` as `TREE_TRANSPLANTS`; code becomes
 the source of truth for hyperparameters once written):
@@ -608,6 +614,69 @@ in W0 regardless. It is also free on BPB by construction: masking removes
 competitors from the normalizer and can only help. The curve's gate therefore
 lives on rules 1 and beyond, where parameters are actually deleted.
 
+### W0 — done (2026-08-28)
+
+All three prerequisites have landed; W1 is unblocked.
+
+**MLS job scaffolding.** `jobs.py` holds the job registry, derived from
+`configs.py` rather than duplicating it — adding an arm there makes it
+launchable here. `run_train_jobs.py` and `run_eval.py` submit it, one
+`a100.1gpu` job per arm (the allocation offers 42 of them, so the wave
+schedule's parallelism is real). Two environment facts were measured, not
+assumed: worker containers mount the workspace at `/workspace-SR004.nfs2/`
+rather than `/mnt/virtual_ai0001053-00054_SR004-nfs2/`, and `mls` is importable
+only from the `arkhip` env while the entrypoints need `gigaevo-core`'s torch.
+`configs.py` is therefore kept standard-library-only, so the launcher reads the
+grid under one interpreter and the job runs it under another. Launchers refuse
+a dirty tree, stage the tracked tree to `<artifacts>/code/<commit>`, skip
+finished and already-queued work, and refuse to fan out over a token cache that
+does not exist yet — `get_tokens` is a read-through cache, so N jobs missing the
+same entry would race to write it.
+
+**P0 — the masked native reference is 0.7796** (`results/transplant_masked/`),
+against 0.7801 unmasked in the same harness. Every suite moves the same way and
+by the same negligible amount:
+
+| suite | masked | unmasked | Δ |
+|---|---|---|---|
+| clean | **0.7796** | 0.7801 | −0.0005 |
+| typo1 | 0.9358 | 0.9365 | −0.0007 |
+| typo5 | 1.3905 | 1.3921 | −0.0016 |
+| lower | 0.8243 | 0.8249 | −0.0006 |
+| upper | 1.0702 | 1.0710 | −0.0009 |
+| title | 0.8885 | 0.8891 | −0.0006 |
+| randcase | 1.8151 | 1.8165 | −0.0014 |
+
+Every delta is at or under the 0.0016 noise floor, so **the mask costs the
+native model nothing measurable** — as predicted, since a pretrained model
+already puts almost no mass on the other-language tail the mask removes. Its
+value is comparability, not the number: an arm with a bad init *can* put real
+mass there, and without the shared mask that would land in its BPB as a
+normalizer artifact rather than as anything about its embedding.
+
+**The active set is 74,957, not 72,304.** The train stream reproduces stage 0's
+72,304 exactly and the clean valid split adds 173. The remaining 2,480 come
+from the six perturbation suites, and taking them is not optional: the `upper`
+suite alone emits 1,323 ids the pre-registered set lacks, covering 3.4% of its
+tokens, and under the mask each is a target of probability zero. Scoring it
+against the pre-registered set would not have shifted `upper` BPB — it would
+have made it unbounded. So the convention is "every text the harness scores",
+`assert_targets_active` fails loudly rather than quietly if that is ever
+violated again, and compression is quoted against 74,957 x 2048 = **153.5M
+floats** in place of 148.1M. On the corpus-trained arms the convention is
+near-vacuous as the plan expected: bpe8k keeps 7,949 of 8,000 ids,
+fact8k-nosuf 7,951.
+
+**Checkpointing** (landed 0626e5ab) now has a reader: `eval_transplant.py`
+reloads a saved embedding and head, re-scores it, and records the delta against
+the run that saved it. Its round trip is covered on CPU in
+`tests/experiments/test_vocab_factorization_w0.py` — with a stub body, so the
+mask and checkpoint contracts are tested without a GPU or a 1.7B download. It
+has not yet run against a real checkpoint, because none exists: producing one
+means training an arm, and the local card could not spare the ~40 GB while
+neighbouring processes held 46 of its 80. That is the constraint W0 exists to
+remove, and the first W1 job removes it.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one
@@ -700,3 +769,15 @@ unseen words.
   arm, the L0-L3 fitness ladder for the later GigaEvo feature-evolution
   phase, and the progressive-shrink track. Written self-contained for a
   fresh implementing session.
+- 2026-08-28 — **W0 done**, W1 unblocked. MLS job scaffolding (`jobs.py`,
+  `run_train_jobs.py`, `run_eval.py`) fans the grid out one arm per
+  `a100.1gpu`; `active_vocab.py` + a stem-softmax mask in `TransplantLM`
+  implement the active-vocabulary convention for every arm; `eval_transplant.py`
+  gives the checkpoints a reader. **P0: the masked native reference is 0.7796**
+  (unmasked 0.7801 in the same harness) — every suite moves by ≤0.0016, so the
+  mask costs the native model nothing measurable and buys comparability only.
+  The active set is **74,957**, not the pre-registered 72,304: the train stream
+  reproduces 72,304 exactly, but the perturbation suites emit 2,653 further ids
+  (`upper` alone 1,323, over 3.4% of its tokens) that the mask would otherwise
+  score at probability zero. Compression is quoted against 153.5M floats.
+  Mask and checkpoint contracts covered on CPU in `tests/experiments/`.

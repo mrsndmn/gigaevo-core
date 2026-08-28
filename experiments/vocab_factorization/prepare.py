@@ -14,8 +14,19 @@ import time
 
 import numpy as np
 
-from experiments.vocab_factorization.configs import ARMS, ARMS_BY_NAME
+from experiments.vocab_factorization.configs import (
+    ARMS,
+    ARMS_BY_NAME,
+    token_cache_path,
+)
 from experiments.vocab_factorization.tokenization import Encoding, iter_chunks
+
+__all__ = [
+    "build_text",
+    "encode_text",
+    "get_tokens",
+    "token_cache_path",
+]
 
 _WORKER_ARM = None
 
@@ -95,13 +106,6 @@ def encode_text(
         role=np.concatenate([r[1] for r in results]),
         suffix=np.concatenate([r[2] for r in results]),
     )
-
-
-def token_cache_path(
-    tokens_dir: Path, arm_name: str, split: str, nbytes: int | None
-) -> Path:
-    tag = "full" if nbytes is None else f"{nbytes // (1024 * 1024)}mb"
-    return tokens_dir / arm_name / f"{split}.{tag}.npz"
 
 
 def get_tokens(

@@ -13,6 +13,11 @@ saved because nothing else changes: the body is frozen and reloads from HF. This
 is what lets a downstream evaluation ride along on a run scheduled for some other
 reason instead of paying for its own.
 
+Every arm is optimized and scored under the **active-vocabulary mask** (see
+``active_vocab``), so the softmax normalizer is the same set of competitors for
+all of them. ``--no-mask`` reproduces the pre-mask numbers and nothing else:
+masked and unmasked BPB are not comparable.
+
 Run::
 
     python -m experiments.vocab_factorization.train_transplant --all
@@ -28,7 +33,7 @@ import time
 
 import torch
 
-from experiments.vocab_factorization import perturb, transplant
+from experiments.vocab_factorization import active_vocab, perturb, transplant
 from experiments.vocab_factorization.build_arms import get_arm
 from experiments.vocab_factorization.configs import (
     HOST_MODEL,
@@ -84,6 +89,14 @@ def _save_checkpoint(model, spec, tspec, heads, steps, path: Path) -> str:
         path,
     )
     return str(path)
+
+
+def _reserve(gb: float) -> None:
+    """Grab the run's peak memory once, up front. See ``distill_embed._reserve``."""
+    if gb <= 0:
+        return
+    buf = torch.empty(int(gb * (1 << 30)), dtype=torch.uint8, device="cuda")
+    del buf
 
 
 def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
@@ -143,6 +156,42 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         text = perturb.apply_suite(suite, valid_text, seed=0)
         e = encode_text(spec.arm, args.arms_dir, text, workers=args.workers)
         eval_sets[suite] = (_heads_arrays(e, heads), len(text.encode("utf-8")))
+
+    # The active-vocabulary convention, applied identically to every arm. Built
+    # from this arm's own streams, so an arm whose vocabulary was trained on the
+    # corpus satisfies it very nearly trivially while the host's 152k table
+    # sheds the half of itself this ru+en corpus never exercises. Skipping it is
+    # possible (--no-mask) but only for reproducing the pre-mask numbers: an
+    # unmasked arm's BPB is not comparable to a masked one's.
+    active_ids = mask_info = None
+    if not args.no_mask:
+        active_ids = active_vocab.load_or_build(
+            spec.arm,
+            arm.heads["stem"],
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            tspec.train_bytes,
+            workers=args.workers,
+        )
+        for suite in EVAL_SUITES:
+            active_vocab.assert_targets_active(
+                eval_sets[suite][0], active_ids, f"{spec.name}/{suite}"
+            )
+        model.set_active_mask(
+            active_vocab.mask_from_ids(active_ids, heads["stem"], device)
+        )
+        mask_info = {
+            "n_active": int(active_ids.size),
+            "table_size": heads["stem"],
+            "active_flat_floats": active_vocab.active_floats(active_ids.size, d_model),
+        }
+        print(
+            f"[{spec.name}] active vocab {active_ids.size}/{heads['stem']} "
+            f"({active_ids.size / heads['stem']:.1%}), "
+            f"flat table {mask_info['active_flat_floats'] / 1e6:.1f}M floats",
+            flush=True,
+        )
 
     def evaluate(tag: str, net) -> dict:
         out = {}
@@ -223,6 +272,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         "tokens_per_byte_train": n_tokens / train_bytes,
         "context_bytes": seq / (n_tokens / train_bytes),
         "checkpoint": ckpt,
+        "active_vocab": mask_info,
         "note": spec.note,
     }
     for suite in EVAL_SUITES:
@@ -250,11 +300,17 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("results/transplant"))
     ap.add_argument("--ckpt-dir", type=Path, default=Path("results/transplant/ckpt"))
     ap.add_argument("--no-ckpt", action="store_true")
+    ap.add_argument(
+        "--no-mask",
+        action="store_true",
+        help="evaluate over the full table (reproduces the pre-mask numbers)",
+    )
     ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--train-mb", type=int, default=0)
     ap.add_argument("--eval-batch", type=int, default=4)
     ap.add_argument("--eval-mb", type=float, default=0.0)
     ap.add_argument("--workers", type=int, default=40)
+    ap.add_argument("--reserve-gb", type=float, default=0.0)
     args = ap.parse_args()
 
     todo = (
@@ -264,6 +320,11 @@ def main() -> None:
         raise SystemExit("pass --exp NAME [NAME ...] or --all")
 
     torch.set_float32_matmul_precision("high")
+    # Grab the run's peak memory once. Stage 0 lost two launches to neighbour
+    # processes expanding into memory freed between allocations; on a dedicated
+    # MLS worker this is a no-op, so it costs nothing to leave on. Pairs with
+    # never calling empty_cache mid-run.
+    _reserve(args.reserve_gb)
     print(f"loading host {HOST_MODEL} ...", flush=True)
     host = transplant.load_host(HOST_MODEL)
     print(f"host loaded: d_model={host[3]} vocab={host[1].shape[0]}", flush=True)

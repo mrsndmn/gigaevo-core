@@ -217,6 +217,51 @@ def transplant_table(runs_dir: Path) -> str:
     return _table(head, rows)
 
 
+def masked_table(masked_dir: Path, distill_dir: Path) -> str:
+    """Runs under the active-vocabulary mask, against their unmasked twins.
+
+    The comparison is the point of the table: the mask is justified by
+    comparability across arms, not by moving any single arm's number, and the
+    only way to see which of those it did is to print both.
+    """
+    names, found = _load(masked_dir, [t.name for t in TRANSPLANTS])
+    if not names:
+        return ""
+    # Stage 0's native record is the unmasked twin of ``orig-frozen``: same
+    # harness, same full valid split, no mask.
+    ref_path = distill_dir / "native.json"
+    ref = json.loads(ref_path.read_text()) if ref_path.exists() else {}
+    head = [
+        "experiment",
+        "active / table",
+        "flat floats",
+        *[f"{s} masked" for s in SUITES],
+        *[f"d {s} vs unmasked" for s in SUITES],
+    ]
+    rows = []
+    for n in names:
+        d = found[n]
+        av = d.get("active_vocab") or {}
+        twin = ref if n == "orig-frozen" else {}
+        rows.append(
+            [
+                n,
+                f"{av.get('n_active', '?')} / {av.get('table_size', '?')}",
+                f"{av.get('active_flat_floats', 0) / 1e6:.1f}M",
+                *[d[f"eval.{s}"]["bpb"] for s in SUITES],
+                *[
+                    (
+                        d[f"eval.{s}"]["bpb"] - twin[f"eval.{s}"]["bpb"]
+                        if twin.get(f"eval.{s}")
+                        else None
+                    )
+                    for s in SUITES
+                ],
+            ]
+        )
+    return _table(head, rows)
+
+
 def distill_table(runs_dir: Path) -> str:
     order = ["native"] + [s.name for s in DISTILLS]
     names, found = _load(runs_dir, order)
@@ -342,6 +387,24 @@ def build_document(args) -> str:
             "",
         ]
 
+    if args.transplant_masked.exists() and any(args.transplant_masked.glob("*.json")):
+        parts += [
+            "## 6. Under the active-vocabulary mask (W0 / P0)",
+            "",
+            "Only ids the corpus exercises stay in the stem softmax — in "
+            "training and in evaluation, identically for every arm — so a "
+            "per-arm BPB delta is about the arm's embedding rather than about "
+            "how its rows happen to sit near the half of the host table this "
+            "ru+en corpus never touches. `d ... vs unmasked` compares against "
+            "the same harness with the mask lifted; masking removes terms from "
+            "the normalizer, so it can only lower BPB, and the question is "
+            "whether it does so by more than the 0.0016 noise floor. "
+            "Compression ratios downstream are quoted against `flat floats`.",
+            "",
+            masked_table(args.transplant_masked, args.distill),
+            "",
+        ]
+
     return "\n".join(parts)
 
 
@@ -350,6 +413,11 @@ def main() -> None:
     ap.add_argument("--screen", type=Path, default=Path("results/screen2.json"))
     ap.add_argument("--runs", type=Path, default=Path("results/runs"))
     ap.add_argument("--transplant", type=Path, default=Path("results/transplant"))
+    ap.add_argument(
+        "--transplant-masked",
+        type=Path,
+        default=Path("results/transplant_masked"),
+    )
     ap.add_argument("--distill", type=Path, default=Path("results/distill"))
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()

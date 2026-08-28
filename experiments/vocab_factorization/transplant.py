@@ -40,21 +40,36 @@ _CE_CHUNK = 4096
 
 
 def _ce_sum(
-    h: torch.Tensor, weight: torch.Tensor, target: torch.Tensor
+    h: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Summed cross-entropy of ``h @ weight.T`` against ``target``.
 
     For a large vocabulary the logits are produced in slices under
     ``checkpoint``, so only one slice exists at a time and backward recomputes
     the rest. For a small vocabulary this is a plain matmul.
+
+    ``mask`` is a keep-mask over the vocabulary (see ``active_vocab``). Masked
+    logits are driven to the float32 floor rather than ``-inf``: a row whose
+    every entry is masked then degrades to a uniform distribution instead of
+    NaN, so a mistake shows up as an absurd loss that can be traced rather than
+    as a silent NaN halfway through a run. Masked rows receive exactly zero
+    gradient through the softmax, which is what makes the mask *also* the
+    "inactive tokens are not optimized" half of the convention.
     """
     V = weight.shape[0]
-    if V < _CHUNK_VOCAB_THRESHOLD:
-        lg = F.linear(h, weight)
-        return F.cross_entropy(lg.float(), target, reduction="sum")
+    floor = torch.finfo(torch.float32).min
 
     def block(hh, tt):
-        return F.cross_entropy(F.linear(hh, weight).float(), tt, reduction="sum")
+        lg = F.linear(hh, weight).float()
+        if mask is not None:
+            lg = lg.masked_fill(~mask, floor)
+        return F.cross_entropy(lg, tt, reduction="sum")
+
+    if V < _CHUNK_VOCAB_THRESHOLD:
+        return block(h, target)
 
     total = h.new_zeros((), dtype=torch.float32)
     for i in range(0, h.shape[0], _CE_CHUNK):
@@ -101,6 +116,28 @@ class TransplantLM(nn.Module):
             if name != "stem":
                 nn.init.zeros_(self.emb[name].weight)
                 nn.init.zeros_(self.out[name].weight)
+        self.register_buffer("stem_mask", None, persistent=False)
+
+    def set_active_mask(self, mask: torch.Tensor | None) -> None:
+        """Restrict the stem softmax to the active vocabulary (or lift it).
+
+        Only the stem head is masked. The feature heads (role, suffix) have a
+        few hundred values and the corpus exercises all of them, so there is
+        nothing inactive to remove and a mask there would only be a chance to
+        get the bookkeeping wrong.
+        """
+        if mask is None:
+            self.stem_mask = None
+            return
+        if mask.shape != (self.heads["stem"],):
+            raise ValueError(
+                f"active mask is {tuple(mask.shape)}, expected "
+                f"({self.heads['stem']},) — the mask must cover the *table*, "
+                "which for an HF host is the padded row count, not len(tokenizer)"
+            )
+        self.stem_mask = mask.to(
+            device=self.emb["stem"].weight.device, dtype=torch.bool
+        )
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
@@ -114,11 +151,21 @@ class TransplantLM(nn.Module):
         x = x.to(self._body_dtype)
         h = self.body(inputs_embeds=x).last_hidden_state
         if targets is None:
-            return {n: self.out[n](h) for n in self.head_names}
+            out = {n: self.out[n](h) for n in self.head_names}
+            if self.stem_mask is not None:
+                out["stem"] = out["stem"].masked_fill(
+                    ~self.stem_mask, torch.finfo(torch.float32).min
+                )
+            return out
 
         hf = h.reshape(-1, self.d_model)
         losses = {
-            "stem": _ce_sum(hf, self.out["stem"].weight, targets["stem"].reshape(-1))
+            "stem": _ce_sum(
+                hf,
+                self.out["stem"].weight,
+                targets["stem"].reshape(-1),
+                mask=self.stem_mask,
+            )
         }
         if len(self.head_names) > 1:
             # Same teacher-forced conditioning as the from-scratch study, so the
