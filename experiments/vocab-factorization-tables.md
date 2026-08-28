@@ -2,7 +2,7 @@
 
 Generated snapshot of every metric in the study. The underlying JSON lives under `results/`, which is gitignored; this file is the tracked record. Interpretation and conclusions live in `experiments/vocab-factorization.md` — this file is data only.
 
-- Generated: 2026-08-28 03:50
+- Generated: 2026-08-28 08:50
 - Transplant host: `Qwen/Qwen3-1.7B`
 - Corpus: ru+en Wikipedia, NFC, document-hash split (`data.py`)
 - Regenerate: `python -m experiments.vocab_factorization.report --out experiments/vocab-factorization-tables.md`
@@ -118,3 +118,30 @@ Body frozen; only the embedding table and heads train.
 | bpe8k-t-random | random | 4.3854 | 1.3130 | 0.1266 | 0.5511 | 0.0887 | 1.5170 | 0.4860 | 1.5324 | 8,000 | 16,384,000 | 1,425,794,048 | 853 | 50.9 |
 | bpe8k-t | mean_of_pieces | 2.7078 | 0.7031 | 0.1359 | 0.5584 | 0.0469 | 0.6979 | 0.1965 | 0.9744 | 8,000 | 16,384,000 | 1,425,794,048 | 853 | 50.9 |
 | fact8k-nosuf-t | mean_of_pieces | 4.1309 | 0.7390 | 0.1475 | 0.6011 | 0.0149 | 0.4599 | 0.0725 | 1.7958 | 8,000 | 16,416,768 | 1,425,826,816 | 898 | 53.7 |
+
+## 5. Stage 0 — distilling the host embedding table
+
+No LM training: each method fits the frozen Qwen3-1.7B table offline, the reconstruction replaces it (tied input + output unless noted), and the frozen body is evaluated as-is. `rel err` is the fraction of table variance the fit leaves unexplained — overall, token-frequency-weighted, and restricted to ids the eval text uses. `d native` is the BPB cost against the freshly evaluated native table. Float params only; code indices are per-token bits, reported in the JSON.
+
+| experiment | method | float params | compress | rel err | rel err freq | rel err active | BPB clean | d native | d upper | d title | d randcase |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| native | none | 311,164,928 | x1.0 | - | - | - | 0.7801 | - | 0.2909 | 0.1090 | 1.0364 |
+| svd512 | svd | 78,839,808 | x3.9 | 0.5757 | 0.6251 | 0.5944 | 3.8617 | 3.0816 | - | - | - |
+| svd256 | svd | 39,419,904 | x7.9 | 0.7200 | 0.7318 | 0.7403 | 4.0216 | 3.2414 | - | - | - |
+| svd128 | svd | 19,709,952 | x15.8 | 0.8089 | 0.7927 | 0.8266 | 4.0323 | 3.2522 | 1.2495 | 0.4322 | 2.1744 |
+| svd64 | svd | 9,854,976 | x31.6 | 0.8649 | 0.8294 | 0.8816 | 3.9390 | 3.1589 | - | - | - |
+| vq4k | vq | 8,388,608 | x37.1 | 0.7756 | 0.7823 | 0.7792 | 3.6611 | 2.8810 | - | - | - |
+| tree64x2 | tree | 4,440,064 | x70.1 | 0.8720 | 0.8888 | 0.8949 | 3.6980 | 2.9179 | - | - | - |
+| rvq8x4k | rvq | 67,108,864 | x4.6 | 0.5057 | 0.4715 | 0.4792 | 2.1509 | 1.3708 | - | - | - |
+| rvq4x4k | rvq | 33,554,432 | x9.3 | 0.6148 | 0.5833 | 0.5948 | 2.5714 | 1.7913 | - | - | - |
+| rvq2x4k | rvq | 16,777,216 | x18.5 | 0.7006 | 0.6858 | 0.6925 | 3.2729 | 2.4928 | 1.9414 | 0.4301 | 1.5135 |
+| tree64x2-r448 | tree_res | 73,424,896 | x4.2 | 0.5744 | 0.6341 | 0.5913 | 2.7521 | 1.9720 | - | - | - |
+| tree64x2-r192 | tree_res | 34,004,992 | x9.2 | 0.7150 | 0.7396 | 0.7342 | 3.0041 | 2.2240 | - | - | - |
+| tree64x2-r64 | tree_res | 14,295,040 | x21.8 | 0.8059 | 0.8038 | 0.8247 | 3.2165 | 2.4363 | 1.6670 | 0.3700 | 1.3853 |
+| tree64x2-r8 | tree_res | 5,671,936 | x54.9 | 0.8602 | 0.8426 | 0.8818 | 3.3522 | 2.5721 | - | - | - |
+| svd128-freq | svd | 19,709,952 | x15.8 | 0.8841 | 0.4837 | 0.8856 | 2.3910 | 1.6109 | 1.5654 | 0.2866 | 1.5666 |
+| tree64x2-r64-freq | tree_res | 12,544,000 | x24.8 | 0.9011 | 0.3894 | 0.8866 | 2.2661 | 1.4860 | 1.8186 | 0.2934 | 1.4616 |
+| svd128-in | svd | 19,709,952 | x15.8 | 0.8089 | 0.7927 | 0.8266 | 2.8763 | 2.0961 | - | - | - |
+| svd128-out | svd | 19,709,952 | x15.8 | 0.8089 | 0.7927 | 0.8266 | 3.6703 | 2.8902 | - | - | - |
+| svd128-freq-norm | svd | 19,861,888 | x15.7 | 1.3302 | 0.6767 | 1.3428 | 6.7925 | 6.0123 | - | - | - |
+| tree64x2-r64-freq-norm | tree_res | 12,693,888 | x24.5 | 1.3953 | 0.5655 | 1.3768 | 7.6406 | 6.8605 | - | - | - |

@@ -329,6 +329,90 @@ plainly: the remaining gap to plain BPE is not a segmentation problem, which
 makes the joint (stem x case) softmax — idea 3, the one deliberately deferred —
 the only remaining candidate that could close it.
 
+## Study 4 — tree-structured vocabulary, stage 0: distill the host table
+
+The program this gates: replace the flat embedding table with a decision tree
+over embedding space — any string routes through learned splits, a token's
+vector is composed from shift vectors along its root-to-leaf path, parameters
+live at shared nodes instead of one row per token. Stage 0 is the cheapest
+decisive probe, pre-registered before running: **fit structured approximations
+of the frozen Qwen3-1.7B table offline** (no LM training anywhere), plug each
+reconstruction into the frozen body as the tied embedding + output head, and
+measure clean-BPB damage. Kill criterion: **> 0.05 BPB at ~x10 compression
+kills the route**; the hope was < 0.01 at x20.
+
+Grid in `configs.DISTILLS` (svd / vq / rvq / hierarchical-k-means tree /
+tree + low-rank residual, at matched float budgets ~x4-x32, each optionally
+fit under token-frequency weighting), runner `distill_embed.py`, full numbers
+in tables §5, figure `results/distill_stage0.png`. Evaluation is the study-2
+harness on the full valid split; the native table re-evaluated in this exact
+harness scores 0.7801 (study 2's 0.7125 was a 2.2 MB cut of the same split —
+deltas here are internal to stage 0).
+
+| arm | compress | rel err | d native BPB |
+|---|---|---|---|
+| rvq8x4k (best absolute) | x4.6 | 0.506 | **+1.371** |
+| rvq4x4k | x9.3 | 0.615 | +1.791 |
+| svd128-freq | x15.8 | 0.884 | +1.611 |
+| tree64x2-r64-freq (best per float) | x24.8 | 0.901 | **+1.486** |
+| svd512 | x3.9 | 0.576 | +3.082 |
+| tree64x2-r64-freq-norm (control) | x24.5 | 1.395 | +6.861 |
+
+**1. The kill criterion fired, with a 30-60x margin.** The best fit at any
+compression costs +1.37 BPB; the criterion was 0.05. No method, objective, or
+budget came within an order of magnitude, so this is not a tuning shortfall.
+
+**2. The table is not low-rank — at all.** Rank 512 (a quarter of d_model)
+leaves 57.6% of the variance unexplained, and SVD's BPB damage is *flat* in
+rank (+3.1 to +3.3 from x3.9 to x31.6). The spectrum is nearly uniform: the
+table's information is per-token idiosyncratic, with no dominant shared
+subspace for a structural fit to exploit.
+
+**3. The fit objective matters more than the structure.** Frequency-weighted
+fitting roughly halves the damage at matched budget (svd128 3.25 -> 1.61;
+tree-r64 2.44 -> 1.49) — the biggest single lever found — while swapping
+structures at matched budget moves far less. The decision-tree constraint
+itself is nearly free (tree-only at x70 ≈ flat VQ at x37) but helps nothing.
+
+**4. The damage is directional, not a softmax-temperature artifact.** The
+obvious objection — low-rank fits shrink row norms, maybe rescaling fixes
+it — was run as a control and made things far *worse* (+1.49 -> +6.86,
+reconstruction error above 1.0): restoring full magnitude to wrong directions
+amplifies the error. Consistently, BPB damage is not monotone in MSE across
+methods; what the body cares about is not Frobenius distance.
+
+**5. Both sides of the model are catastrophic, the output side more so.**
+Reconstructing only the input embedding costs +2.10, only the output head
++2.89, both +3.25 (svd128). There is no cheap half-measure.
+
+**6. Capacity was never the obstacle — the offline objective is.** Study 2's
+`bpe8k-t` trained a 16.4M-float table (x19 fewer floats than native) through
+the frozen body and *beat* the native model (0.7031 vs 0.7125). A x19
+compressed embedding function for this body demonstrably exists and is
+reachable by one GPU-hour of training — it is just not reachable by
+approximating the pretrained matrix. Matching the table is not matching the
+function.
+
+### Stage 0 conclusions
+
+The distillation route — compress an existing model's embedding table
+offline, plug it in, keep BPB — is **dead by its pre-registered criterion**,
+and died for a structural reason, not a tuning one: a trained embedding table
+has effectively full intrinsic parametric dimension under offline
+reconstruction. That is itself a finding worth keeping: every one of the
+311M floats is doing work that MSE — even frequency-weighted MSE — cannot
+summarize.
+
+What survives is the *trained* route, and study 2 already proves its
+capacity side. If the tree-vocabulary program continues, stage 1 must train
+the tree-composed parameterization through the frozen body (study-2 protocol,
+~1 GPU-hour per arm) rather than distill it; the question becomes whether
+routed, shared-node structure matches a flat table at equal floats when both
+are *trained*, with open-vocabulary routing as the remaining upside. The
+cheap 33M-scale alternative from study 3's conclusion — the joint
+(stem x case) softmax — is unaffected by this result and remains the other
+open thread.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -381,3 +465,10 @@ unseen words.
   moved BPB (noise floor measured at 0.0016), but together they turned a 4.8%
   token deficit vs bpe8k into a 7% surplus and improved d upper 0.839 -> 0.691.
   The metric showed ~99.6% of the old typo-robustness number was emission cost.
+- 2026-08-28 — Study 4 stage 0: offline distillation of the Qwen3-1.7B
+  embedding table (19 fits + native + controls, ~1.5 GPU-hours of eval on a
+  contended shared GPU; two OOM crashes fixed by reserving peak memory up
+  front). Killed by its pre-registered criterion with a 30-60x margin: best
+  fit +1.37 BPB vs the 0.05 line. The table has effectively full intrinsic
+  dimension under offline reconstruction; the trained route (study 2) is the
+  one that survives. Figure: `results/distill_stage0.png`.
