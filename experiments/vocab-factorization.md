@@ -349,6 +349,22 @@ harness on the full valid split; the native table re-evaluated in this exact
 harness scores 0.7801 (study 2's 0.7125 was a 2.2 MB cut of the same split —
 deltas here are internal to stage 0).
 
+How the stage-0 tree is built (`distill_embed._fit_tree`): recursive
+*weighted k-means over embedding space* — no surface-feature rules anywhere
+at this stage. Level 1 clusters the table rows (branching 64); level 2
+clusters each cluster's *residuals* (row minus parent centroid); every node
+stores its cluster's weighted residual mean, so the sum of node vectors
+along a root-to-leaf path is exactly the leaf-cluster mean. Routing is
+nearest-centroid, 12 bits per token, counted separately from floats. Two
+structural facts fell out: (a) a depth-2 path-sum is *representationally
+equivalent to flat VQ* with the same leaf count — the hierarchy constrains
+how centroids are found and provides routing, but adds no expressivity,
+which is why tree-only ≈ vq4k below; (b) embedding space is so unevenly
+populated that the nominal 4,096 leaves collapse to 2,104 (unweighted) or
+1,249 (frequency-weighted). `tree_res` adds the identity channel: a
+(weighted) PCA of what the tree leaves behind, shared rank-r basis plus r
+coefficients per token.
+
 | arm | compress | rel err | d native BPB |
 |---|---|---|---|
 | rvq8x4k (best absolute) | x4.6 | 0.506 | **+1.371** |
@@ -413,6 +429,45 @@ cheap 33M-scale alternative from study 3's conclusion — the joint
 (stem x case) softmax — is unaffected by this result and remains the other
 open thread.
 
+### Stage 1 plan — train the tree, don't distill it (pre-registered, not run)
+
+Stage 0's lesson dictates the design: the tree supplies *structure* (which
+parameters a token touches); gradients through the frozen body supply the
+values. Four commitments, fixed before any code runs:
+
+1. **Trainable path composition.** A token's embedding is the sum of node
+   shift vectors along its fixed root-to-leaf path plus a per-token low-rank
+   residual; node vectors and residual factors train through the frozen
+   Qwen3-1.7B body under the study-2 transplant protocol. The softmax stays
+   *flat* over the vocabulary with the output embedding composed from the
+   same tied tree — stage 0's in/out ablation showed the output side is the
+   sensitive one, so prediction never goes hierarchical.
+2. **Routing is fixed before training, from mean-of-pieces vectors.** Stage 0
+   clustered a table stage 1 does not have; the mean-of-pieces vectors
+   (study 2's init, worth 0.61 BPB there) are computed per token, clustered
+   hierarchically to assign paths, then discarded. Optional surface-rule
+   upper levels (script, case shape, leading space) keep the top of the tree
+   interpretable. Learned routing (periodic re-clustering) is an ablation to
+   run only if fixed routing is the measured bottleneck — it imports
+   codebook-collapse failure modes.
+3. **A multiplicative-composition ablation.** The additive path-sum is
+   representationally flat-VQ-plus-residual (see method note above); one arm
+   gives each node a FiLM pair (elementwise scale + shift applied down the
+   path) so depth can buy expressivity. The additive arm stays the default
+   so the baseline remains clean.
+4. **Small vocabulary, matched control.** The comparison is against the
+   trained flat table `bpe8k-t` (0.7031, 16.4M embedding floats) on the same
+   bpe8k vocabulary, with tree arms at ~x2/x4 fewer embedding floats plus
+   the FiLM and re-clustering ablations. Open-vocabulary routing over
+   arbitrary strings is stage 2, contingent on stage 1 surviving.
+
+Success criterion: clean BPB within ~0.005 of `bpe8k-t` at >=x2 fewer
+embedding floats, robustness suites unchanged. Kill criterion: worse than
++0.05 BPB at x2. Estimated cost ~4-5 GPU-hours. The concrete grid lands in
+`configs.py` (`TREE_TRANSPLANTS`) when implementation starts; per this
+file's convention the code, not this section, will then be the source of
+truth for hyperparameters.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -472,3 +527,10 @@ unseen words.
   fit +1.37 BPB vs the 0.05 line. The table has effectively full intrinsic
   dimension under offline reconstruction; the trained route (study 2) is the
   one that survives. Figure: `results/distill_stage0.png`.
+- 2026-08-28 — Stage 1 pre-registered (not run): train the tree-composed
+  parameterization through the frozen body against the `bpe8k-t` flat-table
+  control at matched vocabulary; fixed mean-of-pieces routing, flat softmax,
+  FiLM and re-clustering ablations. Success: parity BPB at >=x2 fewer
+  embedding floats; kill: +0.05 at x2. Recorded stage-0 tree-construction
+  method note (path-sum = leaf mean = flat-VQ equivalence; leaf collapse
+  2,104 / 1,249 of nominal 4,096).
