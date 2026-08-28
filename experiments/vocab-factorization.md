@@ -544,6 +544,78 @@ module with fixed routing and trainable leaf/residual parameters),
 `TREE_TRANSPLANTS` in `configs.py`, reusing `train_transplant.py`'s loop
 with two hooks: the softmax mask and the embedding-module swap.
 
+## Priorities — what runs next, and in what order
+
+Four studies have left five open tracks and no ordering among them. This
+section fixes one. Decisions that were not obvious are recorded as ADRs
+(`docs/adr/`); the terminology is in `CONTEXT.md`; the full derivation,
+including the alternatives rejected, is
+`run/deep-interview/deep-interview-vocab-factorization-priorities.md`.
+
+**Ranking objective: information gained per GPU-hour toward a claim that
+survives scrutiny** (ADR 0001). Compute is not the binding constraint — the
+grid runs as parallel MLS jobs over a week-plus — so the ordering is by what a
+result *changes*, not by what it costs. A cheap probe that can return a
+decisive negative outranks an expensive one that can only return a positive,
+which is the same principle that made stage 0 worth running.
+
+| # | Track | Cost | Gate |
+|---|---|---|---|
+| W0 | *prerequisites* — MLS job scaffolding, checkpoint saving, **P0** = active-vocab mask + masked native reference | ~2 GPU-h | P0's masked BPB becomes stage 1's reference (expect slightly below the unmasked 0.7801) |
+| 1 | **transplant-hardening** — downstream-task eval + an unfrozen-body arm | ~1.3 GPU-h marginal | `bpe8k-t` within a few points of `orig-frozen` on loglikelihood MC → study 2's headline stands; else it is rewritten from "beats the model it replaced" to "matches it on corpus BPB" |
+| 2 | **stage1-tree** — the pre-registered v2 grid above | 5–7 GPU-h + 2 modules | unchanged: parity BPB at ≥x2 fewer embedding floats; kill at +0.05 at x2 |
+| 3 | **ladder-calibration** — rank-correlate L0/L1 against L2 | ~4 GPU-h | Spearman ρ ≳ 0.7 → the evolution phase is unblocked; else it is killed (ADR 0002) |
+| 4 | **progressive-shrink** — the curriculum past rule 0 | ~3 GPU-h | continue while healed BPB stays within +0.01 of the masked reference; stop at the vocabulary size where it does not |
+| 5 | **evolution-phase** — GigaEvo over `token_features.py` | ~0 GPU-h now | pre-registration only: problem dir, `metrics.yaml`, initial program, and an explicit choice of MAP-Elites descriptors. Launch blocked on #3 |
+| — | **stem×case-softmax** | — | **deferred** (ADR 0003) |
+
+Waves, since execution is parallel: **W0** blocking → **W1** transplant-hardening
+‖ stage-1 module implementation → **W2** stage-1 grid ‖ ladder-calibration ‖
+progressive-shrink → **W3** evolution pre-registration.
+
+**Why hardening outranks the flagship.** It is the cheapest thing available that
+can falsify something already written in this file. Study 2's headline — a
+transplant that beats the model it replaced with 295M fewer parameters — rests
+entirely on BPB measured on the same corpus the new embeddings were trained on,
+and the file already concedes that "good BPB does not guarantee preserved
+instruction-following". It costs almost nothing because it budgets **no
+dedicated runs**: stage 1 v2 already schedules a `bpe8k-t` re-run under the
+active-vocab convention, `orig-frozen` needs no training at all
+(`train=False`), and `train_transplant.py` now saves checkpoints — so the
+evaluation rides along on runs that are happening anyway. Round 1 of study 2
+saved nothing, which is why this could not simply be measured on the existing
+models: they no longer exist.
+
+**Why the evolution phase is gated rather than scheduled.** Its ladder has two
+defects that only show up against this study's own findings. L0 scores
+frequency-weighted explained variance — a Frobenius-family fit — which is
+precisely what stage 0 finding 4 showed does not predict BPB. And the
+trustworthy rungs cannot carry a search: a completed GigaEvo run in this repo
+(`problems/tabular_regression/elite_intra_extra_20260524.py`) records ~800
+unique evaluations, which at L2's ~13 min is ~173 GPU-h — 25x this programme's
+total spend to date, spent driving selection on an unvalidated fitness
+function. That is the failure mode the methodological correction above
+documents twice. ~4 GPU-h of rank-correlation buys the right to spend it, or
+not to. The calibration candidates are feature-group ablations **plus three or
+four deliberately-bad anchors** (random routing, single-feature routing,
+length-only): without a known-bad low end, ρ is measured over a restricted
+range and reads optimistically — the same range-restriction trap as `inflation`
+rewarding a bad baseline.
+
+**Rule 0 is not part of progressive-shrink.** It is a prerequisite of stage 1 —
+the masked native reference every stage-1 arm is measured against — so it runs
+in W0 regardless. It is also free on BPB by construction: masking removes
+competitors from the normalizer and can only help. The curve's gate therefore
+lives on rules 1 and beyond, where parameters are actually deleted.
+
+**What was considered and rejected.** An open-vocabulary gate on stage 1 —
+held-out active ids scored against a flat control — was proposed on the grounds
+that the pre-registered gates are parity-only and so cannot detect the one
+thing a flat table structurally cannot do. It was **rejected**: stage 1's gates
+stand as pre-registered. The consequence is recorded rather than hidden — a
+passing stage 1 supports "a routed table matches a flat one at half the floats"
+and not a capability claim.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -610,6 +682,14 @@ unseen words.
   embedding floats; kill: +0.05 at x2. Recorded stage-0 tree-construction
   method note (path-sum = leaf mean = flat-VQ equivalence; leaf collapse
   2,104 / 1,249 of nominal 4,096).
+- 2026-08-28 — Priorities fixed across the five open tracks (no runs yet).
+  Ranking objective recorded as ADR 0001; the evolution phase gated behind a
+  ladder-calibration track as ADR 0002; `stem×case-softmax` deferred and the
+  33M setup demoted from a venue for claims to ladder rung L2 as ADR 0003.
+  `train_transplant.py` now saves the trained embedding and heads — study 2's
+  models were unrecoverable, which is why hardening had to be sequenced around
+  runs that were already scheduled rather than measured directly. Glossary in
+  `CONTEXT.md`; derivation in `run/deep-interview/`.
 - 2026-08-28 — Stage 1 plan revised to v2 before implementation (gates
   unchanged): routing by interpretable token features (surface + char
   n-gram + corpus n-gram statistics) via boosted vector-leaf trees instead

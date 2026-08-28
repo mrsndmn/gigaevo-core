@@ -8,6 +8,11 @@ Every arm is evaluated **twice**: once at step 0, before any training, and once
 after. The step-0 row under ``mean_of_pieces`` init is the literal
 "modify the vocabulary on the fly, train nothing" measurement.
 
+Trained arms write their embedding and heads to ``--ckpt-dir``. Nothing else is
+saved because nothing else changes: the body is frozen and reloads from HF. This
+is what lets a downstream evaluation ride along on a run scheduled for some other
+reason instead of paying for its own.
+
 Run::
 
     python -m experiments.vocab_factorization.train_transplant --all
@@ -52,6 +57,33 @@ def _heads_for(arm, host_vocab: int) -> dict[str, int]:
     if getattr(arm, "kind", "") == "hf":
         heads["stem"] = host_vocab
     return heads
+
+
+def _save_checkpoint(model, spec, tspec, heads, steps, path: Path) -> str:
+    """Persist the trained parameters. The frozen body reloads from HF.
+
+    Round 1 of this study saved nothing, so five arms' worth of trained tables
+    were unrecoverable and any downstream question about them required a full
+    re-train first. ``emb`` and ``out`` *are* the transplant; ``torch.save``
+    keeps ``out.stem`` sharing storage with ``emb.stem`` while they are tied,
+    so a tied arm costs one table on disk, not two.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "experiment": spec.name,
+            "arm": spec.arm,
+            "host": HOST_MODEL,
+            "init": spec.init,
+            "heads": heads,
+            "steps": steps,
+            "seed": tspec.seed,
+            "emb": model.emb.state_dict(),
+            "out": model.out.state_dict(),
+        },
+        path,
+    )
+    return str(path)
 
 
 def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
@@ -167,6 +199,15 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
 
     post = evaluate("final", model) if steps else pre
 
+    # Only trained arms are saved: an untrained ``native`` arm's state is the
+    # host's own table, which reloads from HF for free.
+    ckpt = None
+    if steps and not args.no_ckpt:
+        ckpt = _save_checkpoint(
+            model, spec, tspec, heads, steps, args.ckpt_dir / f"{spec.name}.pt"
+        )
+        print(f"[{spec.name}] checkpoint -> {ckpt}", flush=True)
+
     results: dict = {
         "experiment": spec.name,
         "arm": spec.arm,
@@ -181,6 +222,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         "train_seconds": round(train_seconds, 1),
         "tokens_per_byte_train": n_tokens / train_bytes,
         "context_bytes": seq / (n_tokens / train_bytes),
+        "checkpoint": ckpt,
         "note": spec.note,
     }
     for suite in EVAL_SUITES:
@@ -206,6 +248,8 @@ def main() -> None:
     ap.add_argument("--arms-dir", type=Path, default=Path("data/arms"))
     ap.add_argument("--tokens-dir", type=Path, default=Path("data/tokens"))
     ap.add_argument("--out", type=Path, default=Path("results/transplant"))
+    ap.add_argument("--ckpt-dir", type=Path, default=Path("results/transplant/ckpt"))
+    ap.add_argument("--no-ckpt", action="store_true")
     ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--train-mb", type=int, default=0)
     ap.add_argument("--eval-batch", type=int, default=4)
