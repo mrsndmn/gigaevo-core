@@ -260,3 +260,80 @@ TRANSPLANTS: list[TransplantSpec] = [
 ]
 
 TRANSPLANTS_BY_NAME = {t.name: t for t in TRANSPLANTS}
+
+
+# ---------------------------------------------------------------------------
+# Study 4, stage 0: distill the host's embedding table into structured forms
+# ---------------------------------------------------------------------------
+#
+# The load-bearing question for the tree-vocabulary program: how many float
+# parameters does the pretrained embedding *function* actually need? Every
+# method fits the frozen table offline (no LM training anywhere); the
+# reconstruction is plugged into the frozen body and evaluated with the
+# study-2 BPB harness. Kill criterion agreed up front: > 0.05 BPB damage at
+# ~10x compression kills the program; the hope is < 0.01 at ~20x.
+
+
+@dataclass(frozen=True)
+class DistillSpec:
+    name: str
+    method: str  # svd | vq | rvq | tree | tree_res
+    rank: int = 0  # svd: rank; tree_res: residual rank
+    codes: int = 0  # vq/rvq: codebook size; tree/tree_res: branching factor
+    levels: int = 0  # rvq: number of residual codebook levels
+    depth: int = 0  # tree/tree_res: depth
+    weight: str = "none"  # none | freq -- row weights for the fit objective
+    apply: str = "both"  # both | input | output -- which side is reconstructed
+    full_suites: bool = False  # evaluate all perturbation suites, not just clean
+    note: str = ""
+
+
+# The ladders are matched in float-parameter budget (~x4 / x8 / x16 / x32
+# against the 311.2M-float native table) so methods compare at equal cost.
+# svd shares one exact SVD across ranks; rvq levels share one fit; the tree
+# arms share one tree and one residual basis. Adding a rung is nearly free.
+DISTILLS: list[DistillSpec] = [
+    # --- linear floor: global low-rank -------------------------------------
+    DistillSpec("svd512", "svd", rank=512, note="~x4.0"),
+    DistillSpec("svd256", "svd", rank=256, note="~x7.9"),
+    DistillSpec("svd128", "svd", rank=128, full_suites=True, note="~x15.8"),
+    DistillSpec("svd64", "svd", rank=64, note="~x31.6"),
+    # --- discrete-only floor: every token snaps to a centroid --------------
+    DistillSpec("vq4k", "vq", codes=4096, note="~x37, flat codebook"),
+    DistillSpec("tree64x2", "tree", codes=64, depth=2, note="~x37, routed"),
+    # --- additive codes, unrouted ------------------------------------------
+    DistillSpec("rvq8x4k", "rvq", codes=4096, levels=8, note="~x4.6"),
+    DistillSpec("rvq4x4k", "rvq", codes=4096, levels=4, note="~x9.3"),
+    DistillSpec(
+        "rvq2x4k", "rvq", codes=4096, levels=2, full_suites=True, note="~x18.5"
+    ),
+    # --- the proposal: tree neighborhood + low-rank token identity ---------
+    DistillSpec("tree64x2-r448", "tree_res", codes=64, depth=2, rank=448, note="~x4.0"),
+    DistillSpec("tree64x2-r192", "tree_res", codes=64, depth=2, rank=192, note="~x8.2"),
+    DistillSpec(
+        "tree64x2-r64",
+        "tree_res",
+        codes=64,
+        depth=2,
+        rank=64,
+        full_suites=True,
+        note="~x16.9",
+    ),
+    DistillSpec("tree64x2-r8", "tree_res", codes=64, depth=2, rank=8, note="~x31.9"),
+    # --- does the fit objective matter? weight rows by token frequency -----
+    DistillSpec("svd128-freq", "svd", rank=128, weight="freq", full_suites=True),
+    DistillSpec(
+        "tree64x2-r64-freq",
+        "tree_res",
+        codes=64,
+        depth=2,
+        rank=64,
+        weight="freq",
+        full_suites=True,
+    ),
+    # --- which side of the model is sensitive? -----------------------------
+    DistillSpec("svd128-in", "svd", rank=128, apply="input", note="exact output head"),
+    DistillSpec("svd128-out", "svd", rank=128, apply="output", note="exact input emb"),
+]
+
+DISTILLS_BY_NAME = {s.name: s for s in DISTILLS}

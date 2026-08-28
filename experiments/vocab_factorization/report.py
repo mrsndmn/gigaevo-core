@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from experiments.vocab_factorization.configs import (
+    DISTILLS,
     EXPERIMENTS,
     HOST_MODEL,
     TRANSPLANTS,
@@ -64,16 +65,31 @@ def _load(runs_dir: Path, order: list[str]) -> tuple[list[str], dict]:
 def screen_table(path: Path) -> str:
     rows_in = json.loads(path.read_text())
     head = [
-        "arm", "vocab", "tok/byte", "pieces/word", "whole-word %",
-        "tpb UPPER", "tpb Title", "tpb randcase", "tpb typo5",
-        "embed params (d=512)", "lossless",
+        "arm",
+        "vocab",
+        "tok/byte",
+        "pieces/word",
+        "whole-word %",
+        "tpb UPPER",
+        "tpb Title",
+        "tpb randcase",
+        "tpb typo5",
+        "embed params (d=512)",
+        "lossless",
     ]
     rows = [
         [
-            r["arm"], r["vocab"], r["tpb.clean"], round(r["pieces_per_word"], 3),
-            f"{100 * r['whole_word_rate']:.1f}", r["tpb.upper"], r["tpb.title"],
-            r["tpb.randcase"], r["tpb.typo5"],
-            r["embed_params_d512_tied"], r["roundtrip"],
+            r["arm"],
+            r["vocab"],
+            r["tpb.clean"],
+            round(r["pieces_per_word"], 3),
+            f"{100 * r['whole_word_rate']:.1f}",
+            r["tpb.upper"],
+            r["tpb.title"],
+            r["tpb.randcase"],
+            r["tpb.typo5"],
+            r["embed_params_d512_tied"],
+            r["roundtrip"],
         ]
         for r in rows_in
     ]
@@ -84,12 +100,8 @@ def bpb_tables(runs_dir: Path) -> str:
     names, found = _load(runs_dir, [e.name for e in EXPERIMENTS])
     if not names:
         return ""
-    abs_rows = [
-        [n] + [found[n][f"eval.{s}"]["bpb"] for s in SUITES] for n in names
-    ]
-    delta_rows = [
-        [n] + [found[n][f"delta.{s}"] for s in SUITES[1:]] for n in names
-    ]
+    abs_rows = [[n] + [found[n][f"eval.{s}"]["bpb"] for s in SUITES] for n in names]
+    delta_rows = [[n] + [found[n][f"delta.{s}"] for s in SUITES[1:]] for n in names]
     head_rows = []
     for n in names:
         e = found[n]["eval.clean"]
@@ -114,19 +126,33 @@ def cost_table(runs_dir: Path) -> str:
     if not names:
         return ""
     head = [
-        "experiment", "BPB clean", "total params", "embed params", "tok/byte",
-        "context bytes", "steps", "train tokens", "minutes",
+        "experiment",
+        "BPB clean",
+        "total params",
+        "embed params",
+        "tok/byte",
+        "context bytes",
+        "steps",
+        "train tokens",
+        "minutes",
     ]
     rows = []
     for n in names:
         d = found[n]
         p = d["params"]
-        rows.append([
-            n, d["eval.clean"]["bpb"], p["total"],
-            p["embedding"] + p["output_heads"] + p["ngram"],
-            d["tokens_per_byte_train"], round(d["context_bytes"]),
-            d["steps"], d["train_tokens"], f"{d['train_seconds'] / 60:.1f}",
-        ])
+        rows.append(
+            [
+                n,
+                d["eval.clean"]["bpb"],
+                p["total"],
+                p["embedding"] + p["output_heads"] + p["ngram"],
+                d["tokens_per_byte_train"],
+                round(d["context_bytes"]),
+                d["steps"],
+                d["train_tokens"],
+                f"{d['train_seconds'] / 60:.1f}",
+            ]
+        )
     return _table(head, rows)
 
 
@@ -137,7 +163,8 @@ def context_table(runs_dir: Path) -> str:
     if not names:
         return ""
     head = [
-        "experiment", "ctx BPB clean",
+        "experiment",
+        "ctx BPB clean",
         *[f"d {s}" for s in CTX_SUITES[1:]],
         "typo10 / mismatch",
     ]
@@ -158,20 +185,80 @@ def transplant_table(runs_dir: Path) -> str:
         return ""
     suites = ["typo1", "typo5", "lower", "upper", "title", "randcase"]
     head = [
-        "experiment", "init", "BPB step0", "BPB final",
+        "experiment",
+        "init",
+        "BPB step0",
+        "BPB final",
         *[f"d {s}" for s in suites],
-        "vocab", "embed params", "total params", "steps", "minutes",
+        "vocab",
+        "embed params",
+        "total params",
+        "steps",
+        "minutes",
     ]
     rows = []
     for n in names:
         d = found[n]
         p = d["params"]
-        rows.append([
-            n, d["init"], d["step0_clean_bpb"], d["eval.clean"]["bpb"],
-            *[d[f"delta.{s}"] for s in suites],
-            d["heads"]["stem"], p["embedding"] + p["output_heads"], p["total"],
-            d["steps"], f"{d['train_seconds'] / 60:.1f}",
-        ])
+        rows.append(
+            [
+                n,
+                d["init"],
+                d["step0_clean_bpb"],
+                d["eval.clean"]["bpb"],
+                *[d[f"delta.{s}"] for s in suites],
+                d["heads"]["stem"],
+                p["embedding"] + p["output_heads"],
+                p["total"],
+                d["steps"],
+                f"{d['train_seconds'] / 60:.1f}",
+            ]
+        )
+    return _table(head, rows)
+
+
+def distill_table(runs_dir: Path) -> str:
+    order = ["native"] + [s.name for s in DISTILLS]
+    names, found = _load(runs_dir, order)
+    if not names:
+        return ""
+    native = found.get("native", {}).get("eval.clean", {}).get("bpb")
+    head = [
+        "experiment",
+        "method",
+        "float params",
+        "compress",
+        "rel err",
+        "rel err freq",
+        "rel err active",
+        "BPB clean",
+        "d native",
+        "d upper",
+        "d title",
+        "d randcase",
+    ]
+    rows = []
+    for n in names:
+        d = found[n]
+        p = d["params"]
+        r = d.get("recon", {})
+        clean = d["eval.clean"]["bpb"]
+        rows.append(
+            [
+                n,
+                d.get("method", "-"),
+                p["float_params"],
+                f"x{p['compression']:.1f}",
+                r.get("rel_err"),
+                r.get("rel_err_freq"),
+                r.get("rel_err_active"),
+                clean,
+                clean - native if native is not None and n != "native" else None,
+                d.get("delta.upper"),
+                d.get("delta.title"),
+                d.get("delta.randcase"),
+            ]
+        )
     return _table(head, rows)
 
 
@@ -238,6 +325,23 @@ def build_document(args) -> str:
             "",
         ]
 
+    if args.distill.exists() and any(args.distill.glob("*.json")):
+        parts += [
+            "## 5. Stage 0 — distilling the host embedding table",
+            "",
+            "No LM training: each method fits the frozen Qwen3-1.7B table "
+            "offline, the reconstruction replaces it (tied input + output "
+            "unless noted), and the frozen body is evaluated as-is. "
+            "`rel err` is the fraction of table variance the fit leaves "
+            "unexplained — overall, token-frequency-weighted, and restricted "
+            "to ids the eval text uses. `d native` is the BPB cost against "
+            "the freshly evaluated native table. Float params only; code "
+            "indices are per-token bits, reported in the JSON.",
+            "",
+            distill_table(args.distill),
+            "",
+        ]
+
     return "\n".join(parts)
 
 
@@ -246,6 +350,7 @@ def main() -> None:
     ap.add_argument("--screen", type=Path, default=Path("results/screen2.json"))
     ap.add_argument("--runs", type=Path, default=Path("results/runs"))
     ap.add_argument("--transplant", type=Path, default=Path("results/transplant"))
+    ap.add_argument("--distill", type=Path, default=Path("results/distill"))
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
