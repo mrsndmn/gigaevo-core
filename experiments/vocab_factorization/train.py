@@ -51,7 +51,7 @@ from experiments.vocab_factorization.prepare import build_text, encode_text, get
 EVAL_SUITES = ("clean", "typo1", "typo5", "lower", "upper", "title", "randcase")
 # Corrupted-context evaluation only makes sense for corruptions that leave the
 # text legible; whole-document case transforms are not "context damage".
-CTX_SUITES = ("clean", "typo1", "typo5", "typo10", "randcase")
+CTX_SUITES = ("clean", "typo1", "typo5", "typo10", "randcase", "mismatch")
 
 
 def _heads_arrays(enc, heads: dict[str, int]) -> dict[str, np.ndarray]:
@@ -300,6 +300,11 @@ def run(exp: Experiment, args) -> dict:
 
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"{exp.name}.json").write_text(json.dumps(results, indent=2))
+    if args.save_ckpt:
+        torch.save(
+            {"state_dict": model.state_dict(), "heads": heads, "exp": exp.name},
+            args.out / f"{exp.name}.pt",
+        )
     return results
 
 
@@ -321,6 +326,7 @@ def main() -> None:
     ap.add_argument("--eval-batch", type=int, default=8)
     ap.add_argument("--eval-mb", type=float, default=0.0, help="0 = whole valid split")
     ap.add_argument("--workers", type=int, default=48)
+    ap.add_argument("--save-ckpt", action="store_true", help="keep weights for post-hoc analysis")
     args = ap.parse_args()
 
     if args.all:

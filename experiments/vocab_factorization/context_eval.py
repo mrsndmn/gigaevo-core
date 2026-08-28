@@ -36,6 +36,9 @@ from experiments.vocab_factorization import perturb
 from experiments.vocab_factorization.model import LN2
 
 IGNORE = -100
+# Not a perturbation: replaces the context with an unrelated one, to calibrate
+# how much *any* context damage can possibly cost on this model.
+MISMATCH = "mismatch"
 
 
 def _blocks(text: str, ctx_bytes: int, score_bytes: int) -> list[tuple[str, str]]:
@@ -69,8 +72,16 @@ def build_batches(
     heads = list(arm.heads)
     items = []
     total_bytes = 0
-    for ctx, scored in _blocks(text, ctx_bytes, score_bytes):
-        c_enc = arm.encode(perturb.apply_suite(suite, ctx, seed))
+    blocks = _blocks(text, ctx_bytes, score_bytes)
+    for bi, (ctx, scored) in enumerate(blocks):
+        if suite == MISMATCH:
+            # Sensitivity control: swap in an unrelated document's context.
+            # If this costs no more than a typo'd context, the model is not
+            # using context and the whole metric is measuring nothing.
+            ctx = blocks[(bi + len(blocks) // 2) % len(blocks)][0]
+            c_enc = arm.encode(ctx)
+        else:
+            c_enc = arm.encode(perturb.apply_suite(suite, ctx, seed))
         s_enc = arm.encode(scored)
         n_c, n_s = len(c_enc), len(s_enc)
         if n_s < 2:

@@ -243,6 +243,81 @@ instruction-following. Finally, freezing the body is a strict constraint;
 unfreezing LayerNorms or the top blocks is standard in transplant work and would
 likely close the remaining gap.
 
+## Study 3 — two tokenizer fixes and a metric that can see input-side effects
+
+Round-to-round noise, measured by running `bpe8k` twice under an identical
+config: **0.0016 BPB**. Differences below ~0.003 are not real.
+
+| arm | BPB | tok/byte | context bytes | d upper | d title | d randcase |
+|---|---|---|---|---|---|---|
+| bpe8k | 1.1881 | 0.2374 | 4,313 | 1.937 | 0.670 | 2.051 |
+| fact8k-nosuf (before) | 1.2074 | 0.2488 | 4,116 | 0.839 | 0.330 | 2.509 |
+| fact8k-freqfix (fix 1) | 1.2060 | 0.2213 | 4,627 | 0.733 | 0.292 | 2.028 |
+| **fact8k-v2** (fix 1+2) | 1.2056 | 0.2209 | 4,635 | **0.691** | 0.303 | 2.093 |
+
+**Fix 1 (natural-frequency stem BPE) is real, but its payoff is not BPB.**
+Tokens per byte fell 11.2% (0.2488 -> 0.2209) and clean BPB moved 0.0018 —
+at the noise floor. What the fix actually bought: the factorized arm went from
+a 4.8% token *deficit* against bpe8k to a 7.0% *surplus*, so it now sees 7.5%
+more bytes of context per 1024-token window and is cheaper to run at the same
+byte throughput. Case robustness also improved: d upper 0.839 -> 0.733.
+
+**Fix 2 (per-run case classification) is a clean engineering win with no
+measurable BPB benefit.** It removes the verbatim escape hatch entirely — every
+piece of every mixed-case word now stays in the stem vocabulary, verified
+byte-exact on all suites. Under `randcase` its absolute tokens/byte is 31%
+better than fix 1 alone (0.276 vs 0.400). None of that reaches BPB: 1.2060 ->
+1.2056, and d randcase is if anything slightly worse. The reason is that
+`randcase` BPB is dominated by the entropy of the random case pattern itself,
+which every representation has to pay; only the token count was ever fixable.
+
+**Fix 4 (corrupted-context BPB) is the one that changed a conclusion.**
+
+| arm | ctx clean | d typo1 | d typo5 | d typo10 | d randcase | d MISMATCH | typo10 / mismatch |
+|---|---|---|---|---|---|---|---|
+| bpe8k | 1.1754 | 0.0005 | 0.0024 | 0.0045 | 0.0081 | 0.0262 | 17.1% |
+| fact8k-v2 | 1.1939 | 0.0008 | 0.0035 | 0.0066 | 0.0103 | 0.0269 | 24.6% |
+
+Corrupting the *context* with 10% typos costs 0.0045 BPB, against roughly 1.3
+for the same perturbation under the old whole-text metric — about **250x
+smaller**. So ~99.6% of what this study previously reported as "typo
+robustness" was the model being charged for reproducing noise, which no
+input-side mechanism could ever have reduced. That fully explains why the
+character n-gram bag scored 0.679 against its own control's 0.676.
+
+The `mismatch` control makes this readable rather than merely small: replacing
+the context with an unrelated document costs 0.0262-0.0269, so the metric does
+have dynamic range and typo damage is a real 17-25% of the worst case. Caveat:
+that worst case is itself only ~2% of clean BPB, i.e. a 33M model with 1024
+tokens of context leans mostly on local statistics — the *ratio* is the
+meaningful quantity here, not the absolute.
+
+### Methodological correction
+
+The training-free screen is a good robustness filter and a poor BPB predictor.
+Two specific traps, both of which misled the round-2 predictions in this file:
+
+- **tokens/byte does not forecast BPB.** Fix 1 delivered 11% fewer tokens and
+  0.0018 BPB. Fewer-but-harder tokens is close to a wash per byte.
+- **`inflation` is relative to each arm's own clean baseline, so it rewards a
+  bad baseline.** `fact8k-nosuf` had the *best* randcase inflation (1.226)
+  purely because its clean tokens/byte was the worst. Absolute tokens/byte
+  under perturbation is the metric that ranks correctly; the screen JSON has
+  always stored it as `tpb.<suite>`.
+
+### Study 3 conclusions
+
+Against bpe8k, the fixed factorized arm now costs +1.5% BPB (1.2056 vs 1.1881)
+and returns 2.8x better ALL-UPPER robustness, 2.2x better Title Case, *and* 7%
+shorter sequences. Before these fixes it cost the same +1.5% BPB while being
+4.8% longer, so the trade is strictly better even though BPB did not move.
+
+The honest summary of fixes 1 and 2 is that both worked exactly as designed at
+the tokenizer level and neither improved bits-per-byte. That is worth stating
+plainly: the remaining gap to plain BPE is not a segmentation problem, which
+makes the joint (stem x case) softmax — idea 3, the one deliberately deferred —
+the only remaining candidate that could close it.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -289,3 +364,9 @@ unseen words.
   not vocabulary, is the dominant factor; zero-training transplant does not
   work. Case factorization costs 5% BPB at this scale for 1.5-3x better case
   robustness. Figure: `results/vocab_transplant.png`.
+- 2026-08-28 — Study 3: fixes 1, 2, 4. Natural-frequency stem BPE (-11% tokens),
+  per-run case classification (verbatim fallback removed), and a
+  corrupted-context BPB metric with a mismatch control. Neither tokenizer fix
+  moved BPB (noise floor measured at 0.0016), but together they turned a 4.8%
+  token deficit vs bpe8k into a 7% surplus and improved d upper 0.839 -> 0.691.
+  The metric showed ~99.6% of the old typo-robustness number was emission cost.
