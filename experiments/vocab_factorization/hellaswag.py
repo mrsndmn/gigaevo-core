@@ -174,7 +174,9 @@ def score(model, encoded: list[dict], heads: dict[str, int], device, batch: int 
         inputs, targets, keep = _pad_batch(seqs, heads, device)
         # Autocast only where the BPB harness uses it. On CPU (the tests) it is
         # off, so the arithmetic being checked is the arithmetic, not bf16.
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with torch.autocast(
+            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
             per_head = model.token_nll(inputs, targets)
         total = sum(per_head.values())
         sums = (total * keep).sum(dim=1)
