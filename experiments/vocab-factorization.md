@@ -677,6 +677,15 @@ means training an arm, and the local card could not spare the ~40 GB while
 neighbouring processes held 46 of its 80. That is the constraint W0 exists to
 remove, and the first W1 job removes it.
 
+**End-to-end validation.** `orig-frozen` was submitted through the scaffolding
+as `lm-mpi-job-5d8813f0-f297-45cd-b989-6e244519a5a2` and reproduced the local
+P0 run **digit for digit on all seven suites** — 0.7796 / 0.9358 / 1.3905 /
+0.8243 / 1.0702 / 0.8885 / 1.8151 — from a staged checkout of `c5aee2e1`, in
+377 s against roughly forty minutes on the contended local card. Staging, both
+path translations, the env prefix, the shared HF cache and the cached active
+set are therefore all confirmed working inside a real container rather than
+argued to. A re-launch now skips the arm on its result marker.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one
