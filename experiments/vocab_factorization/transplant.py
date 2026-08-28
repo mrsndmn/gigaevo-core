@@ -263,10 +263,18 @@ class TransplantLM(nn.Module):
 
     def param_counts(self) -> dict[str, int]:
         emb = sum(p.numel() for p in self.emb.parameters())
+        # A head is free on the output side when it *is* the input module (the
+        # routed table, where the tie is structural) or when it shares the input
+        # module's Parameter (the flat table, where the tie is a shared tensor).
+        # Identity of the module has to be checked first: a routed table's
+        # ``weight`` is composed on access, so two reads are never the same
+        # object and the tensor test alone would double-count every leaf.
         out = sum(
             p.numel()
             for n, m in self.out.items()
-            if not (n == "stem" and m.weight is self.emb["stem"].weight)
+            if not (
+                n == "stem" and (m is self.emb[n] or m.weight is self.emb[n].weight)
+            )
             for p in m.parameters()
         )
         # ``self.body`` still owns the host's embed_tokens, but we feed it

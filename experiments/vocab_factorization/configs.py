@@ -314,6 +314,120 @@ TRANSPLANTS_BY_NAME = {t.name: t for t in TRANSPLANTS}
 
 
 # ---------------------------------------------------------------------------
+# Study 4, stage 1: feature-routed trees trained through the frozen body
+# ---------------------------------------------------------------------------
+#
+# The specs live here rather than beside their implementations because this
+# module is the one the MLSpace launchers can import: they run under an env with
+# ``mls`` but without numpy, torch or sklearn. ``token_features`` and
+# ``tree_embed`` read their configuration from here.
+
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    """Which interpretable token features route the tree (see token_features)."""
+
+    groups: tuple[str, ...] = ("surface", "decomposition", "ngram", "corpus")
+    ngram_buckets: int = 256
+    ngram_min: int = 3
+    ngram_max: int = 5
+    # One-hot rather than a raw bucket index: a tree splits on ``x <= t``, so an
+    # arbitrary integer piece id would only let it separate *ranges* of
+    # unrelated pieces.
+    piece_buckets: int = 32
+
+
+@dataclass(frozen=True)
+class TreeSpec:
+    """Structure of one routed table (see tree_embed).
+
+    ``leaves_per_tree = 0`` means "derive it from the arm's budget ratio", which
+    keeps the float budget tied to the flat table each arm is actually measured
+    against instead of a number typed here that drifts from it.
+    """
+
+    n_trees: int = 32
+    leaves_per_tree: int = 0
+    max_depth: int = 12
+    # Targets are projected to this width for the split search only; sklearn's
+    # multi-output splitter is O(features x samples x outputs) per level, so
+    # 2048-wide targets would take hours to fit and the targets only choose the
+    # partition anyway.
+    fit_dim: int = 32
+    film: bool = False
+    seed: int = 0
+
+
+@dataclass(frozen=True)
+class TreeTransplantSpec:
+    name: str
+    arm: str
+    # x fewer embedding floats than the arm's *active* flat table. This is the
+    # claim's units: "parity BPB at >=x2 fewer embedding floats".
+    budget_ratio: float
+    tree: TreeSpec = field(default_factory=TreeSpec)
+    features: FeatureSpec = field(default_factory=FeatureSpec)
+    micro_batch: int = 16
+    # Execution fields with the same names and meanings as ``TransplantSpec``,
+    # so ``train_transplant.run`` drives either kind without branching on type.
+    init: str = "mean_of_pieces"
+    train: bool = True
+    freeze_body: bool = True
+    # Fit each boosting round to the loss gradient w.r.t. token embeddings
+    # collected through the frozen body, instead of to matrix residuals. This is
+    # the arm that boosts on the true objective — precisely the correction stage
+    # 0's failure demands — and it is optional because it costs extra passes.
+    functional_boost: bool = False
+    note: str = ""
+
+
+# The flat control this grid is measured against is ``TRANSPLANTS['bpe8k-t']``,
+# which re-runs under the active-vocab mask as part of W1 — no arm here budgets
+# a second copy of it.
+TREE_TRANSPLANTS: list[TreeTransplantSpec] = [
+    TreeTransplantSpec(
+        "tree8k-x2",
+        "bpe8k",
+        budget_ratio=2.0,
+        note="the flagship: additive routed table at half the flat floats",
+    ),
+    TreeTransplantSpec(
+        "tree8k-x4",
+        "bpe8k",
+        budget_ratio=4.0,
+        note="how far the sharing goes before it breaks",
+    ),
+    TreeTransplantSpec(
+        "tree8k-x2-film",
+        "bpe8k",
+        budget_ratio=2.0,
+        tree=TreeSpec(film=True),
+        note="ablation: FiLM composition, so depth can buy expressivity a "
+        "path-sum cannot (stage 0: additive depth-2 == flat VQ)",
+    ),
+    TreeTransplantSpec(
+        "tree8k-x2-fgb",
+        "bpe8k",
+        budget_ratio=2.0,
+        functional_boost=True,
+        note="ablation: boost on the loss gradient through the body rather "
+        "than on matrix residuals",
+    ),
+    TreeTransplantSpec(
+        "tree-host-x2",
+        HOST_ARM,
+        budget_ratio=2.0,
+        micro_batch=8,
+        tree=TreeSpec(n_trees=48),
+        note="bridge arm on the active host vocabulary: does training rescue "
+        "the distilled init stage 0 showed fails zero-shot?",
+    ),
+]
+
+TREE_TRANSPLANTS_BY_NAME = {t.name: t for t in TREE_TRANSPLANTS}
+
+
+# ---------------------------------------------------------------------------
 # Study 4, stage 0: distill the host's embedding table into structured forms
 # ---------------------------------------------------------------------------
 #

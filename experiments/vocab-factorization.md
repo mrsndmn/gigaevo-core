@@ -729,6 +729,54 @@ other five carry a `requires` on their training checkpoint and are skipped with
 "waiting on an earlier wave" until it exists — which is what makes the wave
 schedule enforce itself rather than rely on launch order.
 
+### W1 strand B — the stage-1 modules (2026-08-29)
+
+Both modules exist and the grid is launchable. Gates unchanged.
+
+`token_features.py` extracts the pre-registered feature set v0 — **345 columns**
+on the bpe8k arm (surface 17, decomposition 66, ngram 256, corpus 6), in ~7 s.
+Its interface matters more than its contents because it becomes the evolution
+genome: groups are first class (`select` / `without` / `columns`), so the
+feature-group ablations and the deliberately-bad anchors calibration needs are
+one call rather than a re-extraction, every column is named, and extraction is
+deterministic with no hidden state.
+
+`tree_embed.py` fits the partition offline and relearns the values through the
+body. Two decisions are worth recording:
+
+- **Split search runs on projected targets.** sklearn's multi-output splitter is
+  O(features x samples x outputs) per level, so 2048-wide targets take hours.
+  Targets are projected to 32 dimensions first. This is not stage 0's mistake in
+  miniature: there, discarded detail became frozen *values* that were then
+  wrong; here it can only make the partition slightly less well chosen, and the
+  vectors are relearned regardless.
+- **Composition accumulates one tree at a time.** The obvious `leaves[routing]`
+  gathers `(V, n_trees, d)` in one allocation — 59 GB for the host bridge arm.
+  Per-tree accumulation keeps the peak at a couple of `(V, d)` tensors, because
+  addition's backward needs neither operand. The FiLM path cannot have that (a
+  product's backward keeps both), which is precisely why FiLM is an 8k-vocabulary
+  arm and there is no FiLM arm on the 152k host.
+
+**Measured on the real bpe8k arm**: `tree8k-x2` fits 3,968 leaves over 32 trees
+= **8.13M floats against the 16.3M active flat table, exactly x2.00**, at 224
+route bits per token (bits reported beside the floats, never inside the ratio,
+per stage 0's convention). `param_counts` reports `output_heads: 0` — the tie is
+structural, both sides being the *same* module, so the leaves are counted once.
+
+**Untrained, that routed table scores 2.1348 clean BPB** against the flat arm's
+0.70. That is not a result, it is stage 0's finding reappearing in the new
+parameterization: leaf means of mean-of-pieces vectors are fitted *values*, and
+fitted values do not transfer. The entire stage-1 claim rests on what training
+through the frozen body does to that number, which is what the gate measures.
+
+Grid in `configs.TREE_TRANSPLANTS`, launchable as the `tree` job group: additive
+at x2 and x4, the FiLM arm, the functional-gradient-boosting arm (which fits the
+partition to the loss gradient w.r.t. embedding rows collected through the body,
+rather than to matrix residuals — the correction stage 0 demands, in its
+single-pass form), and the active-host-vocabulary bridge arm. The flat control
+is `TRANSPLANTS['bpe8k-t']`, which the `transplant` group already re-runs under
+the mask; no arm here budgets a second copy of it.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one

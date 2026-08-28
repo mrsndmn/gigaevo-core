@@ -39,6 +39,7 @@ from experiments.vocab_factorization.configs import (
     DISTILLS,
     HOST_ARM,
     TRANSPLANTS,
+    TREE_TRANSPLANTS,
     TransplantTrainSpec,
     active_cache_path,
     token_cache_path,
@@ -168,6 +169,28 @@ def distill_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
     ]
 
 
+def tree_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
+    """Stage 1: the feature-routed grid, one job per arm.
+
+    The flat control these are measured against is ``transplant-bpe8k-t``, which
+    the ``transplant`` group already launches under the active-vocab mask. No
+    arm here budgets a second copy of it — that was the point of sequencing
+    hardening around runs that were happening anyway.
+    """
+    out = f"{results_root}/transplant"
+    return [
+        JobSpec(
+            name=f"tree-{t.name}",
+            module="experiments.vocab_factorization.train_transplant",
+            description=f"stage1 {t.name} ({t.arm}, x{t.budget_ratio} floats)",
+            args=("--exp", t.name, "--ckpt-dir", CKPT_ROOT, "--reserve-gb", "24"),
+            arms=(t.arm,),
+            marker=f"{out}/{t.name}.json",
+        )
+        for t in TREE_TRANSPLANTS
+    ]
+
+
 def hellaswag_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
     """Transplant-hardening: the downstream task, one job per arm.
 
@@ -214,6 +237,7 @@ def collect_jobs(
         "transplant": transplant_jobs,
         "distill": distill_jobs,
         "hellaswag": hellaswag_jobs,
+        "tree": tree_jobs,
     }
     jobs: list[JobSpec] = []
     for g in groups:

@@ -26,6 +26,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -39,6 +40,8 @@ from experiments.vocab_factorization.configs import (
     HOST_MODEL,
     TRANSPLANTS,
     TRANSPLANTS_BY_NAME,
+    TREE_TRANSPLANTS,
+    TREE_TRANSPLANTS_BY_NAME,
     TransplantSpec,
     TransplantTrainSpec,
 )
@@ -107,6 +110,62 @@ def _reserve(gb: float) -> None:
     del buf
 
 
+@torch.no_grad()
+def _tree_targets(model, spec, sampler, tspec, micro: int, rounds: int = 8):
+    """What the partition is fit to.
+
+    Default: the mean-of-pieces vectors already sitting in the embedding after
+    init. They define the partition only — stage 0 measured that *fitted values*
+    from this kind of target cost at least +1.37 BPB, so the leaves are relearned
+    through the body regardless.
+
+    ``functional_boost``: the accumulated loss gradient w.r.t. each embedding
+    row, collected through the frozen body. This is the correction stage 0's
+    failure demands — grouping tokens that the *objective* wants moved the same
+    way, rather than tokens whose mean-of-pieces vectors happen to be close.
+    It is the single-pass form of the idea: one gradient field, fit once, rather
+    than re-collected between boosting rounds.
+    """
+    if not getattr(spec, "functional_boost", False):
+        return model.emb["stem"].weight.detach().float().cpu().numpy()
+
+    with torch.enable_grad():
+        model.emb["stem"].weight.grad = None
+        for _ in range(rounds):
+            inputs, targets = sampler.batch(micro)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                losses = model(inputs, targets)
+            (sum(losses.values()) / (micro * tspec.seq_len * rounds)).backward()
+    grad = model.emb["stem"].weight.grad
+    model.emb["stem"].weight.grad = None
+    return grad.detach().float().cpu().numpy()
+
+
+def _install_tree(model, spec, features, targets, d_model: int, n_active: int) -> dict:
+    """Swap the flat stem table for a feature-routed one. The other hook.
+
+    Both sides are replaced with the *same* module, so the tie is structural:
+    ``TreeEmbedding.weight`` composes the table from the shared leaves, which is
+    the "output embedding composed from the same tied structure" the plan
+    requires and the side stage 0 found to be the sensitive one.
+    """
+    from experiments.vocab_factorization import tree_embed
+    from experiments.vocab_factorization.active_vocab import active_floats
+
+    flat_floats = active_floats(n_active, d_model)
+    leaves = spec.tree.leaves_per_tree or tree_embed.leaves_for_budget(
+        flat_floats, spec.budget_ratio, d_model, spec.tree.n_trees, spec.tree.film
+    )
+    tspec = replace(spec.tree, leaves_per_tree=leaves)
+    routing = tree_embed.fit_partition(features, targets, tspec)
+    tree = tree_embed.TreeEmbedding(routing, d_model, film=tspec.film).to(
+        model.emb["stem"].weight.device
+    )
+    model.emb["stem"] = tree
+    model.out["stem"] = tree
+    return tree.accounting(flat_floats)
+
+
 def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     body, host_emb, host_tok, d_model = host
     device = torch.device("cuda")
@@ -138,10 +197,45 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         init_stats = transplant.mean_of_pieces_init(model, arm, host_tok, host_emb)
     else:
         raise ValueError(spec.init)
-    counts = model.param_counts()
 
     seq = tspec.seq_len
     micro = spec.micro_batch
+
+    # The embedding-swap hook. It runs after init because the mean-of-pieces
+    # vectors *are* the default fit target, and before the optimizer is built
+    # because it changes which parameters exist.
+    tree_acct = None
+    if getattr(spec, "budget_ratio", None):
+        from experiments.vocab_factorization import token_features
+
+        active_ids = active_vocab.load_or_build(
+            spec.arm,
+            arm.heads["stem"],
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            tspec.train_bytes,
+            workers=args.workers,
+        )
+        feats = token_features.extract(
+            arm, spec.features, host_tok=host_tok, stream=enc.stem
+        )
+        sampler = WindowSampler(_heads_arrays(enc, heads), seq, tspec.seed, device)
+        targets = _tree_targets(model, spec, sampler, tspec, micro)
+        del sampler
+        tree_acct = _install_tree(
+            model, spec, feats.matrix, targets, d_model, int(active_ids.size)
+        )
+        print(
+            f"[{spec.name}] routed table: {tree_acct['n_leaves']} leaves over "
+            f"{tree_acct['n_trees']} trees, {tree_acct['float_params'] / 1e6:.2f}M "
+            f"floats vs {tree_acct['flat_floats'] / 1e6:.1f}M flat "
+            f"(x{tree_acct['compression']:.2f}), "
+            f"{tree_acct['index_bits'] // heads['stem']} route bits/token",
+            flush=True,
+        )
+
+    counts = model.param_counts()
     accum = max(1, tspec.batch_tokens // (micro * seq))
     steps = 0 if not spec.train else (args.steps or int(n_tokens / tspec.batch_tokens))
     print(
@@ -282,6 +376,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         "context_bytes": seq / (n_tokens / train_bytes),
         "checkpoint": ckpt,
         "active_vocab": mask_info,
+        "tree": tree_acct,
         "note": spec.note,
     }
     for suite in EVAL_SUITES:
@@ -303,6 +398,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", nargs="*", default=None)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--all-trees", action="store_true", help="the stage-1 grid")
     ap.add_argument("--corpus", type=Path, default=Path("data/corpus"))
     ap.add_argument("--arms-dir", type=Path, default=Path("data/arms"))
     ap.add_argument("--tokens-dir", type=Path, default=Path("data/tokens"))
@@ -322,9 +418,16 @@ def main() -> None:
     ap.add_argument("--reserve-gb", type=float, default=0.0)
     args = ap.parse_args()
 
-    todo = (
-        TRANSPLANTS if args.all else [TRANSPLANTS_BY_NAME[n] for n in (args.exp or [])]
-    )
+    # One loop drives both grids: a tree arm carries the same execution fields
+    # and differs only by having a budget_ratio, which is what the swap hook
+    # keys on.
+    known = {**TRANSPLANTS_BY_NAME, **TREE_TRANSPLANTS_BY_NAME}
+    if args.all:
+        todo = list(TRANSPLANTS)
+    elif args.all_trees:
+        todo = list(TREE_TRANSPLANTS)
+    else:
+        todo = [known[n] for n in (args.exp or [])]
     if not todo:
         raise SystemExit("pass --exp NAME [NAME ...] or --all")
 
