@@ -36,6 +36,17 @@ not restorable from the lowercase form (`iPhone`, German `STRAßE`, Turkish
 dotted i) are detected by verification rather than by rule and kept verbatim
 (`surface.py:classify_case`).
 
+## Where things live
+
+- **This file** — hypothesis, method, findings, conclusions.
+- **`experiments/vocab-factorization-tables.md`** — every measured number, in
+  full, for all three studies. Generated; `results/` is gitignored, so that
+  snapshot is what actually preserves the data. Regenerate with
+  `python -m experiments.vocab_factorization.report --out
+  experiments/vocab-factorization-tables.md`.
+- **`experiments/vocab_factorization/configs.py`** — the grid itself
+  (`ARMS`, `EXPERIMENTS`, `TRANSPLANTS`). The single source of truth.
+
 ## Setup
 
 Everything is defined in `experiments/vocab_factorization/configs.py`
