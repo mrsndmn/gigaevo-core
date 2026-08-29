@@ -830,6 +830,93 @@ stand as pre-registered. The consequence is recorded rather than hidden — a
 passing stage 1 supports "a routed table matches a flat one at half the floats"
 and not a capability claim.
 
+### W2 — the progressive-shrink curriculum (2026-08-30)
+
+`shrink.py` implements the track's rules and `SHRINK_CURRICULUM` orders them;
+four arms are launchable as the `shrink` job group. No GPU time spent yet — the
+numbers below are CPU measurements on the real vocabulary and the real 230 MB
+stream, which is what makes the curve's x-axis real before any of its y-axis
+exists.
+
+**The rules, and what each actually merges.**
+
+| rung | rule | V | embedding floats | tokens |
+|---|---|---|---|---|
+| 0 | active-vocab mask, as deletion | 74,957 | 153.51M | +0.00% |
+| 1 | case/space -> stem + role bit | **48,703** | 99.77M | +0.00% |
+| 2 | re-piece the tail (count < 100) | **17,385** | 35.63M | +1.81% |
+| 3 | re-piece the tail (count < 1000) | **4,783** | 9.82M | +14.07% |
+
+Rule 1 finds **13,169 lexeme groups covering 39,423 of the 74,957 active ids**
+and saves 26,254 rows — a 35.0% cut with the token count untouched, because it
+is a *relabeling*: `" About"` becomes `(about, sp+title)` rather than a shorter
+sequence. **38.0% of training tokens end up carrying a non-identity role**, so
+the role head is not a rounding term; it is the thing the healing train has to
+learn to express as a global additive direction, which is precisely study 1's
+hypothesis tested on a live pretrained table.
+
+Rule 2 is the one that costs sequence length. At threshold 100 the tail spells
+out at 1.68 pieces per active id and +1.81% tokens; at 1000, 2.46 pieces and
++14.07%. Both numbers are measured on the stream the *previous* rung left, not
+on the host's — the curriculum re-measures counts between rungs, because after
+rule 1 a lexeme's six variants are one row with their summed count.
+
+**A rule deletes rows without deleting information.** The distinction the merged
+rows carried moves to a 6-value role head (2 space states x 3 case forms), and
+`eval_bpb` sums every head, so nothing is bought by hiding case in a side head.
+A role is only legal if it *inverts*: `'ß'.upper()` is `'SS'`, which does not
+lowercase back, so tokens like that are carried verbatim — as are mixed-case
+tokens (`aBc`) and byte-level fragments that are not valid UTF-8.
+
+**Three findings that were not in the pre-registration.**
+
+1. **`piece_string` is lossy for this job.** It decodes an id with the HF
+   tokenizer, which turns a byte-level fragment into U+FFFD — host id 100 is the
+   single byte `0xA7` and comes back as a replacement character. Canonicalising
+   *that* would corrupt the text the rule claims to only re-spell, so `shrink`
+   works on raw bytes recovered from the byte-level alphabet.
+2. **The active vocabulary is not closed under re-piecing.** 66 of the 256
+   single-byte host tokens never occur in this ru+en corpus (control characters,
+   UTF-8 lead bytes), so rule 0 deletes them and a tail stem containing one has
+   no segmentation at all. Rule 2 reaches back to the host tokenizer for a byte
+   floor — but adds only the stems a segmentation actually uses (60 at threshold
+   100, 93 at 1000), so "every row is reachable" survives and the accounting is
+   the table that exists.
+3. **Reachability is the active set, not the training corpus.** An early version
+   decided what to re-piece by looking at the train stream; 2,480 active ids
+   never appear there (they come from the perturbation suites, W0), and those
+   tokens would have had no image at all — the eval suites would have crashed,
+   or worse, been silently shortened. Frequency thresholds read the corpus;
+   reachability reads the active set. The CPU tests pin the distinction.
+
+**How a shrink composes with the active-vocab mask.** They are different
+operations on the same object, and they do not stack — the shrink *subsumes* the
+mask. The mask restricts the softmax over a table that keeps all its rows; a
+shrink re-indexes the table and deletes them. Rule 0 is the mask expressed as
+deletion, and every row of every later rung is reachable from an active host id
+by construction, so there is nothing left for a mask to remove and
+`train_transplant` skips the mask block entirely for a shrink arm. That makes
+`shrink0-mask` a correctness check rather than a measurement: it must reproduce
+`orig-frozen`'s **0.7796** digit for digit, since a masked softmax over 151,936
+rows with 76,979 of them at the float32 floor and a plain softmax over the
+remaining 74,957 are the same distribution. The init is what preserves it —
+`transplant.shrink_init` rescales only rows built from more than one source, so
+a single-source row comes out bit-identical to the host's.
+
+**Deliberate deviation from the pre-registered wording.** "Each followed by a
+short healing train" reads as sequential warm-starting. Each rung is instead
+healed from the host table through its own codec, on the same 230 MB / ~800-step
+protocol. Sequential healing would give rung *k* about *k* times rung 1's
+training compute, so the curve would confound vocabulary size with optimizer
+steps — the confound the fixed-bytes protocol exists to remove — and it would
+serialise four jobs that are otherwise independent.
+
+Gate unchanged: continue while healed clean BPB stays within **+0.01 of 0.7796**;
+stop at the vocabulary size where it does not. `train_transplant` evaluates it
+into each arm's JSON (`gate_pass`, `gate_margin`) rather than leaving it to
+whoever reads the file. Budget ~3 GPU-h: `shrink0-mask` is eval-only and costs
+what `orig-frozen` cost (377 s on a worker), the other three are ~1 GPU-h each.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -926,3 +1013,16 @@ unseen words.
   (`upper` alone 1,323, over 3.4% of its tokens) that the mask would otherwise
   score at probability zero. Compression is quoted against 153.5M floats.
   Mask and checkpoint contracts covered on CPU in `tests/experiments/`.
+- 2026-08-30 — **Track 4 (progressive-shrink) implemented, not yet run.**
+  `shrink.py` expresses every rung as a rewrite of (stem, role) pairs, so the
+  curve's x-axis and its parameter accounting are derived from the mapping
+  rather than asserted; `SHRINK_CURRICULUM` orders the rules and the `shrink`
+  job group launches four arms. Measured on the real vocabulary and stream:
+  74,957 -> **48,703** (case/space merge, 13,169 lexeme groups, token count
+  unchanged, 38.0% of tokens carrying a role) -> **17,385** (+1.81% tokens) ->
+  **4,783** (+14.07%, x31.7 fewer embedding floats than the host table). Three
+  things the pre-registration did not anticipate: `piece_string` is lossy for
+  byte-level fragments, the active vocabulary is not closed under re-piecing
+  (66 single-byte host tokens are inactive, so rule 2 needs a byte floor), and
+  reachability has to be read off the active set rather than the train stream.
+  A shrink step subsumes the mask rather than composing with it.

@@ -125,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         "--groups",
         nargs="*",
         default=["transplant"],
-        help="job groups to launch (transplant, tree, hellaswag, distill)",
+        help="job groups to launch (transplant, tree, shrink, hellaswag, distill)",
     )
     return p.parse_args()
 

@@ -38,6 +38,7 @@ from pathlib import Path
 from experiments.vocab_factorization.configs import (
     DISTILLS,
     HOST_ARM,
+    SHRINKS,
     TRANSPLANTS,
     TREE_TRANSPLANTS,
     TransplantTrainSpec,
@@ -191,6 +192,41 @@ def tree_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
     ]
 
 
+def shrink_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
+    """Track 4: one job per rung of the progressive-shrink curriculum.
+
+    ``shrink0-mask`` is eval-only (``train=False``) and costs what
+    ``orig-frozen`` cost — 377 s on a worker — because it *is* ``orig-frozen``,
+    reached through the shrink machinery instead of through the mask. It has to
+    reproduce 0.7796 before any rung below it means anything, which is why it is
+    a job rather than a unit test: the assertion is about the real model.
+
+    The trained rungs ``requires`` that reference. Nothing reads the file — the
+    number is in ``configs.MASKED_NATIVE_BPB`` — but a curve whose y-axis is
+    "distance from the masked native reference" is uninterpretable before the
+    reference exists, and refusing to spend 3 GPU-hours producing an
+    uninterpretable curve is exactly what the mechanism is for.
+    """
+    out = f"{results_root}/transplant"
+    return [
+        JobSpec(
+            name=f"shrink-{s.name}",
+            module="experiments.vocab_factorization.train_transplant",
+            description=(
+                f"shrink {s.name} (stage {s.stage}"
+                f"{', eval only' if not s.train else ''})"
+            ),
+            args=("--exp", s.name, "--ckpt-dir", CKPT_ROOT, "--reserve-gb", "24"),
+            arms=(s.arm,),
+            marker=f"{out}/{s.name}.json",
+            requires=(
+                () if not s.train else (f"{RESULTS_ROOT}/transplant/orig-frozen.json",)
+            ),
+        )
+        for s in SHRINKS
+    ]
+
+
 def hellaswag_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
     """Transplant-hardening: the downstream task, one job per arm.
 
@@ -238,6 +274,7 @@ def collect_jobs(
         "distill": distill_jobs,
         "hellaswag": hellaswag_jobs,
         "tree": tree_jobs,
+        "shrink": shrink_jobs,
     }
     jobs: list[JobSpec] = []
     for g in groups:

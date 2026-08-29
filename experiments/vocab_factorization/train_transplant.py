@@ -16,7 +16,10 @@ reason instead of paying for its own.
 Every arm is optimized and scored under the **active-vocabulary mask** (see
 ``active_vocab``), so the softmax normalizer is the same set of competitors for
 all of them. ``--no-mask`` reproduces the pre-mask numbers and nothing else:
-masked and unmasked BPB are not comparable.
+masked and unmasked BPB are not comparable. A progressive-shrink arm
+(``--all-shrink``) is the exception, and only because it goes further: its
+vocabulary has already had the inactive rows *deleted*, so there is nothing left
+for a mask to remove.
 
 Run::
 
@@ -32,12 +35,18 @@ import math
 from pathlib import Path
 import time
 
+import numpy as np
 import torch
 
 from experiments.vocab_factorization import active_vocab, perturb, transplant
 from experiments.vocab_factorization.build_arms import get_arm
 from experiments.vocab_factorization.configs import (
     HOST_MODEL,
+    MASKED_NATIVE_BPB,
+    SHRINK_CURRICULUM,
+    SHRINK_GATE_BPB,
+    SHRINKS,
+    SHRINKS_BY_NAME,
     TRANSPLANTS,
     TRANSPLANTS_BY_NAME,
     TREE_TRANSPLANTS,
@@ -93,6 +102,12 @@ def _save_checkpoint(model, spec, tspec, heads, steps, path: Path) -> str:
         "steps": steps,
         "seed": tspec.seed,
         "freeze_body": spec.freeze_body,
+        # A shrink arm's heads alone do not say which vocabulary they index, and
+        # the codec is derived rather than stored (it is a deterministic function
+        # of the arm, the active set, the curriculum prefix and the train
+        # stream). Recording the prefix length is what makes the checkpoint
+        # self-describing enough to rebuild it.
+        "stage": getattr(spec, "stage", 0),
         "emb": model.emb.state_dict(),
         "out": model.out.state_dict(),
     }
@@ -184,12 +199,65 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         args.tokens_dir,
         workers=args.workers,
     )
-    n_tokens = len(enc)
+
+    # The re-indexing hook (progressive-shrink), and the third distinct thing
+    # this loop can do to a vocabulary. The other two leave the id space alone:
+    # the active-vocab mask restricts the softmax over a table that keeps all
+    # its rows, and the tree hook swaps the module behind a fixed row count.
+    # A shrink step *re-indexes* — it deletes rows and rewrites the stream — so
+    # it has to run before the model is built, and it composes with the mask by
+    # subsuming it: every row of a shrunk table is reachable from an active host
+    # id by construction, so there is nothing left to mask and the mask block
+    # below is skipped rather than applied on top. Rule 0 makes that exact
+    # rather than approximate — it *is* the mask, expressed as deletion.
+    plan = shrink_acct = host_counts = None
+    if getattr(spec, "stage", 0):
+        from experiments.vocab_factorization import shrink
+
+        active_ids = active_vocab.load_or_build(
+            spec.arm,
+            arm.heads["stem"],
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            tspec.train_bytes,
+            workers=args.workers,
+        )
+        plan = shrink.build(
+            shrink.host_vocabulary(arm, heads["stem"]),
+            active_ids,
+            enc.stem,
+            SHRINK_CURRICULUM[: spec.stage],
+        )
+        host_counts = np.bincount(enc.stem.astype(np.int64), minlength=heads["stem"])
+        heads = plan.heads()
+        train_arrays = plan.apply_stream(enc.stem)
+        shrink_acct = {**plan.accounting(d_model), **plan.summary()}
+        print(
+            f"[{spec.name}] shrink stage {spec.stage}: "
+            f"{[s.rule for s in plan.steps]} -> {heads} "
+            f"{shrink_acct['float_params'] / 1e6:.2f}M embedding floats "
+            f"(x{shrink_acct['compression_vs_host']:.2f} vs the host table), "
+            f"tokens {shrink_acct['token_inflation']:+.2%}",
+            flush=True,
+        )
+    else:
+        train_arrays = _heads_arrays(enc, heads)
+    n_tokens = int(next(iter(train_arrays.values())).shape[0])
 
     model = transplant.TransplantLM(
         body, heads, d_model, tie_embeddings=True, freeze_body=spec.freeze_body
     ).to(device)
-    if spec.init == "native":
+    if spec.init == "shrink":
+        if plan is None:
+            raise ValueError(
+                f"{spec.name} asks for the shrink init but carries no stage — "
+                "there is no codec to fold the host table down"
+            )
+        init_stats = transplant.shrink_init(
+            model, plan.source_rows(host_counts), host_emb
+        )
+    elif spec.init == "native":
         init_stats = transplant.native_init(model, host_emb)
     elif spec.init == "random":
         init_stats = transplant.random_init(model, host_emb)
@@ -220,7 +288,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         feats = token_features.extract(
             arm, spec.features, host_tok=host_tok, stream=enc.stem
         )
-        sampler = WindowSampler(_heads_arrays(enc, heads), seq, tspec.seed, device)
+        sampler = WindowSampler(train_arrays, seq, tspec.seed, device)
         targets = _tree_targets(model, spec, sampler, tspec, micro)
         del sampler
         tree_acct = _install_tree(
@@ -257,7 +325,11 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     for suite in EVAL_SUITES:
         text = perturb.apply_suite(suite, valid_text, seed=0)
         e = encode_text(spec.arm, args.arms_dir, text, workers=args.workers)
-        eval_sets[suite] = (_heads_arrays(e, heads), len(text.encode("utf-8")))
+        # A shrunk arm scores the same *bytes* through a different token stream,
+        # which is exactly why the metric is bits per byte: the denominator does
+        # not move when re-piecing lengthens the numerator's stream.
+        arrays = plan.apply_stream(e.stem) if plan else _heads_arrays(e, heads)
+        eval_sets[suite] = (arrays, len(text.encode("utf-8")))
 
     # The active-vocabulary convention, applied identically to every arm. Built
     # from this arm's own streams, so an arm whose vocabulary was trained on the
@@ -266,7 +338,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     # possible (--no-mask) but only for reproducing the pre-mask numbers: an
     # unmasked arm's BPB is not comparable to a masked one's.
     active_ids = mask_info = None
-    if not args.no_mask:
+    if not args.no_mask and plan is None:
         active_ids = active_vocab.load_or_build(
             spec.arm,
             arm.heads["stem"],
@@ -322,7 +394,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
             f = tspec.min_lr_frac
             return tspec.lr * (f + (1 - f) * 0.5 * (1 + math.cos(math.pi * p)))
 
-        sampler = WindowSampler(_heads_arrays(enc, heads), seq, tspec.seed, device)
+        sampler = WindowSampler(train_arrays, seq, tspec.seed, device)
         model.train()
         if spec.freeze_body:
             body.eval()  # frozen body stays in eval mode (no dropout)
@@ -377,6 +449,7 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         "checkpoint": ckpt,
         "active_vocab": mask_info,
         "tree": tree_acct,
+        "shrink": shrink_acct,
         "note": spec.note,
     }
     for suite in EVAL_SUITES:
@@ -386,6 +459,19 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     for suite in EVAL_SUITES:
         results[f"delta.{suite}"] = post[suite]["bpb"] - clean
     results["step0_clean_bpb"] = pre["clean"]["bpb"]
+    if shrink_acct is not None:
+        # The gate, evaluated in the artifact rather than left to whoever reads
+        # it: continue the curriculum while healed BPB stays within +0.01 of the
+        # masked native reference, stop at the vocabulary size where it does not.
+        results["gate_margin"] = MASKED_NATIVE_BPB + SHRINK_GATE_BPB - clean
+        results["gate_pass"] = bool(results["gate_margin"] >= 0)
+        print(
+            f"[{spec.name}] gate: clean {clean:.4f} vs "
+            f"{MASKED_NATIVE_BPB} + {SHRINK_GATE_BPB} -> "
+            f"{'PASS' if results['gate_pass'] else 'STOP'} "
+            f"({results['gate_margin']:+.4f}) at V={heads['stem']}",
+            flush=True,
+        )
 
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"{spec.name}.json").write_text(json.dumps(results, indent=2))
@@ -399,6 +485,9 @@ def main() -> None:
     ap.add_argument("--exp", nargs="*", default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--all-trees", action="store_true", help="the stage-1 grid")
+    ap.add_argument(
+        "--all-shrink", action="store_true", help="the progressive-shrink curve"
+    )
     ap.add_argument("--corpus", type=Path, default=Path("data/corpus"))
     ap.add_argument("--arms-dir", type=Path, default=Path("data/arms"))
     ap.add_argument("--tokens-dir", type=Path, default=Path("data/tokens"))
@@ -418,14 +507,16 @@ def main() -> None:
     ap.add_argument("--reserve-gb", type=float, default=0.0)
     args = ap.parse_args()
 
-    # One loop drives both grids: a tree arm carries the same execution fields
-    # and differs only by having a budget_ratio, which is what the swap hook
-    # keys on.
-    known = {**TRANSPLANTS_BY_NAME, **TREE_TRANSPLANTS_BY_NAME}
+    # One loop drives all three grids: every arm carries the same execution
+    # fields and differs only by which hook it keys on — ``budget_ratio`` for
+    # the embedding swap, ``stage`` for the vocabulary re-indexing.
+    known = {**TRANSPLANTS_BY_NAME, **TREE_TRANSPLANTS_BY_NAME, **SHRINKS_BY_NAME}
     if args.all:
         todo = list(TRANSPLANTS)
     elif args.all_trees:
         todo = list(TREE_TRANSPLANTS)
+    elif args.all_shrink:
+        todo = list(SHRINKS)
     else:
         todo = [known[n] for n in (args.exp or [])]
     if not todo:

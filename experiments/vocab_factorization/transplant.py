@@ -28,6 +28,7 @@ no-op and train from there.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -348,6 +349,67 @@ def random_init(
     if verbose:
         print(f"  random init: std={std:.5f}", flush=True)
     return {"init": "random", "std": std}
+
+
+@torch.no_grad()
+def shrink_init(
+    model: TransplantLM,
+    rows: dict[str, np.ndarray],
+    host_emb: torch.Tensor,
+    verbose: bool = True,
+) -> dict:
+    """Fold the host table down a shrink plan's codec (see ``shrink.source_rows``).
+
+    Each new row is the frequency-weighted mean of the host rows that spell
+    through it. Only rows built from more than one source are rescaled — to the
+    weighted mean of *their own* sources' norms, since averaging unrelated
+    vectors shrinks them and study 2 measured that handing the frozen body
+    inputs at the wrong scale is a gratuitous handicap. Rescaling everything
+    would perturb the single-source rows, and those must come out bit-identical:
+    that is what makes the rule-0 rung reproduce the masked native reference
+    exactly instead of approximately.
+    """
+    V = model.heads["stem"]
+    d = host_emb.shape[1]
+    dst = torch.from_numpy(rows["dst"]).long()
+    src = torch.from_numpy(rows["src"]).long()
+    w = torch.from_numpy(rows["weight"]).float()
+
+    acc = torch.zeros(V, d, dtype=torch.float32)
+    norm = torch.zeros(V, dtype=torch.float32)
+    den = torch.zeros(V, dtype=torch.float32)
+    fan = torch.zeros(V, dtype=torch.float32)
+    # Chunked: the source list is one entry per (host id, piece), so the gather
+    # would otherwise materialise ~152k x 2048 fp32 at once.
+    for i in range(0, dst.numel(), 8192):
+        sl = slice(i, i + 8192)
+        block = host_emb[src[sl]].float()
+        acc.index_add_(0, dst[sl], block * w[sl, None])
+        norm.index_add_(0, dst[sl], block.norm(dim=1) * w[sl])
+        den.index_add_(0, dst[sl], w[sl])
+        fan.index_add_(0, dst[sl], torch.ones_like(w[sl]))
+    if not bool((den > 0).all()):
+        missing = int((den == 0).sum())
+        raise ValueError(
+            f"{missing} rows of the shrunk table have no host source — the "
+            "plan created a row nothing can reach"
+        )
+    acc /= den[:, None]
+    merged = fan > 1.5
+    scale = (norm[merged] / den[merged]) / acc[merged].norm(dim=1).clamp(min=1e-6)
+    acc[merged] *= scale[:, None]
+
+    model.emb["stem"].weight.copy_(acc.to(model.emb["stem"].weight.dtype))
+    stats = {
+        "init": "shrink",
+        "vocab": V,
+        "sources": int(dst.numel()),
+        "merged_rows": int(merged.sum()),
+        "mean_fan_in": float(fan.mean()),
+    }
+    if verbose:
+        print(f"  shrink init: {stats}", flush=True)
+    return stats
 
 
 @torch.no_grad()

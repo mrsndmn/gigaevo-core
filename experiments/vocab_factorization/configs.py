@@ -112,6 +112,15 @@ def active_cache_path(tokens_dir: Path, arm_name: str) -> Path:
     return tokens_dir / arm_name / "active_vocab.npz"
 
 
+# The masked native reference (W0, ``results/transplant/orig-frozen.json``):
+# clean BPB of the untouched pretrained model under the active-vocab mask. Every
+# progressive-shrink rung is gated against it, so it lives here rather than in a
+# comment somewhere — and the noise floor is 0.0016 BPB, so the +0.01 gate is
+# ~6x noise, not a rounding argument.
+MASKED_NATIVE_BPB = 0.7796
+SHRINK_GATE_BPB = 0.01
+
+
 # ---------------------------------------------------------------------------
 # Model / training grid
 # ---------------------------------------------------------------------------
@@ -425,6 +434,112 @@ TREE_TRANSPLANTS: list[TreeTransplantSpec] = [
 ]
 
 TREE_TRANSPLANTS_BY_NAME = {t.name: t for t in TREE_TRANSPLANTS}
+
+
+# ---------------------------------------------------------------------------
+# Study 4, track 4: the progressive-shrink curriculum
+# ---------------------------------------------------------------------------
+#
+# Shrink the *live* pretrained vocabulary by interpretable rules, each followed
+# by a healing train, and record BPB against vocabulary size. One-shot
+# replacement is what stage 0 killed; a curriculum of small healed edits is what
+# the evidence permits. ``shrink.py`` implements the rules; this is the order
+# they run in and the only place their hyperparameters live.
+
+
+@dataclass(frozen=True)
+class ShrinkRule:
+    """One rung. ``rule`` names a function in ``shrink.RULES``."""
+
+    rule: str  # mask | case_space | repiece_tail
+    # repiece_tail: a stem the corpus uses fewer than this many times stops
+    # being a row and is spelled out of the stems that survive.
+    min_count: int = 0
+    # case_space: how many variants a lexeme needs before its group is merged.
+    # 2 is not a tuning choice — it is the smallest value that guarantees the
+    # canonical row is emitted by something, which is what keeps every row of
+    # the shrunk table reachable and lets the softmax mask be dropped.
+    min_group: int = 2
+    note: str = ""
+
+
+# Thresholds are measured, not guessed (``python -m ...shrink`` on the real 230 MB
+# stream): 100 takes the vocabulary to 17,385 for +1.81% tokens, and 1000 —
+# applied *after* it, on re-measured counts — to 4,783 for +14.07% against the
+# host's own stream. Adding a rung is one line, so if the curve needs filling
+# between them, fill it.
+SHRINK_CURRICULUM: tuple[ShrinkRule, ...] = (
+    ShrinkRule("mask", note="rule 0 — W0's active-vocab mask, as deletion"),
+    ShrinkRule(
+        "case_space",
+        note="rule 1 — case/space variants of one lexeme become stem + role "
+        "bit; a relabeling, so the token count does not move",
+    ),
+    ShrinkRule("repiece_tail", min_count=100, note="rule 2 — re-piece the tail"),
+    ShrinkRule("repiece_tail", min_count=1000, note="rule 2 again, deeper"),
+)
+
+
+@dataclass(frozen=True)
+class ShrinkTransplantSpec:
+    """One point on the BPB-vs-vocabulary-size curve.
+
+    ``stage`` is how many rules of ``SHRINK_CURRICULUM`` to apply, so the arms
+    are nested vocabularies and the curriculum's order is the grid.
+
+    Execution fields carry the same names and meanings as ``TransplantSpec`` so
+    ``train_transplant.run`` drives either kind without branching on type; a
+    shrink arm differs only by having a ``stage``, which is what the re-indexing
+    hook keys on.
+    """
+
+    name: str
+    stage: int
+    arm: str = HOST_ARM
+    init: str = "shrink"
+    train: bool = True
+    micro_batch: int = 8
+    freeze_body: bool = True
+    note: str = ""
+
+
+# Each rung is healed from the *host* table through its own codec rather than
+# warm-started from the previous rung's checkpoint. That is a deliberate
+# deviation from the pre-registered wording ("each followed by a short healing
+# train", which reads as sequential): with sequential healing, rung k would
+# carry k times rung 1's training compute, and the curve would confound
+# vocabulary size with optimizer steps — precisely the confound the fixed-bytes
+# protocol exists to remove. Equal budget per rung also makes the arms
+# independent, so they launch as parallel jobs.
+SHRINKS: list[ShrinkTransplantSpec] = [
+    ShrinkTransplantSpec(
+        "shrink0-mask",
+        stage=1,
+        train=False,
+        note="rule 0 only, eval only — must reproduce orig-frozen's 0.7796, "
+        "which is the machinery's correctness check rather than a measurement",
+    ),
+    ShrinkTransplantSpec(
+        "shrink1-case",
+        stage=2,
+        note="the first rung where parameters are actually deleted: 74,957 -> "
+        "48,703 stems plus a 6-value role head",
+    ),
+    ShrinkTransplantSpec(
+        "shrink2-tail100",
+        stage=3,
+        note="-> 17,385 stems (35.6M floats) at +1.81% tokens",
+    ),
+    ShrinkTransplantSpec(
+        "shrink3-tail1k",
+        stage=4,
+        note="-> 4,783 stems (9.8M floats, x31.7 against the host table) at "
+        "+14.07% tokens; where the gate is expected to bite, and the point of "
+        "the curve is to say where it actually does",
+    ),
+]
+
+SHRINKS_BY_NAME = {s.name: s for s in SHRINKS}
 
 
 # ---------------------------------------------------------------------------
