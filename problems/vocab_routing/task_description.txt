@@ -1,0 +1,69 @@
+TASK — TOKEN ROUTING FEATURES FOR A SHARED-PARAMETER EMBEDDING
+
+Write the feature extractor that decides which tokens share embedding
+parameters. A boosted-tree ensemble routes each token id to one leaf per tree by
+testing your features; the token's embedding is composed from those leaves and
+trained through a frozen Qwen3-1.7B body. You do not choose the trees, the
+training, or the metric — only what the trees are allowed to look at.
+
+Parameters live at leaves, so V tokens cost `n_leaves x d` floats instead of
+`V x d`. Better features mean tokens that want similar embeddings land in the
+same leaf, which means the same BPB at fewer floats.
+
+OBJECTIVE
+Return features that minimise clean bits-per-byte at a fixed float budget.
+- Fitness = -BPB under the active-vocabulary mask.
+- The flat (one row per token) control scores 0.7704 at x1.
+- The untouched pretrained model scores 0.7796.
+- Noise floor is 0.0016 BPB. Do not chase differences under ~0.003.
+
+ENTRYPOINT
+- `def entrypoint() -> callable` — returns `extract(arm, host_tok, stream)`.
+- `extract` returns `(matrix, names)`:
+    matrix : float32 array, shape (vocab_size, n_features), finite, no NaN
+    names  : list[str] of length n_features, one readable name per column
+- Called ONCE per evaluation. Must be deterministic: the same inputs give the
+  same matrix, every time, in any process. A feature that depends on call order
+  turns the search signal into noise.
+
+WHAT YOU ARE GIVEN
+- `arm`      : the tokenizer. `arm.heads["stem"]` is the vocabulary size.
+               `piece_string(arm, i)` gives token i's surface string.
+- `host_tok` : the host model's tokenizer, for decomposing a surface into the
+               pieces the pretrained model would have used.
+- `stream`   : an int array of ~53M token ids — the training corpus as this
+               tokenizer sees it. Corpus statistics come from here.
+
+WHAT HAS ALREADY BEEN MEASURED (do not re-derive these)
+- Fitting structure to the frozen embedding matrix *offline* fails: every
+  method cost at least +1.37 BPB against a 0.05 kill line. Matching the matrix
+  is not matching the function. Your features choose a partition; the values
+  are relearned. Features that merely predict the pretrained vectors well are
+  not the same as features that group tokens the objective wants grouped.
+- A depth-2 additive path-sum is representationally equivalent to flat vector
+  quantisation with the same leaf count. Sharing is what routing buys; depth
+  alone buys nothing.
+- Character n-grams failed as an additive input *embedding* under an
+  emission-dominated metric. That result does not transfer here, where they are
+  a routing signal — a different role.
+- The baseline extractor (surface + decomposition + n-gram + corpus groups)
+  emits 345 columns for an 8k vocabulary.
+
+CONSTRAINTS
+- Standard library, numpy, and the three arguments above. No network, no disk
+  writes, no global mutable state.
+- Wall-clock budget: a few seconds per thousand vocabulary entries. The
+  baseline does 8k tokens in about 7 seconds.
+- Every column needs a name that says what it is. An evolved router nobody can
+  read defeats the purpose of routing on interpretable features.
+- Width is a cost, not a free parameter: `n_features` is a recorded descriptor.
+  A thousand noisy columns is a worse program than fifty informative ones even
+  at equal BPB.
+
+MAP-ELITES DESCRIPTORS (the axes the archive spreads programs over)
+1. `n_features`       — how wide the representation is.
+2. `feature_seconds`  — how expensive it is to compute.
+Both are *costs*, chosen so the archive keeps a cheap-and-narrow program next to
+an expensive-and-wide one at similar fitness, instead of collapsing onto
+whichever is marginally better. Neither is part of fitness; they only decide
+which niche a program occupies.

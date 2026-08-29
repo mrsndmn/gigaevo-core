@@ -1,0 +1,65 @@
+specs:
+  fitness:
+    description: >-
+      Negative clean bits-per-byte of the routed transplant under the
+      active-vocabulary mask (higher is better, perfect = 0). Which ladder rung
+      computes it is set by the runner; no evolutionary conclusion is accepted
+      from a rung that has not passed the calibration gate (ADR 0002).
+    decimals: 5
+    is_primary: true
+    higher_is_better: true
+    lower_bound: -3.0
+    upper_bound: 0.0
+    include_in_prompts: true
+    significant_change: 1.6e-3
+  is_valid:
+    description: Whether the program is valid (1 valid, 0 invalid)
+    decimals: 0
+    is_primary: false
+    higher_is_better: true
+    lower_bound: 0.0
+    upper_bound: 1.0
+    include_in_prompts: true
+    significant_change: 1.0
+  bpb:
+    description: >-
+      Clean BPB itself, masked, on the transplant harness. Drives fitness. The
+      flat control is 0.7704 and the masked native reference 0.7796; the noise
+      floor is 0.0016, so anything under ~0.003 is not movement.
+    decimals: 5
+    is_primary: false
+    higher_is_better: false
+    lower_bound: 0.0
+    upper_bound: 3.0
+    include_in_prompts: true
+    significant_change: 1.6e-3
+  compression:
+    description: >-
+      Active flat floats divided by routed floats. The claim is parity BPB at
+      >= x2, so a program scoring well below x2 is not solving the task even if
+      its BPB is good.
+    decimals: 3
+    is_primary: false
+    higher_is_better: true
+    lower_bound: 1.0
+    upper_bound: 40.0
+    include_in_prompts: true
+    significant_change: 0.05
+  n_features:
+    description: Number of feature columns the program emits. A descriptor, and a cost.
+    decimals: 0
+    is_primary: false
+    higher_is_better: false
+    lower_bound: 1.0
+    upper_bound: 4096.0
+    include_in_prompts: true
+    significant_change: 1.0
+  feature_seconds:
+    description: Wall-clock to extract features for the whole vocabulary. A descriptor.
+    decimals: 2
+    is_primary: false
+    higher_is_better: false
+    lower_bound: 0.0
+    upper_bound: 600.0
+    include_in_prompts: true
+    significant_change: 0.5
