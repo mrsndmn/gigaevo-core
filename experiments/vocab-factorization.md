@@ -777,6 +777,51 @@ single-pass form), and the active-host-vocabulary bridge arm. The flat control
 is `TRANSPLANTS['bpe8k-t']`, which the `transplant` group already re-runs under
 the mask; no arm here budgets a second copy of it.
 
+### W1 results — the transplant grid under the mask (2026-08-29)
+
+Five jobs, submitted in parallel, 51–75 min each, **84 min of wall clock for
+~5 GPU-hours**. All completed. Full valid split, active-vocab mask, against P0's
+masked native reference of 0.7796.
+
+| arm | step0 | final clean | vs native | note |
+|---|---|---|---|---|
+| `bpe8k-t` | 2.7704 | **0.7704** | **−0.0092** | the headline arm |
+| `bpe8k-t-unfrozen` | 2.7704 | 0.7869 | +0.0073 | body unfrozen |
+| `fact8k-nosuf-t` | 4.2587 | 0.8175 | +0.0379 | the proposal |
+| `bpe8k-t-random` | 4.7938 | 1.4098 | +0.6302 | init floor |
+| `orig-reinit` | 4.8962 | 1.4281 | +0.6485 | THE control |
+
+**Study 2's headline survives the mask.** `bpe8k-t` beats the model it replaced
+by 0.0092 BPB — against 0.0094 measured pre-mask on a 2.2 MB cut. The margin is
+essentially unchanged by re-measuring on the full split under a shared
+normalizer, which is the strongest form the BPB claim can take. It is still a
+corpus-BPB claim; HellaSwag is what tests whether it means anything.
+
+**Unfreezing the body made things worse**, by 0.0165 against the frozen arm —
+ten times the noise floor, and enough to put it *behind* the native model. Read
+carefully, though: `TransplantTrainSpec.lr` is 1e-3, chosen because only
+embeddings train and the random-init arms must move far in ~800 steps. That is
+one to two orders of magnitude above a sane full-model finetuning rate, so what
+this measures is "unfreezing under a protocol tuned for frozen bodies", not
+"the body is not the bottleneck". The honest conclusion is narrower than the
+number looks: **the residual gap is not something a naive unfreeze closes**, and
+answering the original question would need its own LR sweep, which no track
+currently budgets.
+
+**The proposal still loses to the null hypothesis.** `fact8k-nosuf-t` is 0.0471
+behind `bpe8k-t` at matched vocabulary — the same direction study 1 found at 33M
+and study 2 at 1.7B. Case factorization keeps costing clean BPB.
+
+Two internal checks passed. The two mean-of-pieces arms agree to full precision
+at step 0 (2.7704020929249653), as they must before training. And the unfrozen
+arm's checkpoint is 3.5 GB against the frozen arms' 65 MB — it carries the body,
+which is the fix W1 made after noticing that "the body reloads from HF" stops
+being true the moment an arm trains it.
+
+**What this unblocks.** Four checkpoints now exist, so the five waiting
+HellaSwag jobs are launchable, and `bpe8k-t` is the masked flat control the
+stage-1 tree grid is measured against.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one
