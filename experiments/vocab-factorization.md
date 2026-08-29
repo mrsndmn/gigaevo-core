@@ -822,6 +822,98 @@ being true the moment an arm trains it.
 HellaSwag jobs are launchable, and `bpe8k-t` is the masked flat control the
 stage-1 tree grid is measured against.
 
+### Every gate, resolved (2026-08-30)
+
+Four pre-registered gates were run to completion. One passed, three fired. All
+BPB is clean, full valid split, active-vocab mask; masked native = 0.7796, flat
+control (`bpe8k-t`) = 0.7704, noise floor 0.0016.
+
+**1. transplant-hardening — the gate FIRES. Study 2's headline is rewritten.**
+
+| arm | HellaSwag acc_norm | vs native | clean BPB |
+|---|---|---|---|
+| `orig-frozen` (native) | **0.6035** | — | 0.7796 |
+| `bpe8k-t` | 0.5389 | **−6.5 pts** | **0.7704** |
+| `fact8k-nosuf-t` | 0.5182 | −8.5 pts | 0.8175 |
+| `bpe8k-t-unfrozen` | 0.3462 | −25.7 pts | 0.7869 |
+| `bpe8k-t-random` | 0.2901 | −31.3 pts | 1.4098 |
+| `orig-reinit` | 0.2686 | −33.5 pts | 1.4281 |
+
+`bpe8k-t` **beats the model it replaced on corpus BPB and loses 6.5 points of
+HellaSwag doing it** — a 10.7% relative drop, not "within a few points". The
+claim is therefore rewritten, exactly as pre-registered: the transplant
+**matches the model it replaced on corpus BPB**, and does not preserve its
+downstream task ability. The trivial explanation is ruled out by the coverage
+diagnostic: 0.00% of the 8k arms' HellaSwag tokens fall outside their active
+vocabulary, so this is not the model failing to represent the benchmark.
+
+The unfrozen arm makes the point sharper than the headline arm does. Unfreezing
+moved corpus BPB by +0.0165 — a rounding error at this scale — while removing
+**25.7 points** of HellaSwag. BPB and downstream capability are not merely
+imperfectly correlated here; they came apart completely. That is the strongest
+possible argument for why this track had to exist, and it is also the honest
+caveat on the unfrozen arm's BPB result: `lr=1e-3` was tuned for
+embedding-only training and evidently damaged the body.
+
+**2. stage1-tree — the gate FIRES. The routed table is killed.**
+
+| arm | floats | compression | clean BPB | vs flat |
+|---|---|---|---|---|
+| `bpe8k-t` (flat control) | 16.28M | ×1.00 | 0.7704 | — |
+| `tree8k-x2` | 8.02M | ×2.03 | 1.2281 | **+0.458** |
+| `tree8k-x2-fgb` | 7.93M | ×2.05 | 1.4913 | +0.721 |
+| `tree8k-x4` | 4.06M | ×4.01 | 1.7270 | +0.957 |
+| `tree8k-x2-film` | 8.06M | ×2.02 | 1.7287 | +0.958 |
+
+The kill line was +0.05 at ×2. The best routed arm is **+0.458, nine times
+over**. Feature-routed boosted trees do not carry a pretrained embedding table
+at half the floats. Neither ablation rescues it: FiLM composition is no better
+than plain additive routing at *twice* the compression, and boosting on the loss
+gradient through the body — the correction stage 0's failure seemed to demand —
+is worse than boosting on matrix residuals.
+
+**3. ladder-calibration — the gate FIRES. The evolution phase is killed.**
+
+Spearman rho against the expensive rung, over 16 candidates including four
+deliberately-bad anchors: **L0 = 0.50, L1 = 0.47**, both far below the
+pre-registered 0.7. Per ADR 0002 the evolution phase is **not launched**.
+
+Range restriction is not the explanation — the L2 spread is 1.51 BPB, and the
+anchors landed where anchors should (`anchor-leading-space`, one bit, is worst
+at 3.76). The most useful single row is `surface`: it has by far the **highest**
+L0 explained variance (0.2104, 3.5x the next) and ranks **11th of 16** on the
+objective. Selecting on L0 would actively pick a bad router. That is stage 0
+finding 4 reproduced on a new family of partitions, and it is why ~173 GPU-hours
+were not spent.
+
+*Caveat, recorded rather than buried:* L2 here is a 60-step transplant train.
+Whether short-train BPB ranks candidates the same way a full train does is not
+something this measurement establishes. The gate as run says the cheap rungs do
+not predict the 60-step objective; a defender of the ladder could reasonably ask
+for the full-train version, which no track budgets.
+
+**4. progressive-shrink — the gate PASSES, and this is the programme's best
+result.**
+
+| rung | rule | V | floats | vs active flat | clean BPB | vs native | tokens |
+|---|---|---|---|---|---|---|---|
+| 0 | active-vocab mask | 74,957 | 153.51M | ×1.00 | 0.7796 | +0.0000 | — |
+| 1 | case/space → stem + role | 48,703 | 99.77M | ×1.54 | **0.7757** | **−0.0039** | +0.00% |
+| 2 | re-piece tail (<100) | 17,385 | 35.63M | **×4.31** | **0.7775** | **−0.0021** | +1.81% |
+| 3 | re-piece tail (<1000) | 4,783 | 9.82M | ×15.63 | 0.8144 | +0.0348 | +14.07% |
+
+**A 4.3x smaller embedding table matches the pretrained model it came from**,
+and rung 1 is very slightly *better* than native at 1.54x. The curriculum
+continues while healed BPB stays within +0.01 and stops at rung 3, exactly as
+the gate specifies. Rung 0 reproducing 0.7796 to four decimals is the codec's
+correctness check, not a measurement.
+
+**The comparison that matters.** Interpretable shrink rules reach ×4.31 at
+parity; learned feature-routed trees were killed at ×2 with +0.458. Both
+compress the same table against the same reference under the same protocol. The
+structure that works here was *specified*, not searched — which is also, and
+independently, what the calibration gate concluded about searching for it.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one
@@ -1026,3 +1118,21 @@ unseen words.
   (66 single-byte host tokens are inactive, so rule 2 needs a byte floor), and
   reachability has to be read off the active set rather than the train stream.
   A shrink step subsumes the mask rather than composing with it.
+- 2026-08-30 — **All four pre-registered gates resolved.** (1) Hardening
+  FIRES: `bpe8k-t` beats the native model on corpus BPB (0.7704 vs 0.7796) and
+  loses 6.5 points of HellaSwag acc_norm (0.5389 vs 0.6035); study 2's headline
+  is rewritten from "beats the model it replaced" to "matches it on corpus
+  BPB". The unfrozen arm makes it starkest — +0.0165 BPB for -25.7 HellaSwag
+  points. (2) Stage-1 trees KILLED: best routed arm +0.458 BPB at x2 against a
+  +0.05 kill line, with neither FiLM nor functional-gradient boosting helping.
+  (3) Ladder calibration FIRES: Spearman rho 0.50 (L0) and 0.47 (L1) vs 0.7
+  required, so the evolution phase is not launched and ~173 GPU-hours are not
+  spent; `surface` has the highest L0 explained variance and ranks 11th of 16
+  on the objective, reproducing stage 0 finding 4. (4) Progressive-shrink
+  PASSES and is the programme's best result: **17,385 stems + 6 roles, 35.6M
+  embedding floats, x4.31 against the active flat table, at 0.7775 clean BPB —
+  0.0021 *better* than the pretrained model it came from.** The gate stops the
+  curriculum at rung 3 (x15.6, +0.0348). Interpretable rules beat learned
+  routing decisively; the structure that worked was specified, not searched.
+  Evolution phase pre-registered in `problems/vocab_routing/` and left
+  unlaunched.

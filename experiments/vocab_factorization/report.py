@@ -49,9 +49,21 @@ def _table(headers: list[str], rows: list[list]) -> str:
 
 
 def _load(runs_dir: Path, order: list[str]) -> tuple[list[str], dict]:
+    """Training-run records only.
+
+    One directory now holds several artifact kinds — a run's record, a
+    checkpoint re-evaluation (``*.eval.json``), a downstream score. They share
+    the ``experiment`` key and nothing else, so a table that loaded all of them
+    would either crash on a missing field or, worse, let a re-evaluation
+    overwrite the run it re-evaluated.
+    """
     found = {}
-    for p in runs_dir.glob("*.json"):
+    for p in sorted(runs_dir.glob("*.json")):
+        if p.name.startswith("_") or p.name.endswith(".eval.json"):
+            continue
         d = json.loads(p.read_text())
+        if "params" not in d or "eval.clean" not in d:
+            continue
         found[d["experiment"]] = d
     names = [n for n in order if n in found] + [
         n for n in sorted(found) if n not in order
