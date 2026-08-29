@@ -300,6 +300,7 @@ def collect_jobs(
         "hellaswag": hellaswag_jobs,
         "tree": tree_jobs,
         "shrink": shrink_jobs,
+        "calibration": calibration_jobs,
     }
     jobs: list[JobSpec] = []
     for g in groups:
