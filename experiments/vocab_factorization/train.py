@@ -326,7 +326,9 @@ def main() -> None:
     ap.add_argument("--eval-batch", type=int, default=8)
     ap.add_argument("--eval-mb", type=float, default=0.0, help="0 = whole valid split")
     ap.add_argument("--workers", type=int, default=48)
-    ap.add_argument("--save-ckpt", action="store_true", help="keep weights for post-hoc analysis")
+    ap.add_argument(
+        "--save-ckpt", action="store_true", help="keep weights for post-hoc analysis"
+    )
     args = ap.parse_args()
 
     if args.all:

@@ -332,11 +332,14 @@ TRANSPLANTS_BY_NAME = {t.name: t for t in TRANSPLANTS}
 # ``tree_embed`` read their configuration from here.
 
 
+FEATURE_GROUPS_V0: tuple[str, ...] = ("surface", "decomposition", "ngram", "corpus")
+
+
 @dataclass(frozen=True)
 class FeatureSpec:
     """Which interpretable token features route the tree (see token_features)."""
 
-    groups: tuple[str, ...] = ("surface", "decomposition", "ngram", "corpus")
+    groups: tuple[str, ...] = FEATURE_GROUPS_V0
     ngram_buckets: int = 256
     ngram_min: int = 3
     ngram_max: int = 5
@@ -540,6 +543,84 @@ SHRINKS: list[ShrinkTransplantSpec] = [
 ]
 
 SHRINKS_BY_NAME = {s.name: s for s in SHRINKS}
+
+
+# ---------------------------------------------------------------------------
+# Study 4, track 3: calibrating the fitness ladder before evolving (ADR 0002)
+# ---------------------------------------------------------------------------
+#
+# The candidate set is where this track lives or dies. Correlating a cheap rung
+# against an expensive one over near-identical candidates inflates rho — the
+# same range-restriction trap this study already documented once, when
+# `inflation` rewarded a bad baseline. So the set is feature-group ablations
+# PLUS deliberately-bad anchors, and each anchor is a *different kind* of bad:
+# `random` has no signal, `length` has real but nearly useless signal, and the
+# single-feature routers have signal on exactly one axis.
+
+
+@dataclass(frozen=True)
+class CalibrationCandidate:
+    name: str
+    kind: str  # groups | columns | random
+    groups: tuple[str, ...] = ()
+    columns: tuple[str, ...] = ()
+    is_anchor: bool = False
+    note: str = ""
+
+
+CALIBRATION_CANDIDATES: list[CalibrationCandidate] = [
+    # --- feature-group ablations: the range we actually care about ----------
+    CalibrationCandidate("all", "groups", groups=FEATURE_GROUPS_V0),
+    CalibrationCandidate("surface", "groups", groups=("surface",)),
+    CalibrationCandidate("ngram", "groups", groups=("ngram",)),
+    CalibrationCandidate("corpus", "groups", groups=("corpus",)),
+    CalibrationCandidate("decomposition", "groups", groups=("decomposition",)),
+    CalibrationCandidate("surface+ngram", "groups", groups=("surface", "ngram")),
+    CalibrationCandidate("surface+corpus", "groups", groups=("surface", "corpus")),
+    CalibrationCandidate(
+        "surface+decomposition", "groups", groups=("surface", "decomposition")
+    ),
+    CalibrationCandidate("ngram+corpus", "groups", groups=("ngram", "corpus")),
+    CalibrationCandidate(
+        "no-ngram", "groups", groups=("surface", "decomposition", "corpus")
+    ),
+    CalibrationCandidate(
+        "no-corpus", "groups", groups=("surface", "decomposition", "ngram")
+    ),
+    CalibrationCandidate(
+        "no-surface", "groups", groups=("decomposition", "ngram", "corpus")
+    ),
+    # --- deliberately-bad anchors: the low end rho needs to be honest -------
+    CalibrationCandidate(
+        "anchor-random",
+        "random",
+        is_anchor=True,
+        note="no signal at all — the floor any usable rung must rank last",
+    ),
+    CalibrationCandidate(
+        "anchor-length",
+        "columns",
+        columns=("len.bytes.log",),
+        is_anchor=True,
+        note="length-only: real signal, nearly useless for sharing parameters",
+    ),
+    CalibrationCandidate(
+        "anchor-logfreq",
+        "columns",
+        columns=("corpus.logfreq",),
+        is_anchor=True,
+        note="single-feature: frequency alone, the most plausible bad router",
+    ),
+    CalibrationCandidate(
+        "anchor-leading-space",
+        "columns",
+        columns=("flag.leading_space",),
+        is_anchor=True,
+        note="one bit: at most two groups of tokens",
+    ),
+]
+
+CALIBRATION_CANDIDATES_BY_NAME = {c.name: c for c in CALIBRATION_CANDIDATES}
 
 
 # ---------------------------------------------------------------------------

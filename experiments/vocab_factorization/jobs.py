@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from experiments.vocab_factorization.configs import (
+    CALIBRATION_CANDIDATES,
     DISTILLS,
     HOST_ARM,
     SHRINKS,
@@ -224,6 +225,30 @@ def shrink_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
             ),
         )
         for s in SHRINKS
+    ]
+
+
+def calibration_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
+    """Track 3: one job per ladder candidate, then an analysis pass.
+
+    Fanned out rather than looped in one job because the whole point of the
+    track is to be cheap relative to the ~173 GPU-hour decision it gates, and 16
+    ten-minute jobs finish in ten minutes on this allocation. The rho is
+    computed afterwards by ``--analyze`` over whatever landed, so a candidate
+    that fails does not take the verdict with it.
+    """
+    out = f"{results_root}/calibration"
+    return [
+        JobSpec(
+            name=f"calib-{c.name}",
+            module="experiments.vocab_factorization.calibrate",
+            description=f"calibrate {c.name}"
+            + (" [bad anchor]" if c.is_anchor else ""),
+            args=("--candidate", c.name, "--reserve-gb", "24"),
+            arms=("bpe8k",),
+            marker=f"{out}/{c.name}.json",
+        )
+        for c in CALIBRATION_CANDIDATES
     ]
 
 

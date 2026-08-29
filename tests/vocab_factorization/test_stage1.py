@@ -255,3 +255,49 @@ def test_a_routed_model_still_trains_and_scores():
     loss.backward()
     assert torch.isfinite(loss)
     assert torch.count_nonzero(tree.leaves.grad) > 0
+
+
+# --- ladder calibration ---------------------------------------------------
+
+
+def test_spearman_matches_a_hand_computed_case():
+    from experiments.vocab_factorization.calibrate import spearman
+
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    assert spearman(a, a) == pytest.approx(1.0)
+    assert spearman(a, -a) == pytest.approx(-1.0)
+    # Monotone but non-linear: rank correlation must not care.
+    assert spearman(a, a**3) == pytest.approx(1.0)
+
+
+def test_analyze_flips_L0_sign_so_both_rungs_read_positive_is_good():
+    """L0 is explained variance (higher better); L1/L2 are BPB (lower better).
+    A rung that tracks the objective perfectly must score +1 either way, or the
+    gate would reject the good rung and accept the inverted one."""
+    import json as _json
+    from pathlib import Path as _P
+    import tempfile
+
+    from experiments.vocab_factorization.calibrate import analyze
+
+    with tempfile.TemporaryDirectory() as td:
+        d = _P(td)
+        for i in range(6):
+            # L0 perfectly anti-correlated with L2, L1 perfectly correlated:
+            # both are "perfect agreement with the objective".
+            (d / f"c{i}.json").write_text(
+                _json.dumps(
+                    {
+                        "candidate": f"c{i}",
+                        "is_anchor": i >= 4,
+                        "L0_explained_variance": 1.0 - i / 10,
+                        "L1_step0_bpb": 1.0 + i / 10,
+                        "L2_short_train_bpb": 1.0 + i / 10,
+                    }
+                )
+            )
+        v = analyze(d, threshold=0.7)
+    assert v["rho_L0_vs_L2"] == pytest.approx(1.0)
+    assert v["rho_L1_vs_L2"] == pytest.approx(1.0)
+    assert v["evolution_unblocked"] is True
+    assert v["n_anchors"] == 2
