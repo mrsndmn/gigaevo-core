@@ -167,6 +167,24 @@ def _install_tree(model, spec, features, targets, d_model: int, n_active: int) -
     from experiments.vocab_factorization import tree_embed
     from experiments.vocab_factorization.active_vocab import active_floats
 
+    # An HF host's embedding table is padded past ``len(tokenizer)`` — 151,936
+    # rows for 151,669 ids — and features are extracted per *tokenizer* id, so
+    # the two disagree by exactly the padding. Every table row still needs a
+    # route or the routed table would have fewer rows than the softmax it feeds.
+    # Zero rows put the padding in one leaf together, which is right: they are
+    # unreachable by the tokenizer and masked out of the softmax anyway. On a
+    # corpus-trained arm the gap is zero and this is a no-op, which is why only
+    # the host bridge arm ever hit it.
+    rows = targets.shape[0]
+    if features.shape[0] != rows:
+        if features.shape[0] > rows:
+            raise ValueError(
+                f"{features.shape[0]} feature rows for a {rows}-row table — "
+                "features cannot describe tokens the table does not have"
+            )
+        pad = np.zeros((rows - features.shape[0], features.shape[1]), features.dtype)
+        features = np.concatenate([features, pad], axis=0)
+
     flat_floats = active_floats(n_active, d_model)
     leaves = spec.tree.leaves_per_tree or tree_embed.leaves_for_budget(
         flat_floats, spec.budget_ratio, d_model, spec.tree.n_trees, spec.tree.film

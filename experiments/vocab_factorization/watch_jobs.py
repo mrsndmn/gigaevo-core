@@ -68,7 +68,26 @@ def summarize(jobs: list[dict]) -> list[str]:
             lines.append(f"  {j['name']:32s} NO RESULT at {marker}")
             continue
         d = json.loads(marker.read_text())
-        clean = d.get("eval.clean", {}).get("bpb")
+        # The wave is heterogeneous: transplant runs, HellaSwag scores and
+        # calibration rungs land in the same batch and share no fields. Report
+        # whichever this is rather than assuming, because a summary that raises
+        # loses the whole wave's numbers over one job of the wrong kind.
+        if "acc_norm" in d:
+            lines.append(
+                f"  {j['name']:32s} acc={d['acc']:.4f} acc_norm={d['acc_norm']:.4f} "
+                f"oov={100 * d['active_vocab_coverage']['fraction_outside_active']:.2f}%"
+            )
+            continue
+        if "L2_short_train_bpb" in d:
+            lines.append(
+                f"  {j['name']:32s} L0={d['L0_explained_variance']:.4f} "
+                f"L1={d['L1_step0_bpb']:.4f} L2={d['L2_short_train_bpb']:.4f}"
+            )
+            continue
+        clean = (d.get("eval.clean") or {}).get("bpb")
+        if clean is None:
+            lines.append(f"  {j['name']:32s} (no clean BPB in {marker.name})")
+            continue
         step0 = d.get("step0_clean_bpb")
         tree = d.get("tree") or {}
         extra = (
@@ -79,8 +98,10 @@ def summarize(jobs: list[dict]) -> list[str]:
         mins = (d.get("train_seconds") or 0) / 60
         lines.append(
             f"  {j['name']:32s} clean={clean:.4f} step0={step0:.4f} "
-            f"steps={d.get('steps')} {mins:.0f}min{extra}"
+            if step0 is not None
+            else f"  {j['name']:32s} clean={clean:.4f} "
         )
+        lines[-1] += f"steps={d.get('steps')} {mins:.0f}min{extra}"
     return lines
 
 
