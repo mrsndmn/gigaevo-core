@@ -993,6 +993,43 @@ The result the earlier rungs were reaching for is therefore stronger than
 reported: the case regression was an artifact of merging ids rather than text,
 and fixing the layer improves every suite except the one built from mixed case.
 
+### The shrink arms, under the hardening gate (2026-08-30)
+
+The shrink curve's numbers were clean-BPB only, which is exactly the claim this
+programme's own hardening gate exists to distrust. Scored on HellaSwag:
+
+| arm | ×flat | clean BPB | HS acc_norm | vs native |
+|---|---|---|---|---|
+| orig-frozen (native) | — | 0.7796 | **0.6035** | — |
+| **shrink1-fold** | ×1.64 | **0.7554** | **0.5916** | **−1.2 pts** |
+| shrink2-fold100 | ×4.50 | 0.7614 | 0.5714 | −3.2 pts |
+| shrink1-case | ×1.54 | 0.7757 | 0.5760 | −2.8 pts |
+| shrink2-tail100 | ×4.31 | 0.7775 | 0.5628 | −4.1 pts |
+| shrink2-tail200 | ×6.18 | 0.7812 | 0.5547 | −4.9 pts |
+| shrink2-tail300 | ×7.80 | 0.7852 | 0.5441 | −5.9 pts |
+| shrink2-tail500 | ×10.64 | 0.7966 | 0.5316 | −7.2 pts |
+| shrink3-tail1k | ×15.63 | 0.8144 | 0.5209 | −8.3 pts |
+| bpe8k-t (flat control) | — | 0.7704 | 0.5389 | −6.5 pts |
+
+**`shrink1-fold` passes the bar `bpe8k-t` failed.** It loses 1.2 points where
+the transplant lost 6.5, while being 0.0242 *better* on clean BPB — the only
+modified-vocabulary arm in the programme that is both better on BPB and within
+a couple of points downstream. Folding beats merging downstream too, at both
+depths (+1.6 and +0.9 points).
+
+**But the clean-BPB gate is systematically optimistic.** `shrink2-tail300`
+sits *inside* the +0.01 gate (+0.0056, "parity") and loses **5.9 points** —
+worse than `bpe8k-t`, whose 6.5-point loss was judged severe enough to rewrite
+study 2's headline. HellaSwag degrades monotonically down the whole curve
+(0.5916 → 0.5209) while BPB moves by 0.06. So the gate as pre-registered
+licenses compression that downstream ability does not support, and a
+compression claim from this track should quote both numbers or neither.
+
+The coverage diagnostic is `fraction_outside_codec` for these arms — an active
+mask is vacuous once the inactive rows are *deleted*. It reads 0.06% for the
+merge arms, matching `orig-frozen`'s published `tokens_outside_active` exactly
+(rule 0 really is the mask as deletion), and 0.03% for the fold arms.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one
