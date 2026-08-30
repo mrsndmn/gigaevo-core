@@ -39,11 +39,14 @@ from experiments.vocab_factorization.configs import (
     CALIBRATION_CANDIDATES,
     DISTILLS,
     HOST_ARM,
+    SHRINK_CURRICULA,
     SHRINKS,
     TRANSPLANTS,
     TREE_TRANSPLANTS,
     TransplantTrainSpec,
     active_cache_path,
+    fold_active_cache_path,
+    fold_cache_path,
     token_cache_path,
 )
 
@@ -98,6 +101,11 @@ class JobSpec:
     description: str
     args: tuple[str, ...] = ()
     arms: tuple[str, ...] = ()  # token caches this job reads
+    # Arms whose *case-folded* caches this job reads. A separate field rather
+    # than a flag on ``arms`` because the folded stream is a different encoding
+    # of the same arm, with its own cache files and its own active set — and
+    # both are read-through, so both have to be preflighted.
+    fold_arms: tuple[str, ...] = ()
     num_gpus: int = NUM_GPUS
     marker: str = ""  # container path whose existence means "done"
     # Artifacts an *earlier wave* must have produced. Unlike ``arms``, a missing
@@ -219,6 +227,14 @@ def shrink_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
             ),
             args=("--exp", s.name, "--ckpt-dir", CKPT_ROOT, "--reserve-gb", "24"),
             arms=(s.arm,),
+            fold_arms=(
+                (s.arm,)
+                if any(
+                    r.rule == "case_fold"
+                    for r in SHRINK_CURRICULA[s.curriculum][: s.stage]
+                )
+                else ()
+            ),
             marker=f"{out}/{s.name}.json",
             requires=(
                 () if not s.train else (f"{RESULTS_ROOT}/transplant/orig-frozen.json",)
@@ -323,14 +339,19 @@ def missing_inputs(spec: JobSpec, data_dir_local: Path) -> list[str]:
     seconds of CPU; discovering the race after a night of jobs is not.
     """
     tspec = TransplantTrainSpec()
+    tokens = data_dir_local / "tokens"
     missing = []
     for arm in spec.arms:
         want = [
-            token_cache_path(
-                data_dir_local / "tokens", arm, "train", tspec.train_bytes
-            ),
-            token_cache_path(data_dir_local / "tokens", arm, "valid", None),
-            active_cache_path(data_dir_local / "tokens", arm),
+            token_cache_path(tokens, arm, "train", tspec.train_bytes),
+            token_cache_path(tokens, arm, "valid", None),
+            active_cache_path(tokens, arm),
+        ]
+        missing += [str(p) for p in want if not p.exists()]
+    for arm in spec.fold_arms:
+        want = [
+            fold_cache_path(tokens, arm, "train", tspec.train_bytes),
+            fold_active_cache_path(tokens, arm),
         ]
         missing += [str(p) for p in want if not p.exists()]
     return missing
@@ -341,8 +362,18 @@ def missing_requirements(spec: JobSpec) -> list[str]:
     return [r for r in spec.requires if not Path(to_local_path(r)).exists()]
 
 
-def prewarm_command(arm: str) -> str:
-    """What to run to fix what ``missing_inputs`` reports."""
+def prewarm_command(arm: str, fold: bool = False) -> str:
+    """What to run to fix what ``missing_inputs`` reports.
+
+    The folded caches are built by ``shrink --curriculum fold``, which needs them
+    and so writes them; it also prints the curve they produce, which is the
+    thing worth reading before spending GPU time on it.
+    """
+    if fold:
+        return (
+            "PYTHONPATH=. python -m experiments.vocab_factorization.shrink "
+            "--curriculum fold"
+        )
     return (
         "PYTHONPATH=. python -m experiments.vocab_factorization.active_vocab "
         f"--arm {arm}"

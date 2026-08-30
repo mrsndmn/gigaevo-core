@@ -26,6 +26,7 @@ import pytest
 from experiments.vocab_factorization import shrink
 from experiments.vocab_factorization.configs import (
     SHRINK_CURRICULUM,
+    SHRINK_FOLD_CURRICULUM,
     ShrinkRule,
 )
 
@@ -286,6 +287,217 @@ def test_a_broken_rule_is_caught_by_the_round_trip_check():
     )
     with pytest.raises(ValueError, match="does not round-trip"):
         shrink._verify(HOST, step)
+
+
+# --- case folding at tokenization time ------------------------------------
+#
+# Rule 1 merges ids; the fold re-tokenizes. The difference only shows up on text
+# whose casing changes the *segmentation*, so the toy tokenizer below is a real
+# byte-level greedy segmenter over the same surfaces — " THE" is one piece and
+# " ThE" is not, exactly as on the host.
+
+
+class ToyTokenizer:
+    """Longest-match byte segmentation over ``SURFACES``, shaped like HF's."""
+
+    def __init__(self, surfaces: list[bytes]) -> None:
+        self.index = {}
+        for i, s in enumerate(surfaces):
+            self.index.setdefault(s, i)
+        self.longest = max(len(s) for s in surfaces)
+
+    def __call__(self, text: str, add_special_tokens: bool = False) -> dict:
+        b = text.encode("utf-8")
+        ids: list[int] = []
+        i = 0
+        while i < len(b):
+            for ln in range(min(self.longest, len(b) - i), 0, -1):
+                hit = self.index.get(b[i : i + ln])
+                if hit is not None:
+                    ids.append(hit)
+                    i += ln
+                    break
+            else:  # pragma: no cover - SURFACES contains every single byte
+                raise AssertionError("the toy vocabulary cannot spell a byte")
+        return {"input_ids": ids}
+
+
+TOK = ToyTokenizer(SURFACES)
+
+
+def _fold_plan(text: str, rules=SHRINK_FOLD_CURRICULUM[:2], extra: str = ""):
+    """Build a fold plan whose active set is what folding ``text`` emits."""
+    enc = shrink.fold_encode(text + extra, TOK, HOST)
+    active = np.union1d(np.unique(enc.ids.astype(np.int64)), ACTIVE)
+    plan = shrink.build(
+        HOST,
+        active,
+        enc.ids.astype(np.int64),
+        rules,
+        fold_case=enc.case,
+    )
+    return plan, enc
+
+
+def test_fold_makes_the_stem_stream_case_invariant():
+    """The measurement this whole rule exists for. Rule 1 leaves ``upper`` and
+    ``lower`` sharing 36.9% of their stem mass on the real corpus because the
+    host fragments uppercase text first; a fold has to leave them identical."""
+    plan, _ = _fold_plan(" the cat the cat")
+    low = plan.fold_stream(shrink.fold_encode(" the cat", TOK, HOST))
+    up = plan.fold_stream(shrink.fold_encode(" THE CAT", TOK, HOST))
+    title = plan.fold_stream(shrink.fold_encode(" The Cat", TOK, HOST))
+    assert np.array_equal(low["stem"], up["stem"])
+    assert np.array_equal(low["stem"], title["stem"])
+    assert not np.array_equal(low["role"], up["role"])
+    # And the merge, on the same text, does not: " THE" is one host id but
+    # " CAT" is not in this vocabulary, so it fragments before any merge.
+    merge = shrink.build(
+        HOST, ACTIVE, _stream(ACTIVE.tolist(), 40), SHRINK_CURRICULUM[:2]
+    )
+    assert not np.array_equal(
+        merge.apply_stream(np.array(TOK(" the cat")["input_ids"]))["stem"],
+        merge.apply_stream(np.array(TOK(" THE CAT")["input_ids"]))["stem"],
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        " the cat",
+        " THE CAT",
+        " The Cat",
+        " tHe CaT!",  # mixed case: the fallback path
+        "aBc \xd0\x9f",  # a surface no role expresses, next to a byte fragment
+        "İstanbul",  # 'İ'.lower() is two characters: the lowering expands
+        " stra\xdfe STRASSE",  # 'ß'.upper() is 'SS', which does not invert
+        "  the   THE  ",  # multi-space surfaces stay verbatim
+        "",
+    ],
+)
+def test_the_fold_round_trips_the_text_it_encodes(text):
+    """Losslessness is checked by spelling the stream back out, never argued."""
+    plan, _ = _fold_plan(" the cat", extra=text)
+    arrays = plan.fold_stream(shrink.fold_encode(text, TOK, HOST))
+    assert shrink.verify_fold(plan, arrays, text.encode("utf-8"))["bytes"] == len(
+        text.encode("utf-8")
+    )
+
+
+def test_mixed_case_falls_back_to_the_original_tokenization_and_says_so():
+    """A token that spans a case change is not expressible as one role, so the
+    region is re-tokenized from the *original* text. The rate is reported
+    because this is the one place the fold gives up its own guarantee: on the
+    real corpus it is 0.18% of clean tokens and 45% of ``randcase`` ones."""
+    plan, _ = _fold_plan(" the cat thE")
+    enc = shrink.fold_encode(" thE", TOK, HOST)
+    assert enc.stats["fallback_groups"] == 1
+    assert enc.stats["fallback_tokens"] > 1, "the region re-fragments"
+    assert shrink.verify_fold(plan, plan.fold_stream(enc), b" thE")
+
+
+def test_mixed_case_split_across_tokens_needs_no_fallback():
+    """Which is why ``randcase`` is not a total loss: where the tokenizer
+    already cuts at the case change, each piece has a case of its own and the
+    fold expresses it as a role instead of giving up."""
+    enc = shrink.fold_encode("aBc", TOK, HOST)  # 'abc' is not one piece here
+    assert enc.stats["fallback_tokens"] == 0
+    assert enc.stats["recased_tokens"] == 1
+
+
+def test_the_fallback_adds_no_row_the_merge_would_not_have():
+    """The cost of the fallback is fragmentation, not vocabulary. Study 1's
+    verbatim path added stems; here the fallback emits *host ids*, and a surface
+    no role expresses is already a verbatim row under rule 1. On the real
+    vocabulary that shows up as 503 of the fold's 45,742 rows still carrying an
+    uppercase letter, against 4,395 of the merge's 48,703."""
+    stream = _stream(ACTIVE.tolist(), 40)
+    merge = shrink.build(HOST, ACTIVE, stream, SHRINK_CURRICULUM[:2])
+    fold, _ = _fold_plan(" the cat thE")
+    assert b"aBc" in merge.vocab.stems and b"aBc" in fold.vocab.stems
+    assert set(fold.vocab.stems) <= set(merge.vocab.stems)
+
+
+def test_a_clean_lowercase_text_never_takes_the_fallback():
+    enc = shrink.fold_encode(" the cat the cat!", TOK, HOST)
+    assert enc.stats["fallback_tokens"] == 0
+    assert enc.stats["recased_tokens"] == 0
+    assert enc.stats["unattributable_boundaries"] == 0
+
+
+def test_min_group_1_costs_no_rows():
+    """The fold forces ``min_group=1`` so the encoder's decision is a function of
+    a surface. That is free: two surfaces sharing a lowercase core would be a
+    group of two, so a singleton's core collides with nothing."""
+    stream = _stream(ACTIVE.tolist(), 40)
+    one = shrink.build(
+        HOST, ACTIVE, stream, SHRINK_CURRICULUM[:1] + (ShrinkRule("case_space", 0, 1),)
+    )
+    two = shrink.build(HOST, ACTIVE, stream, SHRINK_CURRICULUM[:2])
+    assert len(one.vocab) == len(two.vocab)
+
+
+def test_case_fold_refuses_a_group_threshold_it_cannot_honour():
+    with pytest.raises(ValueError, match="min_group=1"):
+        shrink.build(
+            HOST,
+            ACTIVE,
+            _stream(ACTIVE.tolist(), 4),
+            SHRINK_CURRICULUM[:1] + (ShrinkRule("case_fold", 0, 2),),
+        )
+
+
+def test_a_fold_makes_every_case_form_reachable_for_the_re_piecing():
+    """After a fold, "which casings occur" is no longer a fact about the corpus:
+    the arm is case-invariant by construction, so rule 2 has to be able to spell
+    an uppercase word the training stream never contained."""
+    plan, _ = _fold_plan(" the cat " * 30, rules=SHRINK_FOLD_CURRICULUM[:3])
+    arrays = plan.fold_stream(shrink.fold_encode(" THE CAT", TOK, HOST))
+    assert shrink.verify_fold(plan, arrays, b" THE CAT")
+
+
+def test_a_repiecing_after_a_fold_carries_the_case_onto_the_pieces():
+    """The case is imposed at the fold rung, not on the final pairs, so a word
+    that re-pieces gets *every* piece spelled in the case it was read in."""
+    plan, _ = _fold_plan(
+        " the the the cat",
+        rules=SHRINK_FOLD_CURRICULUM[:2] + (ShrinkRule("repiece_tail", min_count=2),),
+    )
+    arrays = plan.fold_stream(shrink.fold_encode(" CAT", TOK, HOST))
+    assert arrays["stem"].size > 1, "the tail stem should have been re-pieced"
+    assert shrink.verify_fold(plan, arrays, b" CAT")
+
+
+def test_every_row_of_a_folded_table_still_has_a_host_source():
+    """``shrink_init`` refuses a table with a row nothing reaches, and after a
+    fold the codec alone no longer covers one: re-piecing an *uppercase* word
+    can use a stem no lowercase segmentation does. Measured on the real
+    vocabulary, that was one row of ``shrink2-fold100``'s 16,632."""
+    rules = SHRINK_FOLD_CURRICULUM[:2] + (ShrinkRule("repiece_tail", min_count=3),)
+    plan, enc = _fold_plan(" the cat " * 20, rules=rules)
+    counts = np.bincount(enc.ids.astype(np.int64), minlength=len(SURFACES))
+    rows = plan.source_rows(counts)
+    assert set(rows["dst"].tolist()) == set(range(len(plan.vocab)))
+
+
+def test_the_fold_leaves_a_single_source_row_single_source():
+    """The extra edges carry weight 1 and are added only where the codec named
+    no edge at all, so rule 0's rows still come out bit-identical — which is
+    what makes a mask rung reproduce the masked native reference exactly."""
+    plan, enc = _fold_plan(" the cat")
+    counts = np.bincount(enc.ids.astype(np.int64), minlength=len(SURFACES))
+    rows = plan.source_rows(counts)
+    seen = list(zip(rows["dst"].tolist(), rows["src"].tolist()))
+    assert len(seen) == len(set(seen)), "an edge was counted twice"
+    fan = np.bincount(rows["dst"], minlength=len(plan.vocab))
+    verbatim = plan.vocab.stems.index(b"aBc")  # no role, so exactly one source
+    assert fan[verbatim] == 1
+
+
+def test_the_fold_needs_a_fold_rung_to_put_the_case_in():
+    plan = _plan(SHRINK_CURRICULUM[:2])
+    with pytest.raises(ValueError, match="no case_fold rung"):
+        plan.fold_stream(shrink.fold_encode(" the", TOK, HOST))
 
 
 # --- the init the healing train starts from -------------------------------

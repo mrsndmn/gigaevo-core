@@ -63,10 +63,13 @@ from experiments.vocab_factorization.configs import (
     HOST_ARM,
     TransplantTrainSpec,
     active_cache_path,
+    fold_active_cache_path,
 )
 from experiments.vocab_factorization.prepare import (
     build_text,
     encode_text,
+    fold_text,
+    get_fold_tokens,
     get_tokens,
 )
 from experiments.vocab_factorization.train import EVAL_SUITES
@@ -202,6 +205,115 @@ def load_or_build(
         print(
             f"active vocab: {ids.size}/{vocab_size} ids "
             f"({ids.size / vocab_size:.1%}) -> {path}",
+            flush=True,
+        )
+    return ids
+
+
+def build_fold(
+    arm_name: str,
+    table_size: int,
+    corpus_dir: Path,
+    arms_dir: Path,
+    tokens_dir: Path,
+    train_bytes: int,
+    workers: int = 40,
+) -> dict:
+    """The active set of a *case-folded* arm.
+
+    A different set, and it has to be: the folded encoder tokenizes the
+    lowercased text, so it emits ids the original text never does, and it splices
+    in original-text ids wherever a token cannot be re-cased. Reusing the plain
+    active set would leave those unspellable — the mask would score them at
+    probability zero, which is the failure ``assert_targets_active`` exists to
+    make loud. The suites are the same ones, folded.
+    """
+    enc = get_fold_tokens(
+        arm_name,
+        "train",
+        train_bytes,
+        corpus_dir,
+        arms_dir,
+        tokens_dir,
+        table_size,
+        workers,
+    )
+    train_ids = _unique(enc.ids)
+    fold_stats = dict(enc.stats)
+    del enc
+
+    valid_text = build_text(corpus_dir, "valid", None)
+    ids = train_ids
+    per_suite: dict[str, dict] = {}
+    for suite in ACTIVE_SUITES:
+        e = fold_text(
+            arm_name,
+            arms_dir,
+            perturb.apply_suite(suite, valid_text, seed=0),
+            table_size,
+            workers,
+        )
+        suite_ids = _unique(e.ids)
+        outside = suite_ids[~np.isin(suite_ids, train_ids)]
+        per_suite[suite] = {
+            "ids": int(suite_ids.size),
+            "ids_outside_train": int(outside.size),
+            **{k: e.stats[k] for k in ("tokens", "fallback_token_fraction")},
+        }
+        ids = np.union1d(ids, suite_ids)
+        del e
+
+    return {
+        "arm": arm_name,
+        "encoding": "case_fold",
+        "vocab_size": int(table_size),
+        "train_bytes": int(train_bytes),
+        "suites": list(ACTIVE_SUITES),
+        "n_train_ids": int(train_ids.size),
+        "n_active": int(ids.size),
+        "coverage": float(ids.size / table_size),
+        "train_fold": fold_stats,
+        "per_suite": per_suite,
+        "ids": ids,
+    }
+
+
+def load_or_build_fold(
+    arm_name: str,
+    table_size: int,
+    corpus_dir: Path,
+    arms_dir: Path,
+    tokens_dir: Path,
+    train_bytes: int | None = None,
+    workers: int = 40,
+    verbose: bool = True,
+) -> np.ndarray:
+    """Cached ``build_fold``, keyed like ``load_or_build`` and checked the same."""
+    train_bytes = (
+        TransplantTrainSpec().train_bytes if train_bytes is None else train_bytes
+    )
+    path = fold_active_cache_path(tokens_dir, arm_name)
+    if path.exists():
+        z = np.load(path, allow_pickle=False)
+        meta = json.loads(str(z["meta"]))
+        if meta["vocab_size"] != table_size or meta["train_bytes"] != train_bytes:
+            raise ValueError(
+                f"{path} was built for vocab_size={meta['vocab_size']} "
+                f"train_bytes={meta['train_bytes']}, not "
+                f"{table_size}/{train_bytes} — delete it to rebuild"
+            )
+        ids = z["ids"]
+    else:
+        info = build_fold(
+            arm_name, table_size, corpus_dir, arms_dir, tokens_dir, train_bytes, workers
+        )
+        ids = info.pop("ids")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(path, ids=ids, meta=json.dumps(info))
+    if verbose:
+        print(
+            f"folded active vocab: {ids.size}/{table_size} ids "
+            f"({ids.size / table_size:.1%}) [{path}]",
             flush=True,
         )
     return ids

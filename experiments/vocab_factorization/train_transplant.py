@@ -43,7 +43,7 @@ from experiments.vocab_factorization.build_arms import get_arm
 from experiments.vocab_factorization.configs import (
     HOST_MODEL,
     MASKED_NATIVE_BPB,
-    SHRINK_CURRICULUM,
+    SHRINK_CURRICULA,
     SHRINK_GATE_BPB,
     SHRINKS,
     SHRINKS_BY_NAME,
@@ -54,7 +54,13 @@ from experiments.vocab_factorization.configs import (
     TransplantSpec,
     TransplantTrainSpec,
 )
-from experiments.vocab_factorization.prepare import build_text, encode_text, get_tokens
+from experiments.vocab_factorization.prepare import (
+    build_text,
+    encode_text,
+    fold_text,
+    get_fold_tokens,
+    get_tokens,
+)
 from experiments.vocab_factorization.train import (
     EVAL_SUITES,
     WindowSampler,
@@ -106,8 +112,11 @@ def _save_checkpoint(model, spec, tspec, heads, steps, path: Path) -> str:
         # the codec is derived rather than stored (it is a deterministic function
         # of the arm, the active set, the curriculum prefix and the train
         # stream). Recording the prefix length is what makes the checkpoint
-        # self-describing enough to rebuild it.
+        # self-describing enough to rebuild it — including *which* chain the
+        # prefix indexes, since the fold and merge curricula share stage numbers
+        # and produce different vocabularies at each of them.
         "stage": getattr(spec, "stage", 0),
+        "curriculum": getattr(spec, "curriculum", "default"),
         "emb": model.emb.state_dict(),
         "out": model.out.state_dict(),
     }
@@ -228,37 +237,83 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     # id by construction, so there is nothing left to mask and the mask block
     # below is skipped rather than applied on top. Rule 0 makes that exact
     # rather than approximate — it *is* the mask, expressed as deletion.
-    plan = shrink_acct = host_counts = None
+    plan = shrink_acct = host_counts = fold = None
     if getattr(spec, "stage", 0):
         from experiments.vocab_factorization import shrink
 
-        active_ids = active_vocab.load_or_build(
-            spec.arm,
-            arm.heads["stem"],
-            args.corpus,
-            args.arms_dir,
-            args.tokens_dir,
-            tspec.train_bytes,
-            workers=args.workers,
-        )
         # Overriding the last rule's threshold rather than extending the chain
         # keeps every arm a nested prefix of one curriculum — which is what
         # makes the result a curve rather than a scatter of unrelated
         # vocabularies. A longer chain would apply a 200 threshold to a
         # vocabulary already thresholded at 1000, which is a different thing.
-        rules = list(SHRINK_CURRICULUM[: spec.stage])
+        rules = list(SHRINK_CURRICULA[getattr(spec, "curriculum", "default")])
+        rules = rules[: spec.stage]
         if getattr(spec, "override_min_count", 0) and rules:
             rules[-1] = replace(rules[-1], min_count=spec.override_min_count)
+        folding = any(r.rule == "case_fold" for r in rules)
+
+        if folding:
+            # The folded stream is a different encoding of the same bytes, so it
+            # brings its own active set and its own counts; nothing about it can
+            # be recovered from the host-id stream ``enc``.
+            fold = get_fold_tokens(
+                spec.arm,
+                "train",
+                budget,
+                args.corpus,
+                args.arms_dir,
+                args.tokens_dir,
+                heads["stem"],
+                workers=args.workers,
+            )
+            active_ids = active_vocab.load_or_build_fold(
+                spec.arm,
+                heads["stem"],
+                args.corpus,
+                args.arms_dir,
+                args.tokens_dir,
+                tspec.train_bytes,
+                workers=args.workers,
+            )
+            stream, stream_case = fold.ids.astype(np.int64), fold.case
+        else:
+            active_ids = active_vocab.load_or_build(
+                spec.arm,
+                arm.heads["stem"],
+                args.corpus,
+                args.arms_dir,
+                args.tokens_dir,
+                tspec.train_bytes,
+                workers=args.workers,
+            )
+            stream, stream_case = enc.stem.astype(np.int64), None
+
         plan = shrink.build(
             shrink.host_vocabulary(arm, heads["stem"]),
             active_ids,
-            enc.stem,
+            stream,
             rules,
+            fold_case=stream_case,
+            # Token inflation stays quoted against the host's *own* tokenization
+            # of the same text, so a fold arm's number says what folding costs
+            # in sequence length rather than comparing it to itself.
+            host_tokens=int(enc.stem.size),
         )
-        host_counts = np.bincount(enc.stem.astype(np.int64), minlength=heads["stem"])
+        host_counts = np.bincount(stream, minlength=heads["stem"])
         heads = plan.heads()
-        train_arrays = plan.apply_stream(enc.stem)
+        train_arrays = (
+            plan.fold_stream(fold) if folding else plan.apply_stream(enc.stem)
+        )
         shrink_acct = {**plan.accounting(d_model), **plan.summary()}
+        if folding:
+            shrink_acct["fold"] = fold.stats
+            print(
+                f"[{spec.name}] fold: {fold.stats['recased_fraction']:.2%} of "
+                f"tokens carry a restored case, "
+                f"{fold.stats['fallback_token_fraction']:.4%} came back through "
+                f"the mixed-case fallback",
+                flush=True,
+            )
         print(
             f"[{spec.name}] shrink stage {spec.stage}: "
             f"{[s.rule for s in plan.steps]} -> {heads} "
@@ -348,14 +403,43 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     # Encode every suite once and reuse for both the step-0 and final passes:
     # the text does not change, only the model does.
     eval_sets = {}
+    fold_eval: dict[str, dict] = {}
     for suite in EVAL_SUITES:
         text = perturb.apply_suite(suite, valid_text, seed=0)
-        e = encode_text(spec.arm, args.arms_dir, text, workers=args.workers)
         # A shrunk arm scores the same *bytes* through a different token stream,
         # which is exactly why the metric is bits per byte: the denominator does
         # not move when re-piecing lengthens the numerator's stream.
-        arrays = plan.apply_stream(e.stem) if plan else _heads_arrays(e, heads)
+        if fold is not None:
+            from experiments.vocab_factorization.shrink import verify_fold
+
+            # ``heads`` is the *shrunk* table by now; the fold encoder needs the
+            # host's row count, which is what the plan kept.
+            e = fold_text(
+                spec.arm, args.arms_dir, text, len(plan.host), workers=args.workers
+            )
+            arrays = plan.fold_stream(e)
+            # Every scored suite is round-tripped, not argued about. This is the
+            # only place the encoder's alignment, its case decision and its
+            # fallback splice are all exercised on text nobody chose, and a
+            # stream that does not spell the bytes back would still produce a
+            # perfectly plausible BPB.
+            verify_fold(plan, arrays, text.encode("utf-8"))
+            fold_eval[suite] = e.stats
+        elif plan is not None:
+            e = encode_text(spec.arm, args.arms_dir, text, workers=args.workers)
+            arrays = plan.apply_stream(e.stem)
+        else:
+            e = encode_text(spec.arm, args.arms_dir, text, workers=args.workers)
+            arrays = _heads_arrays(e, heads)
         eval_sets[suite] = (arrays, len(text.encode("utf-8")))
+    if fold_eval:
+        shrink_acct["fold_eval"] = fold_eval
+        for suite, st in fold_eval.items():
+            print(
+                f"[{spec.name}] fold {suite:9s} {st['tokens']:>9,} tokens  "
+                f"fallback {st['fallback_token_fraction']:.4%}",
+                flush=True,
+            )
 
     # The active-vocabulary convention, applied identically to every arm. Built
     # from this arm's own streams, so an arm whose vocabulary was trained on the

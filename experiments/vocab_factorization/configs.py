@@ -112,6 +112,24 @@ def active_cache_path(tokens_dir: Path, arm_name: str) -> Path:
     return tokens_dir / arm_name / "active_vocab.npz"
 
 
+# The case-folded encoding is a *different* stream over the same arm — host ids
+# of the lowercased text plus the case each token restores — so it needs its own
+# cache keys rather than a variant spelling of the ones above. Same reason the
+# functions exist at all: the launcher checks the cache before fanning out jobs
+# that would otherwise race to write it.
+
+
+def fold_cache_path(
+    tokens_dir: Path, arm_name: str, split: str, nbytes: int | None
+) -> Path:
+    tag = "full" if nbytes is None else f"{nbytes // (1024 * 1024)}mb"
+    return tokens_dir / arm_name / f"{split}.{tag}.fold.npz"
+
+
+def fold_active_cache_path(tokens_dir: Path, arm_name: str) -> Path:
+    return tokens_dir / arm_name / "active_vocab.fold.npz"
+
+
 # The masked native reference (W0, ``results/transplant/orig-frozen.json``):
 # clean BPB of the untouched pretrained model under the active-vocab mask. Every
 # progressive-shrink rung is gated against it, so it lives here rather than in a
@@ -483,11 +501,42 @@ SHRINK_CURRICULUM: tuple[ShrinkRule, ...] = (
 )
 
 
+# Rule 1 merges token *ids*, and measurement says that is not the same thing as
+# merging case. `shrink1-case` is 0.0039 BPB better than native on clean text and
+# +1.145 worse on `upper`, with 0.886 of the damage in the stem head — because
+# the host tokenizer fragments uppercase text into different pieces *before* any
+# merge applies (`orig-frozen` emits +64% tokens on `upper`), so the merge fires
+# on the wrong fragments. Diagnostic, 2026-08-30: the stem streams rule 1
+# produces for `upper` and `lower` share only 36.9% of their unigram mass.
+#
+# This curriculum swaps the merge for a fold at tokenization time: tokenize the
+# lowercased text, emit the role from the original casing. Same vocabulary, same
+# role algebra; the difference is entirely in how the stream is produced, so the
+# `case_space` arms keep the numbers already published against them.
+SHRINK_FOLD_CURRICULUM: tuple[ShrinkRule, ...] = (
+    ShrinkRule("mask", note="rule 0 — unchanged; the active set is the folded one"),
+    ShrinkRule(
+        "case_fold",
+        min_group=1,
+        note="rule 1' — the merged table entered by re-tokenizing the "
+        "lowercased text; min_group=1 is what makes the encoder's decision a "
+        "function of a surface rather than of the plan",
+    ),
+    ShrinkRule("repiece_tail", min_count=100, note="rule 2 — re-piece the tail"),
+    ShrinkRule("repiece_tail", min_count=1000, note="rule 2 again, deeper"),
+)
+
+SHRINK_CURRICULA: dict[str, tuple[ShrinkRule, ...]] = {
+    "default": SHRINK_CURRICULUM,
+    "fold": SHRINK_FOLD_CURRICULUM,
+}
+
+
 @dataclass(frozen=True)
 class ShrinkTransplantSpec:
     """One point on the BPB-vs-vocabulary-size curve.
 
-    ``stage`` is how many rules of ``SHRINK_CURRICULUM`` to apply, so the arms
+    ``stage`` is how many rules of the arm's curriculum to apply, so the arms
     are nested vocabularies and the curriculum's order is the grid.
 
     Execution fields carry the same names and meanings as ``TransplantSpec`` so
@@ -504,6 +553,8 @@ class ShrinkTransplantSpec:
     # where the re-piecing threshold sits, and the curve needs points between
     # them far more than it needs a longer chain.
     override_min_count: int = 0
+    # Which chain of ``SHRINK_CURRICULA`` ``stage`` is a prefix of.
+    curriculum: str = "default"
     arm: str = HOST_ARM
     init: str = "shrink"
     train: bool = True
@@ -561,6 +612,26 @@ SHRINKS: list[ShrinkTransplantSpec] = [
     ),
     ShrinkTransplantSpec(
         "shrink2-tail500", stage=3, override_min_count=500, note="ditto"
+    ),
+    # --- the case-fold repair (W2 follow-up) --------------------------------
+    # These are *additions*, not replacements: `shrink1-case` and the tail arms
+    # keep the numbers already on the curve, and the comparison that matters is
+    # fold-vs-merge at the same vocabulary size and the same token budget.
+    ShrinkTransplantSpec(
+        "shrink1-fold",
+        stage=2,
+        curriculum="fold",
+        note="rule 1's table, entered by folding case at tokenization time — "
+        "the arm that tests whether shrink1-case's +1.145 on `upper` was the "
+        "merge or the fragmentation the merge inherited",
+    ),
+    ShrinkTransplantSpec(
+        "shrink2-fold100",
+        stage=3,
+        curriculum="fold",
+        note="the fold carried through one re-piecing pass, so the compression "
+        "that passed the gate (x4.31) is measured on the case-invariant stream "
+        "rather than only at the free rung",
     ),
 ]
 

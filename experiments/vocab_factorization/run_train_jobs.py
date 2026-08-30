@@ -153,6 +153,8 @@ def main() -> int:
             print(f"  {m}", file=sys.stderr)
         for a in arms:
             print(f"  $ {prewarm_command(a)}", file=sys.stderr)
+        if any(j.fold_arms for j in jobs):
+            print(f"  $ {prewarm_command('', fold=True)}", file=sys.stderr)
         return 1
 
     if args.dry:

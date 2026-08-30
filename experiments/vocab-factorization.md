@@ -1009,6 +1009,91 @@ into each arm's JSON (`gate_pass`, `gate_margin`) rather than leaving it to
 whoever reads the file. Budget ~3 GPU-h: `shrink0-mask` is eval-only and costs
 what `orig-frozen` cost (377 s on a worker), the other three are ~1 GPU-h each.
 
+### The case regression, diagnosed and repaired (2026-08-30)
+
+Rule 1 passes the gate and breaks case robustness. Both, at once:
+
+| arm | clean | upper | Δ upper | randcase | Δ randcase |
+|---|---|---|---|---|---|
+| `orig-frozen` (native) | 0.7796 | 1.0702 | +0.291 | 1.8151 | +1.036 |
+| `shrink1-case` | **0.7757** | 1.9205 | **+1.145** | 1.9814 | +1.206 |
+| `shrink2-tail100` | 0.7775 | 1.9236 | +1.146 | 1.9877 | +1.210 |
+
+Split by head on `upper` for `shrink1-case`: stem 0.7023 → **1.5886**, role
+0.0734 → 0.3319. The damage is in the *stem* head, which is the surprise — the
+role head is supposed to be where case goes.
+
+**The diagnosis.** Rule 1 merges token **ids**, and the ids uppercase text emits
+are not the ids the merge was built from. The host tokenizer fragments uppercase
+text first: `orig-frozen` emits 1,572,864 tokens on `upper` against 958,464 on
+`clean` (+64%), and `' ПРИВЕТ'` comes back as `' П','РИ','В','Е','Т'` where
+`' привет'` is `' пр','ив','ет'`. So the merge does fire — **92.9% of `upper`'s
+tokens land in a lexeme group**, more than clean's 67.4% — it just fires on
+different fragments. The clean test: if case-merging worked as intended, `upper`
+and `lower` would leave nearly the same stem stream. Their unigram multisets
+share **36.9%**, against 95.8% for clean-vs-lower.
+
+The original hypothesis was half right and worth correcting in public: the claim
+was that uppercase text does not produce the variant ids *at all*. It does, in
+quantity. What it does not produce is the same *segmentation*, and that is what
+the stem head pays for.
+
+**The repair: `case_fold`, a fold at tokenization time rather than a merge after
+it.** Tokenize the lowercased text, emit the role from the original casing —
+what `tokenization.FactorizedArm` does at the tokenizer and what rule 1 only
+approximates. Same role algebra (`shrink._canonicalize`, `_cased`), same kind of
+table, new arms (`shrink1-fold`, `shrink2-fold100`) so the published `case_space`
+numbers do not move.
+
+| | rule 1 merge | rule 1' fold |
+|---|---|---|
+| stems (stage 2) | 48,703 | **45,742** |
+| embedding floats | 99.77M | **93.70M** |
+| rows still carrying an uppercase letter | 4,395 (9.0%) | **503 (1.1%)** |
+| `upper` tokens (valid split) | 1,573,813 | **962,723** (−38.8%) |
+| `upper` stems agreeing with `lower` | 36.9% | **99.85%** |
+| `title` stems agreeing with `lower` | 79.1% | **99.4%** |
+| `randcase` stems agreeing with `lower` | 56.2% | 58.6% |
+| train tokens vs the host's own | +0.00% | −0.08% |
+
+The folded arm is *smaller* as well as case-invariant, because the lowercased
+text exercises fewer host ids (58,587 active against 74,957) — so it carries its
+own active set, `active_vocab.load_or_build_fold`.
+
+**Alignment is done in bytes, not characters.** HF's `return_offsets_mapping` is
+not usable here: a byte-level BPE splits characters, and measured on this
+tokenizer `'ǅ'` comes back as two tokens *both* claiming span (0, 1) while a
+combining mark is dropped from the map entirely. Byte-level BPE is an exact byte
+segmentation, so the token surfaces' own lengths give a partition that cannot be
+wrong; `shrink._lower_map` carries it back to the original through a per-character
+lowercasing (`str.lower()` is context-sensitive and length-changing — `'İ'`
+becomes two characters — so the whole-string result has no exact offset map).
+
+**Mixed case falls back, and the rate is reported.** `"aBc"` is not expressible
+as one role. Study 1's answer was per-run classification (`ArmSpec.piece_case`),
+which is unavailable to a transplant: its runs would be new stems, and this
+vocabulary's rows are pretrained host rows. So the region is re-tokenized from
+the *original* text and emitted with the role its own ids carry — exactly what
+rule 1 does, which is why it adds **no row**: a surface no role expresses is
+already a verbatim row. What it costs is fragmentation. Fallback rates, measured:
+
+| suite | clean | typo1 | typo5 | lower | upper | title | randcase | train (230 MB) |
+|---|---|---|---|---|---|---|---|---|
+| tokens via fallback | 0.18% | 0.21% | 0.33% | 0.00% | 0.10% | 0.62% | **45.1%** | 0.145% |
+
+`randcase` is the honest exception and is expected to stay bad: it is mixed case
+by construction. It is not a total loss only because where the tokenizer already
+cuts at the case change (`' rAnDoM'` → `' r','An','Do','M'`) each piece has a
+case of its own and the fold expresses it as a role instead of giving up.
+
+**Losslessness is verified, not argued.** `shrink.verify_fold` spells the whole
+stream back out and compares it to the text; it runs over every scored suite
+inside `train_transplant` and over the full 230 MB train stream in the module's
+own report. All seven suites and the train stream round-trip byte for byte.
+
+One thing the repair does *not* fix and one thing that could still go wrong are
+recorded in the changelog entry below.
+
 ## Changelog
 
 - 2026-08-26 — Built harness: corpus prep, surface factorization with verified
@@ -1136,3 +1221,34 @@ unseen words.
   routing decisively; the structure that worked was specified, not searched.
   Evolution phase pre-registered in `problems/vocab_routing/` and left
   unlaunched.
+- 2026-08-30 — **The shrink track's case regression diagnosed and repaired
+  (CPU only; no GPU time spent).** `shrink1-case` is 0.0039 BPB better than
+  native on clean text and +1.145 worse on `upper`, with 0.886 of that in the
+  *stem* head. Cause, measured: rule 1 merges token **ids**, and uppercase text
+  is fragmented into different pieces before any merge applies — the merge fires
+  on 92.9% of `upper`'s tokens but on the wrong fragments, leaving `upper` and
+  `lower` sharing only 36.9% of their stem mass. New rule `case_fold` +
+  `shrink.fold_encode` tokenize the *lowercased* text and read the role off the
+  original casing; that takes the same figure to 99.85% and cuts `upper` from
+  1,573,813 tokens to 962,723 for the same bytes, at 45,742 stems against rule
+  1's 48,703. Two new arms, `shrink1-fold` and `shrink2-fold100`; the
+  `case_space` arms are untouched and reproduce their published numbers
+  (74,957 / 48,703 / 17,385 / 4,783) digit for digit. Round-tripping is verified
+  by spelling the stream back out over all seven suites and the full 230 MB
+  train stream.
+
+  **What this does not fix, and what could still go wrong.** `randcase` is
+  mixed case by construction: 45.1% of its tokens take the fallback and its stem
+  agreement moves only 56.2% → 58.6%, so the `randcase` regression should be
+  expected to survive. And the repair is a *token-stream* result, not a BPB
+  result — no arm has been trained. Three ways it could still disappoint: the
+  frozen body has never seen a stream in which case is carried by a side head,
+  so the role head's own NLL on `upper` (where the merge already paid 0.3319)
+  could grow enough to eat the stem-head win; the fold changes the *train*
+  stream too (10.99% of train tokens carry a restored case), which is a
+  distribution the pretrained body was not built for and could cost clean BPB
+  the merge arm did not; and the folded active set is a different 58,587 rows,
+  so `shrink1-fold` is not a controlled swap of one mechanism at fixed
+  vocabulary. The claim being tested is narrow and worth stating as such: a
+  case-invariant stem stream is *available* at this vocabulary size, and whether
+  the frozen body can be healed onto it is the measurement the two new arms buy.

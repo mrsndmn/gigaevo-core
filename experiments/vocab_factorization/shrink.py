@@ -35,24 +35,42 @@ rewritten pair still spells the same bytes it did before. That is what keeps
 BPB comparable across the curve: the token stream changes, the byte stream it
 encodes does not, and BPB's denominator is bytes.
 
+**Merging ids is not the same as merging case.** Rule 1 rewrites ids that are
+already case variants of one lexeme, and on clean text that is excellent — 0.7757
+BPB, 0.0039 *better* than the pretrained model, at no cost in tokens. On
+uppercase text it is a disaster: 1.9205, and 0.886 of the +1.145 lives in the
+*stem* head. The reason is that the host tokenizer fragments uppercase text into
+different, rarer pieces **before** any merge applies, so the merge fires on the
+wrong fragments — 92.9% of ``upper``'s tokens do land in a lexeme group, and the
+stem streams rule 1 leaves for ``upper`` and ``lower`` still share only 36.9% of
+their unigram mass. ``case_fold`` + ``fold_encode`` is the repair: tokenize the
+lowercased text, read the role off the original casing. That takes the same
+comparison to **99.85%** and cuts ``upper`` from 1,573,813 tokens to 962,723.
+
 Measured on Qwen3-1.7B's vocabulary and the real 230 MB stream (run the module,
-2026-08-30; 24 s of CPU for the deepest rung, so nothing here needs a cache):
+2026-08-30; 26 s of CPU for the deepest rung once the stream is encoded):
 
 =====================================  ======  ========  ====================
 rule 0  active-vocab mask               74,957  153.51M   W0's mask, as deletion
 rule 1  case/space -> stem + role bit   48,703   99.77M   token count unchanged
 rule 2  re-piece the tail (< 100)       17,385   35.63M   +1.81% tokens
 rule 2  re-piece the tail (< 1000)       4,783    9.82M   +14.07% tokens
+-------------------------------------  ------  --------  --------------------
+rule 0  mask, over the folded ids       58,587  119.99M   fewer ids are used
+rule 1' case fold at tokenization       45,742   93.70M   -0.08% tokens
+rule 2  re-piece the tail (< 100)       16,632   34.09M   +1.56% tokens
+rule 2  re-piece the tail (< 1000)       4,890   10.04M   +12.82% tokens
 =====================================  ======  ========  ====================
 
 Run::
 
     PYTHONPATH=. python -m experiments.vocab_factorization.shrink
+    PYTHONPATH=. python -m experiments.vocab_factorization.shrink --curriculum fold
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -250,12 +268,18 @@ def _rewrite_from_lists(
 
 @dataclass(frozen=True)
 class Step:
-    """One curriculum rung: the rule, its rewrite, and what it actually did."""
+    """One curriculum rung: the rule, its rewrite, and what it actually did.
+
+    ``case_invariant`` marks a rung whose vocabulary is meant to be *entered by
+    re-tokenizing* (``fold_encode``) rather than by relabeling host ids. It
+    changes what "reachable" means downstream — see ``_case_variants``.
+    """
 
     rule: str
     params: dict
     rewrite: Rewrite
     stats: dict
+    case_invariant: bool = False
 
     @property
     def n_stems(self) -> int:
@@ -378,6 +402,72 @@ def _rule_case_space(vocab: Vocabulary, rule: ShrinkRule, ctx: Context) -> Step:
             ],
         },
     )
+
+
+def _rule_case_fold(vocab: Vocabulary, rule: ShrinkRule, ctx: Context) -> Step:
+    """Rule 1' — the same merged table, entered by re-tokenizing instead.
+
+    Rule 1 merges *ids*. Measured (W2 diagnostic, 2026-08-30) that is not the
+    same thing as merging case: the host tokenizer fragments uppercase text
+    before any merge can apply, so ``upper`` and ``lower`` leave stem streams
+    whose unigram multisets overlap only **36.9%** and whose lengths differ by
+    63%. The merge fires — 92.9% of ``upper`` tokens land in a lexeme group —
+    but on *different fragments*, and shrink1-case pays +0.886 BPB in the stem
+    head for it. ``fold_encode`` produces the stream this vocabulary was
+    designed for: tokenize the lowercased text, read the role off the original.
+
+    The vocabulary is exactly rule 1's, with one change: ``min_group`` is forced
+    to 1. That is not a tuning knob, it is what makes the encoder independent of
+    the plan. The encoder decides "may I re-case this piece?" from the piece's
+    own surface (``_canonicalize``); if a singleton group were left verbatim,
+    a surface that canonicalizes would still be an unmerged row and imposing a
+    case role on it would spell the wrong bytes. Row count is unaffected — two
+    surfaces sharing a core would be a group of two, so a singleton's core
+    collides with nothing and one row is traded for one row.
+    """
+    if rule.min_group != 1:
+        raise ValueError(
+            "case_fold requires min_group=1: the fold encoder reads the merge "
+            "decision off a surface, not off the group's size"
+        )
+    step = _rule_case_space(vocab, replace(rule, min_group=1), ctx)
+    stats = dict(step.stats)
+    # Inherited from rule 1, where it counts tokens whose *id* carries a case or
+    # space role. Under a fold the stream is lowercase, so the same number counts
+    # leading spaces only and the case fraction lives in ``FoldEncoding.stats``.
+    # Renaming it here stops the artifact from being read as the fold's own.
+    stats["token_fraction_with_a_space"] = stats.pop("token_fraction_with_a_role")
+    return Step("case_fold", {"min_group": 1}, step.rewrite, stats, True)
+
+
+def _case_variants(
+    stems: np.ndarray, roles: np.ndarray | None, vocab: Vocabulary
+) -> tuple[np.ndarray, np.ndarray]:
+    """Every legal case form of a reachable pair is reachable after a fold.
+
+    Reachability is what rule 2 re-pieces over, and after a fold it is no longer
+    "the pairs the active ids happen to spell". The point of folding is that any
+    casing of a reachable word is emittable whether or not the perturbation
+    suites happened to contain it, so the closure is taken over the role algebra
+    rather than over the measured suites. Illegal forms (``b"42"`` has no upper)
+    are dropped, so ``spell`` stays total on the result.
+    """
+    stems = np.asarray(stems, dtype=np.int64)
+    base = (
+        np.zeros_like(stems)
+        if roles is None
+        else (np.asarray(roles, dtype=np.int64) // 3) * 3
+    )
+    s = np.repeat(stems, 3)
+    r = np.repeat(base, 3) + np.tile(np.arange(3, dtype=np.int64), stems.size)
+    key = np.unique(s * vocab.n_roles + r)
+    s, r = np.divmod(key, vocab.n_roles)
+    keep = np.fromiter(
+        (vocab.spell(int(a), int(b)) is not None for a, b in zip(s, r, strict=True)),
+        dtype=bool,
+        count=s.size,
+    )
+    return s[keep], r[keep]
 
 
 def _greedy(
@@ -506,8 +596,346 @@ def _rule_repiece_tail(vocab: Vocabulary, rule: ShrinkRule, ctx: Context) -> Ste
 RULES = {
     "mask": _rule_mask,
     "case_space": _rule_case_space,
+    "case_fold": _rule_case_fold,
     "repiece_tail": _rule_repiece_tail,
 }
+
+
+# --- case folding at tokenization time ------------------------------------
+#
+# Rule 1 rewrites ids that are already case variants of one lexeme. The
+# diagnostic behind ``_rule_case_fold`` says uppercase text does not *emit*
+# those ids in the first place — it is fragmented differently before any merge
+# applies. So this half tokenizes the lowercased text and recovers the case from
+# the original, which is what study 1's factorized arms did at the tokenizer
+# (``tokenization.FactorizedArm``) and what rule 1 only approximates.
+
+
+@dataclass(frozen=True)
+class FoldEncoding:
+    """Host ids over the *lowercased* text, plus the case each token restores.
+
+    ``case`` is the case index (0/1/2) to impose on the id's role, or **-1** for
+    "keep the role the id already carries". -1 rather than 0 is load-bearing: a
+    token that came back through the fallback path spells the original text
+    itself, and its id may well be an uppercase surface whose own role is
+    ``upper`` — forcing 0 onto it would re-spell it in lowercase.
+    """
+
+    ids: np.ndarray  # int32
+    case: np.ndarray  # int8
+    nbytes: int
+    stats: dict = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return int(self.ids.size)
+
+
+def _utf8_len(cp: np.ndarray) -> np.ndarray:
+    n = np.ones(cp.size, dtype=np.int64)
+    n += (cp >= 0x80).astype(np.int64)
+    n += (cp >= 0x800).astype(np.int64)
+    n += (cp >= 0x10000).astype(np.int64)
+    return n
+
+
+def _lower_map(text: str) -> tuple[str, bytes, np.ndarray, np.ndarray]:
+    """Lowercase ``text`` and map the result's byte offsets back onto it.
+
+    Returns ``(low, low_bytes, omap, changed)``. ``omap[p]`` is the byte offset
+    in ``text`` that lowercase byte ``p`` came from, or -1 where the question
+    has no answer; ``changed[p]`` counts lowercase bytes before ``p`` that
+    belong to a character the lowering altered.
+
+    **Lowercasing is done character by character, not with ``str.lower()``.**
+    Not for speed — the vectorized path here is a codepoint LUT and is faster —
+    but because ``str.lower()`` is context-sensitive (Greek final sigma) and
+    length-changing ('İ' becomes two characters), so the whole-string result has
+    no exact offset map. Per character it does, and the -1 entries mark the
+    interiors of characters whose bytes moved, which is precisely where a
+    byte-level BPE boundary would be unattributable.
+    """
+    cp = np.frombuffer(text.encode("utf-32-le"), dtype=np.uint32)
+    uniq, inv = np.unique(cp, return_inverse=True)
+    inv = inv.reshape(-1)
+    forms = [chr(int(c)).lower() for c in uniq.tolist()]
+    same_u = np.array(
+        [f == chr(int(c)) for c, f in zip(uniq.tolist(), forms, strict=True)],
+        dtype=bool,
+    )
+    if all(len(f) == 1 for f in forms):
+        lut = np.array([ord(f) for f in forms], dtype=np.uint32)
+        low = lut[inv].astype("<u4").tobytes().decode("utf-32-le")
+    else:
+        low = "".join([forms[i] for i in inv.tolist()])
+    low_bytes = low.encode("utf-8")
+
+    blen = np.array([len(f.encode("utf-8")) for f in forms], dtype=np.int64)
+    nb_low = blen[inv] if inv.size else np.zeros(0, dtype=np.int64)
+    ob = np.zeros(cp.size + 1, dtype=np.int64)
+    np.cumsum(_utf8_len(cp), out=ob[1:])
+    lb = np.zeros(cp.size + 1, dtype=np.int64)
+    np.cumsum(nb_low, out=lb[1:])
+    same = same_u[inv] if inv.size else np.zeros(0, dtype=bool)
+
+    n = int(lb[-1])
+    omap = np.full(n + 1, -1, dtype=np.int64)
+    pos = np.arange(n, dtype=np.int64)
+    keep = np.repeat(same, nb_low)
+    omap[pos[keep]] = pos[keep] + np.repeat(ob[:-1] - lb[:-1], nb_low)[keep]
+    omap[lb[:-1]] = ob[:-1]
+    omap[n] = int(ob[-1])
+    changed = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(np.repeat(~same, nb_low), out=changed[1:])
+    return low, low_bytes, omap, changed
+
+
+def _fold_case(surface: bytes, original: bytes) -> int:
+    """Which case role turns ``surface`` back into ``original``.
+
+    0/1/2 for a case index, -1 for "the surface is already the original", -2 for
+    "no role spells this" — the mixed-case answer, and the only path that costs
+    anything.
+    """
+    if surface == original:
+        return -1
+    canon = _canonicalize(surface)
+    if canon is None:
+        return -2
+    core, role = canon
+    lead = b" " if role >= 3 else b""
+    for c in (1, 2):
+        form = _cased(core, c)
+        if form is not None and lead + form == original:
+            return c
+    return -2
+
+
+def fold_encode(text: str, tok, host: Vocabulary) -> FoldEncoding:
+    """Tokenize the lowercased text; read each token's case off the original.
+
+    The alignment is done in **bytes, not characters**. HF's
+    ``return_offsets_mapping`` reports character spans, and a byte-level BPE
+    splits characters: measured on this tokenizer, 'ǅ' comes back as two tokens
+    both claiming the span (0, 1) and a combining mark is dropped from the map
+    entirely. Byte-level BPE *is* an exact byte segmentation, so the token
+    surfaces' own lengths give a partition that cannot be wrong, and
+    ``_lower_map`` carries it back to the original text.
+
+    Two escape hatches, both counted rather than assumed away:
+
+    * a token whose span is not attributable (its boundary lands inside a
+      character the lowering moved), and
+    * a token no single role can re-case — the mixed-case case, ``"aBc"``.
+
+    Both fall back to **tokenizing that region of the original text** and
+    emitting it with the role its own ids carry, which is exactly what rule 1
+    does. Study 1's answer here was per-run case classification
+    (``configs.ArmSpec.piece_case``), which is unavailable to a transplant: its
+    runs are new stems, and this vocabulary's rows are pretrained host rows. The
+    fallback therefore adds **no row at all**, unlike study 1's verbatim path —
+    what it costs is fragmentation, on the region that hits it.
+    """
+    raw = text.encode("utf-8")
+    low, low_bytes, omap, changed = _lower_map(text)
+    ids = np.asarray(tok(low, add_special_tokens=False)["input_ids"], dtype=np.int64)
+    n = int(ids.size)
+    slen = np.fromiter((len(s) for s in host.stems), np.int64, len(host.stems))
+    bounds = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(slen[ids], out=bounds[1:])
+    if int(bounds[-1]) != len(low_bytes):
+        raise ValueError(
+            f"the token surfaces spell {int(bounds[-1])} bytes but the "
+            f"lowercased text has {len(low_bytes)} — this vocabulary is not "
+            "the one the tokenizer emits"
+        )
+
+    rawb = np.frombuffer(raw, dtype=np.uint8)
+    ob = omap[bounds]
+    aligned = ob >= 0
+    span_low = bounds[1:] - bounds[:-1]
+    attributable = aligned[:-1] & aligned[1:]
+    # Where the fallback is allowed to cut. A byte-level BPE splits characters
+    # (' ПРИВЕТ' comes back as five tokens over six two-byte characters), so an
+    # attributable boundary is not necessarily a character boundary — and the
+    # fallback has to hand the tokenizer a *string*. Cutting only at lead bytes
+    # is what keeps that decode total.
+    cut = aligned.copy()
+    inside = aligned & (ob < len(raw))
+    cut[inside] = (rawb[ob[inside]] & 0xC0) != 0x80
+    # A token is untouched by the lowering iff no altered character overlaps it
+    # and its two spans have the same length; then its surface *is* the original
+    # substring and no role has to be imposed.
+    plain = (
+        attributable
+        & (changed[bounds[1:]] == changed[bounds[:-1]])
+        & ((ob[1:] - ob[:-1]) == span_low)
+    )
+    if plain.any():
+        lowb = np.frombuffer(low_bytes, dtype=np.uint8)
+        covered = np.repeat(plain, span_low)
+        src = np.arange(lowb.size, dtype=np.int64) + np.repeat(
+            ob[:-1] - bounds[:-1], span_low
+        )
+        if not np.array_equal(lowb[covered], rawb[src[covered]]):
+            raise ValueError(
+                "case fold: a span the lowering left alone does not match the "
+                "original text — the byte offset map is wrong"
+            )
+
+    case = np.full(n, -1, dtype=np.int8)
+    fallback = ~attributable
+    memo: dict[tuple[int, bytes], int] = {}
+    for i in np.flatnonzero(attributable & ~plain).tolist():
+        original = raw[int(ob[i]) : int(ob[i + 1])]
+        key = (int(ids[i]), original)
+        c = memo.get(key)
+        if c is None:
+            c = memo[key] = _fold_case(host.stems[int(ids[i])], original)
+        if c == -2:
+            fallback[i] = True
+        else:
+            case[i] = c
+
+    # Grow each failing token out to the nearest cuttable boundaries, then merge
+    # the runs that touch. Byte 0 and the final byte always cut, so the growth
+    # terminates.
+    groups: list[list[int]] = []
+    for i in np.flatnonzero(fallback).tolist():
+        a, b = i, i + 1
+        while a > 0 and not cut[a]:
+            a -= 1
+        while b < n and not cut[b]:
+            b += 1
+        if groups and groups[-1][1] >= a:
+            groups[-1][1] = max(groups[-1][1], b)
+        else:
+            groups.append([a, b])
+
+    out_ids: list[np.ndarray] = []
+    out_case: list[np.ndarray] = []
+    cur = 0
+    fb_tokens = fb_bytes = 0
+    for a, b in groups:
+        if a > cur:
+            out_ids.append(ids[cur:a])
+            out_case.append(case[cur:a])
+        lo, hi = int(ob[a]), int(ob[b])
+        sub = np.asarray(
+            tok(raw[lo:hi].decode("utf-8"), add_special_tokens=False)["input_ids"],
+            dtype=np.int64,
+        )
+        got = b"".join(host.stems[j] for j in sub.tolist())
+        if got != raw[lo:hi]:
+            raise ValueError(
+                f"case fold: the fallback re-encoding of bytes [{lo}, {hi}) "
+                f"spells {got[:40]!r}, not {raw[lo:hi][:40]!r}"
+            )
+        out_ids.append(sub)
+        out_case.append(np.full(sub.size, -1, dtype=np.int8))
+        fb_tokens += int(sub.size)
+        fb_bytes += hi - lo
+        cur = b
+    if cur < n:
+        out_ids.append(ids[cur:])
+        out_case.append(case[cur:])
+
+    final_ids = (
+        np.concatenate(out_ids) if out_ids else np.zeros(0, dtype=np.int64)
+    ).astype(np.int32)
+    final_case = np.concatenate(out_case) if out_case else np.zeros(0, dtype=np.int8)
+    return FoldEncoding(
+        final_ids,
+        final_case,
+        len(raw),
+        {
+            "tokens": int(final_ids.size),
+            "lowercase_tokens": n,
+            "recased_tokens": int((final_case >= 0).sum()),
+            "fallback_groups": len(groups),
+            "fallback_tokens": fb_tokens,
+            "fallback_bytes": fb_bytes,
+            "unattributable_boundaries": int((~aligned).sum()),
+        },
+    )
+
+
+def fold_stats(encs: list[FoldEncoding]) -> dict:
+    """Sum the per-chunk counters and add the rates worth reporting."""
+    keys = (
+        "tokens",
+        "lowercase_tokens",
+        "recased_tokens",
+        "fallback_groups",
+        "fallback_tokens",
+        "fallback_bytes",
+        "unattributable_boundaries",
+    )
+    out = {k: sum(int(e.stats.get(k, 0)) for e in encs) for k in keys}
+    nb = sum(e.nbytes for e in encs)
+    out["bytes"] = nb
+    out["fallback_token_fraction"] = out["fallback_tokens"] / max(1, out["tokens"])
+    out["fallback_byte_fraction"] = out["fallback_bytes"] / max(1, nb)
+    out["recased_fraction"] = out["recased_tokens"] / max(1, out["tokens"])
+    return out
+
+
+def verify_fold(
+    plan: ShrinkPlan, arrays: dict, raw: bytes, block: int = 1 << 22
+) -> dict:
+    """Spell the whole folded stream back out and compare it to the text.
+
+    The one statement everything else rests on. ``verify_codec`` certifies the
+    id-level codec; this certifies the *encoder*, which is where the alignment,
+    the case decision and the fallback splice can all go wrong, and it does it
+    on the real byte stream rather than on the argument that they cannot.
+
+    Blocked so it can be run on the 230 MB train stream as well as on an eval
+    suite: 53M tokens materialised as one Python list would cost a couple of
+    gigabytes to check something the block loop checks for nothing.
+    """
+    stems = np.asarray(arrays["stem"], dtype=np.int64)
+    n_roles = plan.vocab.n_roles
+    roles = (
+        np.asarray(arrays["role"], dtype=np.int64)
+        if n_roles > 1
+        else np.zeros_like(stems)
+    )
+    keys = stems * n_roles + roles
+    uniq = np.unique(keys)
+    table: dict[int, bytes] = {}
+    for k in uniq.tolist():
+        b = plan.vocab.spell(*divmod(k, n_roles))
+        if b is None:
+            s, r = divmod(k, n_roles)
+            raise ValueError(
+                f"the folded stream emits (stem {s}, role {r}), which has no "
+                "spelling in this vocabulary"
+            )
+        table[k] = b
+    lens = np.fromiter((len(table[k]) for k in uniq.tolist()), np.int64, uniq.size)
+    per_token = lens[np.searchsorted(uniq, keys)]
+    off = np.zeros(keys.size + 1, dtype=np.int64)
+    np.cumsum(per_token, out=off[1:])
+    if int(off[-1]) != len(raw):
+        raise ValueError(
+            f"the folded stream spells {int(off[-1])} bytes against a "
+            f"{len(raw)}-byte text"
+        )
+    for a in range(0, keys.size, block):
+        b = min(a + block, keys.size)
+        got = b"".join(map(table.__getitem__, keys[a:b].tolist()))
+        if got != raw[off[a] : off[b]]:
+            bad = next(
+                i
+                for i in range(len(got))
+                if got[i : i + 1] != raw[off[a] + i : off[a] + i + 1]
+            )
+            raise ValueError(
+                "the folded stream does not round-trip: it diverges from the "
+                f"text at byte {int(off[a]) + bad}"
+            )
+    return {"tokens": int(keys.size), "bytes": len(raw)}
 
 
 # --- the plan -------------------------------------------------------------
@@ -547,6 +975,55 @@ class ShrinkPlan:
             out["role"] = roles.astype(np.int64)
         return out
 
+    @property
+    def fold_rung(self) -> int:
+        """Index of the ``case_fold`` rung, or -1 if this plan has none."""
+        for k, s in enumerate(self.steps):
+            if s.case_invariant:
+                return k
+        return -1
+
+    def _split_at_fold(self) -> tuple[Rewrite, Rewrite | None]:
+        """The codec either side of the fold rung: (host -> pair, pair -> pair)."""
+        k = self.fold_rung
+        pre = self.steps[0].rewrite
+        for s in self.steps[1 : k + 1]:
+            pre = pre.then(s.rewrite)
+        post = None
+        for s in self.steps[k + 1 :]:
+            post = s.rewrite if post is None else post.then(s.rewrite)
+        return pre, post
+
+    def fold_stream(self, enc: FoldEncoding) -> dict[str, np.ndarray]:
+        """Rewrite a folded encoding into this plan's heads.
+
+        The codec is split at the fold rung rather than applied whole. The case
+        the encoder read from the text is a fact about the *merged* pair, so it
+        has to be imposed there; anything after the fold (re-piecing) then
+        rewrites the already-cased pair, which is how an uppercase word gets its
+        pieces spelled in uppercase instead of being re-cased piece by piece.
+        """
+        k = self.fold_rung
+        if k < 0:
+            raise ValueError(
+                "this plan has no case_fold rung, so a folded encoding has "
+                "nowhere to put the case it read off the text"
+            )
+        pre, _ = self._split_at_fold()
+        ids = np.asarray(enc.ids, dtype=np.int64)
+        stems, roles = pre.apply(ids)
+        if stems.size != ids.size:
+            raise ValueError("the rungs up to the fold must be a relabeling")
+        roles = roles.astype(np.int64)
+        case = np.asarray(enc.case, dtype=np.int64)
+        roles = np.where(case < 0, roles, (roles // 3) * 3 + case)
+        for s in self.steps[k + 1 :]:
+            stems, roles = s.rewrite.apply(stems, roles)
+        out = {"stem": np.asarray(stems, dtype=np.int64)}
+        if self.vocab.n_roles > 1:
+            out["role"] = np.asarray(roles, dtype=np.int64)
+        return out
+
     def source_rows(self, host_counts: np.ndarray) -> dict[str, np.ndarray]:
         """Which host rows feed each new row, and with what weight.
 
@@ -562,11 +1039,58 @@ class ShrinkPlan:
         src = np.arange(n_src, dtype=np.int64)
         length = self.codec.offsets[1:] - self.codec.offsets[:-1]
         weights = 1.0 + np.asarray(host_counts, dtype=np.float64)[:n_src]
-        return {
-            "dst": self.codec.stems.astype(np.int64),
-            "src": np.repeat(src, length),
-            "weight": np.repeat(weights, length),
-        }
+        dst = self.codec.stems.astype(np.int64)
+        out_src = np.repeat(src, length)
+        out_w = np.repeat(weights, length)
+
+        # The codec spells host ids in the case they already carry, which after a
+        # fold is not everything the table has to cover: re-piecing an uppercase
+        # word can use a stem no lowercase segmentation does. Measured on
+        # ``shrink2-fold100``, exactly one row (the byte b'\xd0') came out with
+        # no source, and ``shrink_init`` refuses to init a table with a row
+        # nothing reaches. The variants are appended only where they name a
+        # (row, host id) edge the codec did not already, and at weight 1 — the
+        # same weight an active-but-unobserved row gets — so nothing that
+        # already had a source is re-weighted and rule 0's bit-identical rows
+        # stay single-source.
+        extra = self._fold_source_edges()
+        if extra is not None:
+            edst, esrc = extra
+            new = ~np.isin(edst * n_src + esrc, dst * n_src + out_src)
+            dst = np.concatenate([dst, edst[new]])
+            out_src = np.concatenate([out_src, esrc[new]])
+            out_w = np.concatenate([out_w, np.ones(int(new.sum()))])
+        return {"dst": dst, "src": out_src, "weight": out_w}
+
+    def _fold_source_edges(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """(row, host id) edges reached by re-casing, or None without a fold."""
+        if self.fold_rung < 0:
+            return None
+        pre, post = self._split_at_fold()
+        folded = self.steps[self.fold_rung].rewrite.dst
+        length = pre.offsets[1:] - pre.offsets[:-1]
+        ids = np.flatnonzero(length == 1)
+        stem = pre.stems[pre.offsets[ids]].astype(np.int64)
+        base = (pre.roles[pre.offsets[ids]].astype(np.int64) // 3) * 3
+        s, r, i = [], [], []
+        for c in range(3):
+            role = base + c
+            legal = np.fromiter(
+                (
+                    folded.spell(int(a), int(b)) is not None
+                    for a, b in zip(stem.tolist(), role.tolist(), strict=True)
+                ),
+                dtype=bool,
+                count=ids.size,
+            )
+            s.append(stem[legal])
+            r.append(role[legal])
+            i.append(ids[legal])
+        stem, role, ids = np.concatenate(s), np.concatenate(r), np.concatenate(i)
+        if post is None:
+            return stem, ids
+        pieces, _, length = post._expand(stem * post.src_roles + role)
+        return pieces.astype(np.int64), np.repeat(ids, length)
 
     def accounting(self, d_model: int) -> dict:
         """Embedding floats, derived from the mapping rather than typed in."""
@@ -611,6 +1135,8 @@ def build(
     host_stream: np.ndarray,
     rules: tuple[ShrinkRule, ...],
     verify: bool = True,
+    fold_case: np.ndarray | None = None,
+    host_tokens: int | None = None,
 ) -> ShrinkPlan:
     """Apply a curriculum prefix, re-measuring the stream between rungs.
 
@@ -619,6 +1145,12 @@ def build(
     one stem's count, and after one re-piecing pass the dropped stems' mass has
     moved onto their pieces. Thresholding stale counts would make a progressive
     curriculum silently non-progressive.
+
+    ``fold_case`` is ``FoldEncoding.case`` aligned to ``host_stream``, for a
+    curriculum with a ``case_fold`` rung. It is imposed on the stream at that
+    rung for the same reason the stream is rewritten at all: a later threshold
+    reads counts, and after a fold the counts belong to the case-invariant
+    stems, not to the ones the host's own tokenization would have produced.
     """
     vocab, codec = host, None
     stems = np.asarray(host_stream, dtype=np.int64)
@@ -634,13 +1166,25 @@ def build(
         codec = step.rewrite if codec is None else codec.then(step.rewrite)
         stems, roles = step.rewrite.apply(stems, roles)
         reach, rroles = step.rewrite.apply(reach, rroles)
+        if step.case_invariant:
+            reach, rroles = _case_variants(reach, rroles, step.rewrite.dst)
+            if fold_case is not None:
+                case = np.asarray(fold_case, dtype=np.int64)
+                have = np.asarray(roles, dtype=np.int64)
+                roles = np.where(case < 0, have, (have // 3) * 3 + case)
         if step.rewrite.dst.n_roles == 1:
             roles = rroles = None
         vocab = step.rewrite.dst
         steps.append(step)
     if codec is None:
         raise ValueError("an empty curriculum shrinks nothing")
-    return ShrinkPlan(host, tuple(steps), codec, int(stems.size), int(host_stream.size))
+    return ShrinkPlan(
+        host,
+        tuple(steps),
+        codec,
+        int(stems.size),
+        int(host_stream.size if host_tokens is None else host_tokens),
+    )
 
 
 def verify_codec(plan: ShrinkPlan, active_ids: np.ndarray) -> dict:
@@ -737,7 +1281,7 @@ def main() -> None:
     from experiments.vocab_factorization.configs import (
         HOST_ARM,
         MASKED_NATIVE_BPB,
-        SHRINK_CURRICULUM,
+        SHRINK_CURRICULA,
         TransplantTrainSpec,
         active_cache_path,
         token_cache_path,
@@ -750,28 +1294,76 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=None, help="also write the JSON")
     ap.add_argument("--d-model", type=int, default=2048)
     ap.add_argument("--table-size", type=int, default=151936)
+    ap.add_argument("--curriculum", default="default", choices=sorted(SHRINK_CURRICULA))
+    ap.add_argument("--workers", type=int, default=40)
+    ap.add_argument(
+        "--no-verify-fold",
+        action="store_true",
+        help="skip spelling the whole 230 MB train stream back out (~40 s/rung)",
+    )
     args = ap.parse_args()
 
     from experiments.vocab_factorization.build_arms import get_arm
 
     arm = get_arm(HOST_ARM, args.arms_dir, args.corpus)
     host = host_vocabulary(arm, args.table_size)
-    active = np.load(active_cache_path(args.tokens_dir, HOST_ARM))["ids"]
-    stream = np.load(
-        token_cache_path(
-            args.tokens_dir, HOST_ARM, "train", TransplantTrainSpec().train_bytes
-        )
+    curriculum = SHRINK_CURRICULA[args.curriculum]
+    train_bytes = TransplantTrainSpec().train_bytes
+    host_stream = np.load(
+        token_cache_path(args.tokens_dir, HOST_ARM, "train", train_bytes)
     )["stem"]
+    case = enc = raw = None
+    if any(r.rule == "case_fold" for r in curriculum):
+        from experiments.vocab_factorization import active_vocab
+        from experiments.vocab_factorization.prepare import build_text, get_fold_tokens
+
+        enc = get_fold_tokens(
+            HOST_ARM,
+            "train",
+            train_bytes,
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            args.table_size,
+            args.workers,
+        )
+        active = active_vocab.load_or_build_fold(
+            HOST_ARM,
+            args.table_size,
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            train_bytes,
+            args.workers,
+        )
+        stream, case = enc.ids.astype(np.int64), enc.case
+        print(f"fold: {json.dumps(enc.stats)}")
+        if not args.no_verify_fold:
+            # The corpus is round-tripped, not the argument that it would be.
+            # Every rung below re-checks against these exact bytes.
+            raw = build_text(args.corpus, "train", train_bytes).encode("utf-8")
+    else:
+        active = np.load(active_cache_path(args.tokens_dir, HOST_ARM))["ids"]
+        stream = host_stream
     print(
         f"host table {len(host)}  active {active.size}  stream {stream.size / 1e6:.1f}M"
     )
 
     rows = []
-    for k in range(1, len(SHRINK_CURRICULUM) + 1):
+    for k in range(1, len(curriculum) + 1):
         t0 = time.time()
-        plan = build(host, active, stream, SHRINK_CURRICULUM[:k])
+        plan = build(
+            host,
+            active,
+            stream,
+            curriculum[:k],
+            fold_case=case,
+            host_tokens=int(host_stream.size),
+        )
         acct = plan.accounting(args.d_model)
         check = verify_codec(plan, active)
+        if raw is not None and plan.fold_rung >= 0:
+            check |= verify_fold(plan, plan.fold_stream(enc), raw)
         last = plan.steps[-1]
         rows.append(
             {
@@ -798,16 +1390,26 @@ def main() -> None:
         for k2, v in last.stats.items():
             if k2 != "examples":
                 print(f"       {k2}: {v}")
-        arrow = "<-" if last.rule == "case_space" else "->"
+        arrow = "->" if last.rule == "repiece_tail" else "<-"
         for ex in last.stats.get("examples", [])[:6]:
             print(f"       {ex[0]!r} {arrow} {ex[1:]}")
 
     if args.out:
         args.out.mkdir(parents=True, exist_ok=True)
-        (args.out / "shrink_curve.json").write_text(
-            json.dumps({"reference_bpb": MASKED_NATIVE_BPB, "stages": rows}, indent=2)
+        tag = "" if args.curriculum == "default" else f"_{args.curriculum}"
+        path = args.out / f"shrink_curve{tag}.json"
+        args.out.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "reference_bpb": MASKED_NATIVE_BPB,
+                    "curriculum": args.curriculum,
+                    "stages": rows,
+                },
+                indent=2,
+            )
         )
-        print(f"-> {args.out / 'shrink_curve.json'}")
+        print(f"-> {path}")
 
 
 if __name__ == "__main__":

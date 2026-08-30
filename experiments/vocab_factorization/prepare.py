@@ -17,6 +17,7 @@ import numpy as np
 from experiments.vocab_factorization.configs import (
     ARMS,
     ARMS_BY_NAME,
+    fold_cache_path,
     token_cache_path,
 )
 from experiments.vocab_factorization.tokenization import Encoding, iter_chunks
@@ -24,11 +25,15 @@ from experiments.vocab_factorization.tokenization import Encoding, iter_chunks
 __all__ = [
     "build_text",
     "encode_text",
+    "fold_cache_path",
+    "fold_text",
+    "get_fold_tokens",
     "get_tokens",
     "token_cache_path",
 ]
 
 _WORKER_ARM = None
+_WORKER_HOST = None
 
 
 def _init_worker(arm_name: str, arms_dir: str) -> None:
@@ -38,9 +43,23 @@ def _init_worker(arm_name: str, arms_dir: str) -> None:
     _WORKER_ARM = load_arm(Path(arms_dir) / arm_name)
 
 
+def _init_fold_worker(arm_name: str, arms_dir: str, table_size: int) -> None:
+    global _WORKER_HOST
+    from experiments.vocab_factorization.shrink import host_vocabulary
+
+    _init_worker(arm_name, arms_dir)
+    _WORKER_HOST = host_vocabulary(_WORKER_ARM, table_size)
+
+
 def _encode_chunk(chunk: str):
     enc = _WORKER_ARM.encode(chunk)
     return enc.stem, enc.role, enc.suffix
+
+
+def _fold_chunk(chunk: str):
+    from experiments.vocab_factorization.shrink import fold_encode
+
+    return fold_encode(chunk, _WORKER_ARM.tok, _WORKER_HOST)
 
 
 def build_text(
@@ -106,6 +125,80 @@ def encode_text(
         role=np.concatenate([r[1] for r in results]),
         suffix=np.concatenate([r[2] for r in results]),
     )
+
+
+def fold_text(
+    arm_name: str,
+    arms_dir: Path,
+    text: str,
+    table_size: int,
+    workers: int = 32,
+):
+    """``shrink.fold_encode`` over a long text, fanned out like ``encode_text``.
+
+    Chunks are cut on newlines, so the fold sees the same 4 MB blocks every
+    other encoding in this study does. That matters more here than elsewhere:
+    the fold's fallback path is triggered by what sits next to a token, so a
+    different chunking would move which tokens take it, and the fallback rate is
+    a reported number.
+    """
+    import multiprocessing as mp
+
+    from experiments.vocab_factorization.shrink import FoldEncoding, fold_stats
+
+    chunks = list(iter_chunks(text, 1 << 22))
+    if len(chunks) <= 1:
+        _init_fold_worker(arm_name, str(arms_dir), table_size)
+        parts = [_fold_chunk(chunks[0] if chunks else "")]
+    else:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(
+            processes=min(workers, len(chunks)),
+            initializer=_init_fold_worker,
+            initargs=(arm_name, str(arms_dir), table_size),
+        ) as pool:
+            parts = pool.map(_fold_chunk, chunks, chunksize=1)
+    return FoldEncoding(
+        np.concatenate([p.ids for p in parts]),
+        np.concatenate([p.case for p in parts]),
+        sum(p.nbytes for p in parts),
+        fold_stats(parts),
+    )
+
+
+def get_fold_tokens(
+    arm_name: str,
+    split: str,
+    nbytes: int | None,
+    corpus_dir: Path,
+    arms_dir: Path,
+    tokens_dir: Path,
+    table_size: int,
+    workers: int = 32,
+):
+    """Return the cached case-folded encoding of a split, building it once."""
+    import json
+
+    from experiments.vocab_factorization.shrink import FoldEncoding
+
+    path = fold_cache_path(tokens_dir, arm_name, split, nbytes)
+    if path.exists():
+        z = np.load(path, allow_pickle=False)
+        return FoldEncoding(
+            z["ids"], z["case"], int(z["nbytes"]), json.loads(str(z["stats"]))
+        )
+    enc = fold_text(
+        arm_name, arms_dir, build_text(corpus_dir, split, nbytes), table_size, workers
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        ids=enc.ids,
+        case=enc.case,
+        nbytes=enc.nbytes,
+        stats=json.dumps(enc.stats),
+    )
+    return enc
 
 
 def get_tokens(
