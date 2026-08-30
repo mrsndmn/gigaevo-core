@@ -865,8 +865,14 @@ embedding-only training and evidently damaged the body.
 | `tree8k-x4` | 4.06M | ×4.01 | 1.7270 | +0.957 |
 | `tree8k-x2-film` | 8.06M | ×2.02 | 1.7287 | +0.958 |
 
+The bridge arm completes the grid: `tree-host-x2` routes the *active host*
+vocabulary at ×2.19 (34,258 leaves, 70.16M floats) and scores **1.3340**, which
+is **+0.554 against the masked native 0.7796** it is meant to reproduce. So
+training does not rescue the distilled init on the host vocabulary either — the
+question that arm existed to ask is answered no.
+
 The kill line was +0.05 at ×2. The best routed arm is **+0.458, nine times
-over**. Feature-routed boosted trees do not carry a pretrained embedding table
+over**, and all five arms are killed. Feature-routed boosted trees do not carry a pretrained embedding table
 at half the floats. Neither ablation rescues it: FiLM composition is no better
 than plain additive routing at *twice* the compression, and boosting on the loss
 gradient through the body — the correction stage 0's failure seemed to demand —
