@@ -241,11 +241,19 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
             tspec.train_bytes,
             workers=args.workers,
         )
+        # Overriding the last rule's threshold rather than extending the chain
+        # keeps every arm a nested prefix of one curriculum — which is what
+        # makes the result a curve rather than a scatter of unrelated
+        # vocabularies. A longer chain would apply a 200 threshold to a
+        # vocabulary already thresholded at 1000, which is a different thing.
+        rules = list(SHRINK_CURRICULUM[: spec.stage])
+        if getattr(spec, "override_min_count", 0) and rules:
+            rules[-1] = replace(rules[-1], min_count=spec.override_min_count)
         plan = shrink.build(
             shrink.host_vocabulary(arm, heads["stem"]),
             active_ids,
             enc.stem,
-            SHRINK_CURRICULUM[: spec.stage],
+            rules,
         )
         host_counts = np.bincount(enc.stem.astype(np.int64), minlength=heads["stem"])
         heads = plan.heads()

@@ -498,6 +498,12 @@ class ShrinkTransplantSpec:
 
     name: str
     stage: int
+    # Replaces the *last* applied rule's ``min_count``. The curriculum is a
+    # linear chain and ``stage`` a prefix of it, so this is how a rung gets a
+    # different depth without forking the chain: rungs 2 and 3 differ only in
+    # where the re-piecing threshold sits, and the curve needs points between
+    # them far more than it needs a longer chain.
+    override_min_count: int = 0
     arm: str = HOST_ARM
     init: str = "shrink"
     train: bool = True
@@ -539,6 +545,22 @@ SHRINKS: list[ShrinkTransplantSpec] = [
         note="-> 4,783 stems (9.8M floats, x31.7 against the host table) at "
         "+14.07% tokens; where the gate is expected to bite, and the point of "
         "the curve is to say where it actually does",
+    ),
+    # The gate flips between stage-3 thresholds 100 (PASS, -0.0021) and 1000
+    # (FAIL, +0.0348), a 3.6x jump in vocabulary with nothing measured inside
+    # it. The deliverable of this track is a *curve*; these are the points
+    # where it actually breaks.
+    ShrinkTransplantSpec(
+        "shrink2-tail200",
+        stage=3,
+        override_min_count=200,
+        note="locating the cliff between x4.3 (passes) and x15.6 (fails)",
+    ),
+    ShrinkTransplantSpec(
+        "shrink2-tail300", stage=3, override_min_count=300, note="ditto"
+    ),
+    ShrinkTransplantSpec(
+        "shrink2-tail500", stage=3, override_min_count=500, note="ditto"
     ),
 ]
 
