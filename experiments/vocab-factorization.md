@@ -902,11 +902,38 @@ result.**
 | 2 | re-piece tail (<100) | 17,385 | 35.63M | **×4.31** | **0.7775** | **−0.0021** | +1.81% |
 | 3 | re-piece tail (<1000) | 4,783 | 9.82M | ×15.63 | 0.8144 | +0.0348 | +14.07% |
 
-**A 4.3x smaller embedding table matches the pretrained model it came from**,
-and rung 1 is very slightly *better* than native at 1.54x. The curriculum
-continues while healed BPB stays within +0.01 and stops at rung 3, exactly as
-the gate specifies. Rung 0 reproducing 0.7796 to four decimals is the codec's
-correctness check, not a measurement.
+**A 7.8x smaller embedding table matches the pretrained model it came from.**
+Three thresholds added later (200/300/500) filled the 3.6x gap the first pass
+left between its last PASS and first FAIL, and moved the headline from x4.31 to
+**x7.80** (9,599 stems, 19.68M floats, +0.0056):
+
+| rung | V | floats | vs active flat | clean BPB | vs native | tokens | gate |
+|---|---|---|---|---|---|---|---|
+| mask | 74,957 | 153.51M | x1.00 | 0.7796 | +0.0000 | +0.00% | PASS |
+| case | 48,703 | 99.77M | x1.54 | 0.7757 | −0.0039 | +0.00% | PASS |
+| tail100 | 17,385 | 35.63M | x4.31 | 0.7775 | −0.0021 | +1.81% | PASS |
+| tail200 | 12,117 | 24.84M | x6.18 | 0.7812 | +0.0016 | +3.70% | PASS |
+| **tail300** | **9,599** | **19.68M** | **x7.80** | **0.7852** | **+0.0056** | +5.45% | **PASS** |
+| tail500 | 7,032 | 14.43M | x10.64 | 0.7966 | +0.0170 | +8.64% | FAIL |
+| tail1k | 4,783 | 9.82M | x15.63 | 0.8144 | +0.0348 | +14.07% | FAIL |
+
+The cliff sits between x7.80 and x10.64. Rung 0 reproducing 0.7796 to four
+decimals is the codec's correctness check, not a measurement.
+
+**The cost is token inflation, almost exactly.** Across the seven rungs the BPB
+penalty tracks the extra tokens monotonically and nearly linearly past ~2%
+(+1.81% → −0.0021, +3.70% → +0.0016, +5.45% → +0.0056, +8.64% → +0.0170,
++14.07% → +0.0348). Re-piecing does not damage the representation; it spends
+more tokens on the same bytes. That localises the next lever precisely: greedy
+longest-match segmentation is the thing to improve, not the threshold.
+
+**The gate is clean-BPB only, and that matters here.** Rule 1 costs
+`upper` badly — 1.9205 against the native 1.0702, a +1.145 delta where native
+pays +0.291 — and the damage persists at every later rung (~1.89–1.92
+throughout), so it is rule 1's, not the re-piecing's. Split by head on `upper`:
+stem 0.7023 → 1.5886, role 0.0734 → 0.3319, so it is mostly the *stem* head.
+A x7.8 table that matches the pretrained model on clean text is a real result;
+"matches the pretrained model" without that qualifier is not.
 
 **The comparison that matters.** Interpretable shrink rules reach ×4.31 at
 parity; learned feature-routed trees were killed at ×2 with +0.458. Both
