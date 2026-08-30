@@ -977,6 +977,12 @@ x4.50 compression and slightly fewer floats than the merge. `randcase` is the
 one suite that gets worse, exactly as predicted from the fallback rate: it is
 mixed case by construction, so there is no case-invariant stream to fold onto.
 
+The shallower fold rung is better still. `shrink1-fold` (45,742 stems, 93.70M
+floats, x1.64) scores **0.7554 clean — 0.0242 better than the pretrained model
+and 0.0150 better than the flat `bpe8k-t` control**, with `upper` at 1.1844
+(+0.114 over native). Both fold rungs beat every merge rung on clean, `upper`,
+`title`, `lower` and `typo5`.
+
 The result the earlier rungs were reaching for is therefore stronger than
 reported: the case regression was an artifact of merging ids rather than text,
 and fixing the layer improves every suite except the one built from mixed case.
