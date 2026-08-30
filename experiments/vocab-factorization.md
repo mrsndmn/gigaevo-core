@@ -941,6 +941,46 @@ compress the same table against the same reference under the same protocol. The
 structure that works here was *specified*, not searched — which is also, and
 independently, what the calibration gate concluded about searching for it.
 
+### Folding case at tokenization instead of after it (2026-08-30)
+
+Rule 1's `upper` regression traced to *where* the merge happens. It rewrites
+token **ids**, so it can only merge variants the tokenizer actually emitted —
+and uppercase text is segmented differently before any merge applies. Measured:
+rule 1's stem streams for `upper` and `lower` share only **36.9%** of their
+unigram mass (clean-vs-lower is 95.75%). The merge does fire on uppercase text
+(92.9% of its tokens land in a lexeme group, *more* than clean's 67.4%) — it
+just fires on the wrong fragments.
+
+`case_fold` tokenizes the **lowercased** text and reads each token's case off
+the original, so the stem stream is case-invariant by construction. Alignment is
+done in bytes, not characters: HF's `return_offsets_mapping` was measured
+returning two tokens both claiming span (0,1) for `'ǅ'`, and dropping a
+combining mark. Round-tripped losslessly over all seven suites and the full
+230 MB train stream. Mixed case ("aBc") is not expressible as one role and
+falls back to the original ids — 0.15% of the train stream, but **45.1% of
+`randcase`**, which is mixed case by construction.
+
+At matched vocabulary (16,632 stems / 34.09M floats vs 17,385 / 35.63M):
+
+| suite | native | merge (tail100) | **fold (fold100)** | fold vs merge |
+|---|---|---|---|---|
+| clean | 0.7796 | 0.7775 | **0.7614** | **−0.0161** |
+| upper | 1.0702 | 1.9236 | **1.2034** | **−0.720** |
+| title | 0.8885 | 0.9168 | **0.8576** | −0.059 |
+| lower | 0.8243 | 0.8055 | **0.7760** | −0.030 |
+| typo5 | 1.3905 | 1.4067 | **1.3899** | −0.017 |
+| randcase | 1.8151 | 1.9877 | 2.0841 | +0.096 |
+
+**It recovers 84% of the `upper` regression** (+0.853 over native → +0.133) and
+*improves* clean BPB to **0.7614 — 0.0182 better than the pretrained model**, at
+x4.50 compression and slightly fewer floats than the merge. `randcase` is the
+one suite that gets worse, exactly as predicted from the fallback rate: it is
+mixed case by construction, so there is no case-invariant stream to fold onto.
+
+The result the earlier rungs were reaching for is therefore stronger than
+reported: the case regression was an artifact of merging ids rather than text,
+and fixing the layer improves every suite except the one built from mixed case.
+
 **What was considered and rejected.** An open-vocabulary gate on stage 1 —
 held-out active ids scored against a flat control — was proposed on the grounds
 that the pre-registered gates are parity-only and so cannot detect the one
