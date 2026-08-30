@@ -208,6 +208,103 @@ def _install_tree(model, spec, features, targets, d_model: int, n_active: int) -
     return tree.accounting(flat_floats)
 
 
+def build_shrink_plan(
+    spec,
+    arm,
+    host_vocab: int,
+    args,
+    tspec: TransplantTrainSpec,
+    budget: int,
+    host_stream: np.ndarray | None = None,
+    host_tokens: int | None = None,
+):
+    """Rebuild the codec a shrink arm's model indexes. Returns (plan, fold, stream).
+
+    One implementation, two callers: ``run`` builds the codec to *train* against
+    and ``hellaswag`` rebuilds it to *score* against. A second implementation
+    would be free to drift, and a drifted codec does not crash — it indexes a
+    table whose rows mean something else and returns a perfectly plausible
+    accuracy. That is the failure mode this whole study is organized against, so
+    the rebuild is this function or it is nothing.
+
+    The codec is a deterministic function of the arm, the active set, the
+    curriculum prefix and the train stream, which is why a checkpoint can record
+    only ``stage`` + ``curriculum`` and still be reconstructible — the other
+    three are on disk. ``host_tokens`` is the one exception and it is not part of
+    the codec: it only quotes ``accounting()['token_inflation']`` against the
+    host's own tokenization, so a caller that does not report the accounting may
+    leave it None.
+    """
+    from experiments.vocab_factorization import shrink
+
+    # Overriding the last rule's threshold rather than extending the chain keeps
+    # every arm a nested prefix of one curriculum — which is what makes the
+    # result a curve rather than a scatter of unrelated vocabularies. A longer
+    # chain would apply a 200 threshold to a vocabulary already thresholded at
+    # 1000, which is a different thing.
+    rules = list(SHRINK_CURRICULA[getattr(spec, "curriculum", "default")])
+    rules = rules[: spec.stage]
+    if getattr(spec, "override_min_count", 0) and rules:
+        rules[-1] = replace(rules[-1], min_count=spec.override_min_count)
+
+    fold = None
+    if any(r.rule == "case_fold" for r in rules):
+        # The folded stream is a different encoding of the same bytes, so it
+        # brings its own active set and its own counts; nothing about it can be
+        # recovered from the host-id stream.
+        fold = get_fold_tokens(
+            spec.arm,
+            "train",
+            budget,
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            host_vocab,
+            workers=args.workers,
+        )
+        active_ids = active_vocab.load_or_build_fold(
+            spec.arm,
+            host_vocab,
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            tspec.train_bytes,
+            workers=args.workers,
+        )
+        stream, stream_case = fold.ids.astype(np.int64), fold.case
+    else:
+        active_ids = active_vocab.load_or_build(
+            spec.arm,
+            arm.heads["stem"],
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            tspec.train_bytes,
+            workers=args.workers,
+        )
+        if host_stream is None:
+            host_stream = get_tokens(
+                spec.arm,
+                "train",
+                budget,
+                args.corpus,
+                args.arms_dir,
+                args.tokens_dir,
+                workers=args.workers,
+            )[0].stem
+        stream, stream_case = np.asarray(host_stream, dtype=np.int64), None
+
+    plan = shrink.build(
+        shrink.host_vocabulary(arm, host_vocab),
+        active_ids,
+        stream,
+        rules,
+        fold_case=stream_case,
+        host_tokens=host_tokens,
+    )
+    return plan, fold, stream
+
+
 def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     body, host_emb, host_tok, d_model = host
     device = torch.device("cuda")
@@ -239,61 +336,14 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
     # rather than approximate — it *is* the mask, expressed as deletion.
     plan = shrink_acct = host_counts = fold = None
     if getattr(spec, "stage", 0):
-        from experiments.vocab_factorization import shrink
-
-        # Overriding the last rule's threshold rather than extending the chain
-        # keeps every arm a nested prefix of one curriculum — which is what
-        # makes the result a curve rather than a scatter of unrelated
-        # vocabularies. A longer chain would apply a 200 threshold to a
-        # vocabulary already thresholded at 1000, which is a different thing.
-        rules = list(SHRINK_CURRICULA[getattr(spec, "curriculum", "default")])
-        rules = rules[: spec.stage]
-        if getattr(spec, "override_min_count", 0) and rules:
-            rules[-1] = replace(rules[-1], min_count=spec.override_min_count)
-        folding = any(r.rule == "case_fold" for r in rules)
-
-        if folding:
-            # The folded stream is a different encoding of the same bytes, so it
-            # brings its own active set and its own counts; nothing about it can
-            # be recovered from the host-id stream ``enc``.
-            fold = get_fold_tokens(
-                spec.arm,
-                "train",
-                budget,
-                args.corpus,
-                args.arms_dir,
-                args.tokens_dir,
-                heads["stem"],
-                workers=args.workers,
-            )
-            active_ids = active_vocab.load_or_build_fold(
-                spec.arm,
-                heads["stem"],
-                args.corpus,
-                args.arms_dir,
-                args.tokens_dir,
-                tspec.train_bytes,
-                workers=args.workers,
-            )
-            stream, stream_case = fold.ids.astype(np.int64), fold.case
-        else:
-            active_ids = active_vocab.load_or_build(
-                spec.arm,
-                arm.heads["stem"],
-                args.corpus,
-                args.arms_dir,
-                args.tokens_dir,
-                tspec.train_bytes,
-                workers=args.workers,
-            )
-            stream, stream_case = enc.stem.astype(np.int64), None
-
-        plan = shrink.build(
-            shrink.host_vocabulary(arm, heads["stem"]),
-            active_ids,
-            stream,
-            rules,
-            fold_case=stream_case,
+        plan, fold, stream = build_shrink_plan(
+            spec,
+            arm,
+            heads["stem"],
+            args,
+            tspec,
+            budget,
+            host_stream=enc.stem,
             # Token inflation stays quoted against the host's *own* tokenization
             # of the same text, so a fold arm's number says what folding costs
             # in sequence length rather than comparing it to itself.
@@ -302,10 +352,10 @@ def run(spec: TransplantSpec, host, args, tspec: TransplantTrainSpec) -> dict:
         host_counts = np.bincount(stream, minlength=heads["stem"])
         heads = plan.heads()
         train_arrays = (
-            plan.fold_stream(fold) if folding else plan.apply_stream(enc.stem)
+            plan.fold_stream(fold) if fold is not None else plan.apply_stream(enc.stem)
         )
         shrink_acct = {**plan.accounting(d_model), **plan.summary()}
-        if folding:
+        if fold is not None:
             shrink_acct["fold"] = fold.stats
             print(
                 f"[{spec.name}] fold: {fold.stats['recased_fraction']:.2%} of "

@@ -25,6 +25,7 @@ from pathlib import Path
 import shlex
 import sys
 
+from experiments.vocab_factorization.configs import SHRINKS_BY_NAME
 from experiments.vocab_factorization.jobs import (
     BASE_IMAGE,
     CKPT_ROOT,
@@ -67,6 +68,16 @@ def main() -> int:
 
     ckpt_local = Path(to_local_path(args.checkpoints_dir))
     ckpts = sorted(ckpt_local.glob("*.pt")) if ckpt_local.is_dir() else []
+    # ``eval_transplant`` encodes its suites with ``arm.encode``, which yields
+    # host ids; a progressive-shrink model indexes a rewritten vocabulary and
+    # would score them as something else. The entrypoint refuses such a
+    # checkpoint, so filtering here only saves the doomed submission — the BPB
+    # those arms are meant to have is already in results/transplant/<name>.json,
+    # written by the run that trained them with the codec applied.
+    shrunk = [c for c in ckpts if c.stem in SHRINKS_BY_NAME]
+    for c in shrunk:
+        print(f"\033[33mSkip (shrink arm, needs its codec):\033[0m {c.name}")
+    ckpts = [c for c in ckpts if c not in shrunk]
     if args.filter:
         ckpts = [c for c in ckpts if args.filter in c.stem]
     if not ckpts:

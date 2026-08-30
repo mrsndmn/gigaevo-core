@@ -488,6 +488,44 @@ def _greedy(
     return out
 
 
+class Segmenter:
+    """Longest-match segmentation over everything a vocabulary can spell.
+
+    Rule 2 already spells a stem the corpus barely uses out of the stems that
+    survive it. This is that same operation, kept for text the corpus never
+    contained *at all* — which is what a downstream benchmark is. Measured on
+    HellaSwag's validation split (2026-08-30), 2,072 of 3,166,583 host tokens
+    (0.065%, 207 distinct surfaces: " mascara", " tablespoons", " walmart",
+    " ipad") never occur in this ru+en corpus, so rule 0 deleted their rows and
+    the codec has no image for them.
+
+    Spelling such a surface out is the arm's *own* answer to a surface it has no
+    row for, so it measures the arm rather than the handling. The alternatives
+    are worse and quietly so: refusing the token would drop roughly a tenth of
+    the benchmark's documents and make the accuracy incomparable to the arms
+    that scored all of it, and dropping the token would score fewer bytes than
+    ``acc_norm`` divides by.
+
+    ``None`` is returned for bytes the vocabulary cannot spell at all. The byte
+    floor is complete only after a ``repiece_tail`` rung (rule 0 deletes 66 of
+    the 256 single-byte host tokens this corpus never uses), so at the mask and
+    merge rungs the caller has to decide rather than be handed a silent gap.
+    """
+
+    def __init__(self, vocab: Vocabulary) -> None:
+        self.vocab = vocab
+        self.table = vocab.spellings()
+        self.span: dict[int, int] = {}
+        for text in self.table:
+            self.span[text[0]] = max(self.span.get(text[0], 1), len(text))
+        self._memo: dict[bytes, list[tuple[int, int]] | None] = {}
+
+    def __call__(self, text: bytes) -> list[tuple[int, int]] | None:
+        if text not in self._memo:
+            self._memo[text] = _greedy(text, self.table, self.span)
+        return self._memo[text]
+
+
 def _rule_repiece_tail(vocab: Vocabulary, rule: ShrinkRule, ctx: Context) -> Step:
     """Rule 2 — spell the frequency tail out of the pieces that survive.
 
@@ -709,6 +747,28 @@ def _fold_case(surface: bytes, original: bytes) -> int:
         if form is not None and lead + form == original:
             return c
     return -2
+
+
+def fold_surface(host: Vocabulary, stem: int, case: int) -> bytes:
+    """The bytes a folded token contributes to the text it was read from.
+
+    The inverse of ``_fold_case``: the encoder emits (host id over the
+    *lowercased* text, case to restore), and this puts the case back. Needed
+    wherever a folded token has to be handled as text rather than as an id —
+    re-piecing one the codec has no row for, for instance, where the pieces
+    must spell the original casing rather than the lowercase surface.
+    """
+    surface = host.stems[stem]
+    if case < 0:  # "keep what the id already spells" — the fallback path's mark
+        return surface
+    canon = _canonicalize(surface)
+    form = None if canon is None else _cased(canon[0], case)
+    if canon is None or form is None:
+        raise ValueError(
+            f"host surface {surface!r} has no case-{case} form, so it cannot be "
+            "the lowercase side of a folded token"
+        )
+    return (b" " if canon[1] >= 3 else b"") + form
 
 
 def fold_encode(text: str, tok, host: Vocabulary) -> FoldEncoding:
@@ -966,6 +1026,21 @@ class ShrinkPlan:
         if self.vocab.n_roles > 1:
             heads["role"] = self.vocab.n_roles
         return heads
+
+    def covers(self, host_ids: np.ndarray) -> np.ndarray:
+        """Which host ids this codec has an image for, elementwise.
+
+        Rule 0 *deletes* the rows the corpus never exercised, so an id outside
+        the active set is not merely unlikely under a shrunk vocabulary — it has
+        no image at all, and ``Rewrite.apply`` refuses the entire stream by name
+        rather than dropping the token. On the corpus that is the right
+        behaviour, because every text the BPB harness scores is in the active
+        set by construction. Downstream benchmark text is not, so a caller that
+        means to *handle* those tokens (see ``Segmenter``) needs to ask before
+        applying instead of catching afterwards.
+        """
+        key = np.asarray(host_ids, dtype=np.int64) * self.codec.src_roles
+        return self.codec.offsets[key + 1] > self.codec.offsets[key]
 
     def apply_stream(self, host_ids: np.ndarray) -> dict[str, np.ndarray]:
         """Rewrite a stream of host ids into this plan's heads."""

@@ -276,6 +276,19 @@ def hellaswag_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
     compared against. The trained arms are scored from the checkpoints their
     training jobs saved — which is the whole point of the hardening track
     budgeting no dedicated re-runs.
+
+    **The shrink arms are here for the same reason the transplant arms are.**
+    The gate this track established is that corpus BPB does not imply downstream
+    ability: ``bpe8k-t`` beats native on BPB and loses 6.5 points of acc_norm,
+    ``bpe8k-t-unfrozen`` moves BPB by +0.0165 and loses 25.7. ``shrink1-fold``'s
+    0.7554 clean BPB — the programme's best number, 0.0242 *better* than the
+    model it was derived from — is exactly the kind of claim that gate exists to
+    check, so it gets checked. ``shrink0-mask`` is ``train=False`` and writes no
+    checkpoint; unlike ``orig-frozen`` there is no reconstruction of it here,
+    because its softmax is the 74,957-row deleted table rather than the host's
+    151,936, so ``--native`` would score a different model. The tree arms are
+    deliberately absent: all five are killed, and their downstream scores are not
+    worth the GPU.
     """
     out = f"{results_root}/hellaswag"
     jobs = [
@@ -300,6 +313,35 @@ def hellaswag_jobs(results_root: str = RESULTS_ROOT) -> list[JobSpec]:
         )
         for t in TRANSPLANTS
         if t.train
+    ]
+    jobs += [
+        JobSpec(
+            name=f"hellaswag-{s.name}",
+            module="experiments.vocab_factorization.hellaswag",
+            description=(
+                f"hellaswag {s.name} (shrink stage {s.stage}, "
+                f"{s.curriculum} curriculum)"
+            ),
+            args=("--ckpt", f"{CKPT_ROOT}/{s.name}.pt", "--reserve-gb", "24"),
+            # The codec is rebuilt from the same caches the training run built it
+            # from, so this job reads exactly what ``shrink_jobs`` reads and both
+            # have to be preflighted the same way — a fold arm needs the folded
+            # stream and the folded active set, neither of which is recoverable
+            # from the host-id caches.
+            arms=(s.arm,),
+            fold_arms=(
+                (s.arm,)
+                if any(
+                    r.rule == "case_fold"
+                    for r in SHRINK_CURRICULA[s.curriculum][: s.stage]
+                )
+                else ()
+            ),
+            marker=f"{out}/{s.name}.json",
+            requires=(f"{CKPT_ROOT}/{s.name}.pt",),
+        )
+        for s in SHRINKS
+        if s.train
     ]
     return jobs
 

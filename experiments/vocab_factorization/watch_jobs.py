@@ -73,9 +73,14 @@ def summarize(jobs: list[dict]) -> list[str]:
         # whichever this is rather than assuming, because a summary that raises
         # loses the whole wave's numbers over one job of the wrong kind.
         if "acc_norm" in d:
+            # A shrink arm has no mask to be outside of — its inactive rows are
+            # deleted — so it reports the codec's own coverage under a different
+            # name. Same column, and the summary still does not raise.
+            cov = d["active_vocab_coverage"]
+            oov = cov.get("fraction_outside_active", cov.get("fraction_outside_codec"))
             lines.append(
                 f"  {j['name']:32s} acc={d['acc']:.4f} acc_norm={d['acc_norm']:.4f} "
-                f"oov={100 * d['active_vocab_coverage']['fraction_outside_active']:.2f}%"
+                f"oov={100 * oov:.2f}%"
             )
             continue
         if "L2_short_train_bpb" in d:

@@ -33,10 +33,23 @@ fraction of scored tokens outside each arm's active set is a first-class field
 in the result. An arm that cannot represent the benchmark's text is not a
 scoring inconvenience, it is a finding about the transplant.
 
+**A progressive-shrink arm is scored through its codec.** Its model does not
+index host ids at all: rule 0 deletes the rows this corpus never exercised, rule
+1 relabels case and space into stem + role, rule 2 re-pieces the frequency tail.
+Handing such a model host ids would measure nothing, so the codec is rebuilt from
+the checkpoint's ``stage`` + ``curriculum`` — by the same function
+``train_transplant`` builds it with, never a second copy of the logic — and
+applied to every encoded document. Two consequences that are easy to get quietly
+wrong, and are therefore the two things most heavily commented below: the
+continuation boundary has to be **recomputed** after the rewrite (rule 2 turns
+one token into several), and a benchmark token whose row was deleted has to be
+spelled out of the rows that remain rather than dropped.
+
 Run::
 
     python -m experiments.vocab_factorization.hellaswag --native
     python -m experiments.vocab_factorization.hellaswag --ckpt <artifacts>/ckpt/bpe8k-t.pt
+    python -m experiments.vocab_factorization.hellaswag --ckpt <artifacts>/ckpt/shrink1-fold.pt
 """
 
 from __future__ import annotations
@@ -50,14 +63,15 @@ import time
 import numpy as np
 import torch
 
-from experiments.vocab_factorization import active_vocab, transplant
+from experiments.vocab_factorization import active_vocab, shrink, transplant
 from experiments.vocab_factorization.build_arms import get_arm
 from experiments.vocab_factorization.configs import (
     HOST_ARM,
     HOST_MODEL,
+    SHRINKS_BY_NAME,
     TransplantTrainSpec,
 )
-from experiments.vocab_factorization.train_transplant import _reserve
+from experiments.vocab_factorization.train_transplant import _reserve, build_shrink_plan
 
 DATASET = "hellaswag"
 SPLIT = "validation"
@@ -97,32 +111,269 @@ def load_docs(limit: int = 0) -> list[dict]:
     return docs
 
 
-def encode_docs(arm, docs: list[dict], heads: dict[str, int]) -> list[dict]:
-    """Tokenize each (context, ending) pair with the arm's own tokenizer.
+class HostCodec:
+    """Host ids straight into the model's heads. The six transplant arms' path.
 
-    The continuation boundary is ``len(encode(context))`` -- the context and the
-    concatenation are encoded separately and the split is taken by length. For a
-    BPE-family tokenizer the context's encoding is not guaranteed to be a strict
-    prefix of the concatenation's, so a token straddling the join can shift the
-    boundary by one. That is the same approximation every published harness
-    makes, it is identical in kind for every arm here, and the alternative
-    (scoring the context tokens too) would swamp the signal with context.
+    Their tables are indexed by the arm's own ids, so encoding *is* the whole
+    job: the arrays are the encoding and the continuation boundary needs no
+    translation. Kept as a class only so ``encode_docs`` does not have to know
+    which kind of arm it is walking.
+    """
+
+    shrink = False
+
+    def __init__(self, arm, heads: dict[str, int]) -> None:
+        self.arm, self.heads = arm, heads
+
+    def encode(self, text: str):
+        return self.arm.encode(text)
+
+    def source_len(self, enc) -> int:
+        return int(enc.stem.size)
+
+    def document(self, enc, src_ctx_len: int, cont_bytes: int) -> dict:
+        return {
+            "arrays": {n: getattr(enc, n).astype(np.int64) for n in self.heads},
+            "ctx_len": src_ctx_len,
+            "cont_bytes": cont_bytes,
+        }
+
+    def check(self, arrays: dict, raw: bytes) -> None:
+        """Nothing to certify: these ids are the arm's own, unrewritten."""
+
+
+class ShrinkCodec:
+    """A shrink arm's rewritten vocabulary, applied to a benchmark document.
+
+    The plan is rebuilt by ``train_transplant.build_shrink_plan`` — the function
+    the training run itself used — so what is scored here is the vocabulary the
+    checkpoint was trained against and not a lookalike.
+
+    Three things this has to get right that the host path does not:
+
+    * **the encoding.** A ``fold`` arm's stream is not ``arm.encode`` at all: it
+      is ``fold_encode`` over the lowercased text, with the case read back off
+      the original. The two curricula share stage numbers and produce different
+      vocabularies at each, so the curriculum name decides which one runs.
+    * **the continuation boundary.** See ``document``.
+    * **tokens whose row was deleted.** See ``_pieces``.
+    """
+
+    shrink = True
+
+    def __init__(self, plan, arm, folding: bool) -> None:
+        self.plan, self.arm, self.folding = plan, arm, folding
+        self.segmenter = shrink.Segmenter(plan.vocab)
+
+    def encode(self, text: str):
+        if self.folding:
+            return shrink.fold_encode(text, self.arm.tok, self.plan.host)
+        return self.arm.encode(text)
+
+    def source_ids(self, enc) -> np.ndarray:
+        return np.asarray(enc.ids if self.folding else enc.stem, dtype=np.int64)
+
+    def source_len(self, enc) -> int:
+        return int(enc.ids.size if self.folding else enc.stem.size)
+
+    def document(self, enc, src_ctx_len: int, cont_bytes: int) -> dict:
+        """Arrays, plus the continuation boundary **recomputed** in their index space.
+
+        This is the subtle one. ``src_ctx_len`` counts *source* tokens, and under
+        a re-piecing codec one source token becomes several — 14.07% more of them
+        at ``shrink3-tail1k``, and not spread evenly, because the tokens that
+        re-piece are the rare ones. Carrying the boundary across the rewrite
+        would therefore land it somewhere inside the context, and every choice
+        would be scored on a sum that includes context NLL: a number that looks
+        entirely reasonable and is not the benchmark.
+
+        The boundary is instead defined as "what the same codec does to the same
+        prefix", which cannot drift from the array it indexes because it is the
+        array's own prefix. It costs one extra codec pass over the context.
+        """
+        n = self.source_len(enc)
+        cut = min(src_ctx_len, n)
+        covered = self.plan.covers(self.source_ids(enc))
+        return {
+            "arrays": self._apply(enc, covered, 0, n),
+            "ctx_len": int(self._apply(enc, covered, 0, cut)["stem"].size),
+            "cont_bytes": cont_bytes,
+            # The coverage diagnostic's raw material, counted here because it is
+            # the only place that still knows which *source* tokens these arrays
+            # came from. See ``codec_coverage``.
+            "source_cont_tokens": n - cut,
+            "source_cont_repieced": int((~covered[cut:]).sum()),
+        }
+
+    def check(self, arrays: dict, raw: bytes) -> None:
+        """Spell the document back out and compare it to its own bytes.
+
+        ``verify_fold`` certifies any codec-applied stream, not only a folded
+        one: it re-spells every (stem, role) pair and diffs against the text. Run
+        per document rather than argued about, because three separate things here
+        can produce a plausible wrong stream — the fold encoder's case decision,
+        the re-piecing, and the fallback splice below — and all three would leave
+        ``acc_norm`` looking perfectly ordinary. ``cont_bytes`` is the accuracy's
+        denominator, so a stream that does not spell exactly these bytes is
+        normalizing by a length it does not have.
+        """
+        shrink.verify_fold(self.plan, arrays, raw)
+
+    def _slice(self, enc, lo: int, hi: int) -> dict[str, np.ndarray]:
+        """The codec over a run of source tokens it covers."""
+        if self.folding:
+            # Position-independent: every rung either relabels or re-pieces one
+            # token at a time, so a slice's image is the image's slice.
+            return self.plan.fold_stream(
+                shrink.FoldEncoding(enc.ids[lo:hi], enc.case[lo:hi], 0)
+            )
+        return self.plan.apply_stream(np.asarray(enc.stem[lo:hi], dtype=np.int64))
+
+    def _pieces(self, enc, i: int) -> list[tuple[int, int]]:
+        """A token whose row was deleted, spelled out of the rows that remain.
+
+        HellaSwag is English from a different distribution than this ru+en
+        corpus, and 2,072 of its 3,166,583 host tokens (0.065%, 207 distinct
+        surfaces — " mascara", " tablespoons", " walmart") never occur in it. A
+        transplant arm scores those unmasked, because the row still exists; a
+        shrink arm cannot, because rule 0 deleted it. Re-piecing is the arm's own
+        answer to a surface it has no row for — it is literally rule 2 — so it
+        measures the model rather than the workaround, and it preserves the byte
+        stream that ``cont_bytes`` normalizes by.
+        """
+        stem = int(enc.ids[i]) if self.folding else int(enc.stem[i])
+        raw = (
+            shrink.fold_surface(self.plan.host, stem, int(enc.case[i]))
+            if self.folding
+            else self.plan.host.stems[stem]
+        )
+        pieces = self.segmenter(raw)
+        if pieces is None:
+            # Only reachable before a ``repiece_tail`` rung, where the byte floor
+            # is still incomplete. Silence here would drop bytes the accuracy is
+            # normalized by, so it is a stop rather than a warning.
+            raise ValueError(
+                f"{self.plan.host.stems[stem]!r} (host id {stem}) is outside this "
+                f"arm's vocabulary and cannot be spelled out of its "
+                f"{len(self.plan.vocab)} remaining stems either — the benchmark "
+                "is not representable by this arm at all"
+            )
+        return pieces
+
+    def _apply(
+        self, enc, covered: np.ndarray, lo: int, hi: int
+    ) -> dict[str, np.ndarray]:
+        """The codec over ``[lo, hi)``, splicing the uncovered tokens' spellings in.
+
+        Covered tokens go through the vectorized codec in runs; only the handful
+        the codec has no image for cost a Python detour.
+        """
+        role_head = self.plan.vocab.n_roles > 1
+        stems: list[np.ndarray] = []
+        roles: list[np.ndarray] = []
+        i = lo
+        while i < hi:
+            j = i
+            while j < hi and covered[j]:
+                j += 1
+            if j > i:
+                part = self._slice(enc, i, j)
+                stems.append(part["stem"])
+                if role_head:
+                    roles.append(part["role"])
+                i = j
+            while i < hi and not covered[i]:
+                pieces = self._pieces(enc, i)
+                stems.append(np.fromiter((p[0] for p in pieces), np.int64, len(pieces)))
+                if role_head:
+                    roles.append(
+                        np.fromiter((p[1] for p in pieces), np.int64, len(pieces))
+                    )
+                i += 1
+        out = {"stem": _concat(stems)}
+        if role_head:
+            out["role"] = _concat(roles)
+        return out
+
+
+def _concat(parts: list[np.ndarray]) -> np.ndarray:
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+
+def build_codec(meta: dict, arm, args, tspec: TransplantTrainSpec):
+    """What turns a document into the arrays this checkpoint's model indexes."""
+    if not meta.get("stage", 0):
+        return HostCodec(arm, meta["heads"])
+
+    spec = _shrink_spec(meta)
+    plan, fold, _ = build_shrink_plan(
+        spec, arm, meta["host_vocab"], args, tspec, tspec.train_bytes
+    )
+    # The codec is derived, so nothing checks it against the model unless this
+    # does. A plan built over a different budget or a drifted curriculum yields a
+    # different vocabulary, and its ids would index the checkpoint's table
+    # happily and mean something else. Head cardinalities are the cheap, total
+    # statement that the two agree.
+    if plan.heads() != meta["heads"]:
+        raise ValueError(
+            f"rebuilt codec for {meta['experiment']} has heads {plan.heads()} but "
+            f"the checkpoint's table is {meta['heads']} — the plan does not "
+            "describe this model, so scoring it would measure a different "
+            "vocabulary"
+        )
+    return ShrinkCodec(plan, arm, fold is not None)
+
+
+def _shrink_spec(meta: dict):
+    """The arm's row in ``configs.SHRINKS``, cross-checked against the checkpoint.
+
+    ``override_min_count`` is *not* in the checkpoint, and three arms
+    (``shrink2-tail200``/``300``/``500``) differ from ``shrink2-tail100`` in
+    nothing else — so configs stays the source of truth for what an arm is, and
+    the ``stage``/``curriculum`` the checkpoint does carry are read back as the
+    check that the row still describes the model on disk.
+    """
+    spec = SHRINKS_BY_NAME.get(meta["experiment"])
+    if spec is None:
+        raise KeyError(
+            f"{meta['experiment']} is a stage-{meta['stage']} checkpoint with no "
+            "row in configs.SHRINKS, so its curriculum's thresholds cannot be "
+            "recovered — add the row rather than guessing them here"
+        )
+    got = (meta["stage"], meta.get("curriculum", "default"))
+    if (spec.stage, spec.curriculum) != got:
+        raise ValueError(
+            f"configs.SHRINKS says {spec.name} is stage {spec.stage} of the "
+            f"{spec.curriculum!r} curriculum; the checkpoint says {got}. The two "
+            "curricula share stage numbers and produce different vocabularies at "
+            "each, so this is not a naming quibble"
+        )
+    return spec
+
+
+def encode_docs(codec, docs: list[dict]) -> list[dict]:
+    """Tokenize each (context, ending) pair the way this arm's model reads text.
+
+    The continuation boundary starts as ``len(encode(context))`` -- the context
+    and the concatenation are encoded separately and the split is taken by
+    length. For a BPE-family tokenizer the context's encoding is not guaranteed
+    to be a strict prefix of the concatenation's, so a token straddling the join
+    can shift the boundary by one. That is the same approximation every published
+    harness makes, it is identical in kind for every arm here, and the
+    alternative (scoring the context tokens too) would swamp the signal with
+    context. What the codec must not do is *add* to that approximation, which is
+    why ``ShrinkCodec.document`` recomputes rather than carries it.
     """
     out = []
     for d in docs:
-        ctx_len = len(arm.encode(d["query"]).stem)
+        src_ctx_len = codec.source_len(codec.encode(d["query"]))
         seqs = []
         for choice in d["choices"]:
-            enc = arm.encode(d["query"] + " " + choice)
-            seqs.append(
-                {
-                    "arrays": {
-                        name: getattr(enc, name).astype(np.int64) for name in heads
-                    },
-                    "ctx_len": ctx_len,
-                    "cont_bytes": len((" " + choice).encode("utf-8")),
-                }
-            )
+            text = d["query"] + " " + choice
+            enc = codec.encode(text)
+            seq = codec.document(enc, src_ctx_len, len((" " + choice).encode("utf-8")))
+            codec.check(seq["arrays"], text.encode("utf-8"))
+            seqs.append(seq)
         out.append({"gold": d["gold"], "seqs": seqs})
     return out
 
@@ -218,6 +469,43 @@ def coverage(encoded: list[dict], ids: np.ndarray) -> dict:
     }
 
 
+def codec_coverage(encoded: list[dict]) -> dict:
+    """The same question asked of a vocabulary that has no mask to lift.
+
+    "Fraction outside the active set" is meaningless for a shrink arm: the mask
+    is subsumed by the codec, because rule 0 *deleted* the inactive rows instead
+    of masking them, and every id the codec accepts is active by construction. So
+    reporting that number would report 0.0000 forever while measuring nothing.
+
+    The honest analogue is one rung earlier: how much of the benchmark this
+    vocabulary has no row for at all. Those tokens are still scored -- spelled
+    out of the rows that survive, see ``ShrinkCodec._pieces`` -- so like the
+    unmasked fraction above this is reported rather than enforced, and like it,
+    it is a finding about the arm rather than a scoring inconvenience. Counted in
+    *source* tokens (host ids, or folded ids for a ``fold`` arm) because that is
+    the space the question is asked in; ``continuation_tokens`` is what actually
+    got scored, and the gap between them is the re-piecing.
+    """
+    source = sum(s["source_cont_tokens"] for e in encoded for s in e["seqs"])
+    repieced = sum(s["source_cont_repieced"] for e in encoded for s in e["seqs"])
+    scored = sum(
+        int(s["arrays"]["stem"].size) - s["ctx_len"] for e in encoded for s in e["seqs"]
+    )
+    return {
+        "mode": "codec",
+        "continuation_tokens": scored,
+        "source_continuation_tokens": source,
+        "tokens_outside_codec": repieced,
+        "fraction_outside_codec": repieced / max(1, source),
+        "note": (
+            "a shrink arm's inactive rows are deleted, not masked, so "
+            "'outside the active vocabulary' is vacuous here; this counts "
+            "benchmark tokens the codec has no row for, which are scored by "
+            "being re-pieced out of the rows that remain"
+        ),
+    }
+
+
 def build_native(device):
     """The untouched pretrained model, with no checkpoint involved.
 
@@ -236,7 +524,16 @@ def build_native(device):
     return (
         model,
         heads,
-        {"experiment": "orig-frozen", "arm": HOST_ARM, "init": "native", "steps": 0},
+        # ``heads`` is carried in the metadata as well so this reconstruction
+        # describes itself exactly as a checkpoint does, and ``build_codec`` can
+        # read one shape for both.
+        {
+            "experiment": "orig-frozen",
+            "arm": HOST_ARM,
+            "init": "native",
+            "steps": 0,
+            "heads": heads,
+        },
     )
 
 
@@ -260,6 +557,7 @@ def main() -> None:
     _reserve(args.reserve_gb)
     t0 = time.time()
 
+    tspec = TransplantTrainSpec()
     if args.native:
         model, heads, meta = build_native(device)
     else:
@@ -271,26 +569,47 @@ def main() -> None:
     arm = get_arm(meta["arm"], args.arms_dir, args.corpus)
     print(f"[{name}] arm={meta['arm']} heads={heads}", flush=True)
 
+    codec = build_codec(meta, arm, args, tspec)
+    if codec.shrink:
+        print(
+            f"[{name}] codec rebuilt: stage {meta['stage']} of the "
+            f"{meta.get('curriculum', 'default')!r} curriculum, "
+            f"{[s.rule for s in codec.plan.steps]} -> {codec.plan.heads()}"
+            f"{', folded encoding' if codec.folding else ''} "
+            f"({time.time() - t0:.0f}s)",
+            flush=True,
+        )
+
     docs = load_docs(args.limit)
-    encoded = encode_docs(arm, docs, heads)
+    encoded = encode_docs(codec, docs)
     print(f"[{name}] {len(encoded)} docs encoded ({time.time() - t0:.0f}s)", flush=True)
 
-    ids = active_vocab.load_or_build(
-        meta["arm"],
-        arm.heads["stem"],
-        args.corpus,
-        args.arms_dir,
-        args.tokens_dir,
-        TransplantTrainSpec().train_bytes,
-        workers=args.workers,
-    )
-    cov = coverage(encoded, ids)
-    print(
-        f"[{name}] outside active vocab: {cov['tokens_outside_active']}/"
-        f"{cov['continuation_tokens']} continuation tokens "
-        f"({cov['fraction_outside_active']:.2%})",
-        flush=True,
-    )
+    if codec.shrink:
+        cov = codec_coverage(encoded)
+        print(
+            f"[{name}] outside the codec: {cov['tokens_outside_codec']}/"
+            f"{cov['source_continuation_tokens']} continuation source tokens "
+            f"({cov['fraction_outside_codec']:.2%}), re-pieced into "
+            f"{cov['continuation_tokens']} scored tokens",
+            flush=True,
+        )
+    else:
+        ids = active_vocab.load_or_build(
+            meta["arm"],
+            arm.heads["stem"],
+            args.corpus,
+            args.arms_dir,
+            args.tokens_dir,
+            tspec.train_bytes,
+            workers=args.workers,
+        )
+        cov = coverage(encoded, ids)
+        print(
+            f"[{name}] outside active vocab: {cov['tokens_outside_active']}/"
+            f"{cov['continuation_tokens']} continuation tokens "
+            f"({cov['fraction_outside_active']:.2%})",
+            flush=True,
+        )
 
     model.set_active_mask(None)  # explicit: the benchmark is scored unmasked
     nll = score(model, encoded, heads, device, args.batch)
@@ -308,6 +627,15 @@ def main() -> None:
         "active_vocab_coverage": cov,
         "eval_seconds": round(time.time() - t0, 1),
     }
+    if codec.shrink:
+        # Emitted only for the arms it describes, so the six published
+        # transplant artifacts stay byte-identical on a re-run.
+        results["shrink"] = {
+            "stage": meta["stage"],
+            "curriculum": meta.get("curriculum", "default"),
+            "heads": heads,
+            "folded_encoding": codec.folding,
+        }
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / f"{name}.json").write_text(json.dumps(results, indent=2))
     print(

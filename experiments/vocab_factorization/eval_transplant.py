@@ -67,8 +67,13 @@ def load_checkpoint(path: Path, device) -> tuple[torch.nn.Module, dict]:
     model.out.load_state_dict(ckpt["out"])
     if not frozen:
         model.body.load_state_dict(ckpt["body"])
-    del host_emb
     meta = {k: v for k, v in ckpt.items() if k not in ("emb", "out", "body")}
+    # A shrink arm's ``heads`` describe the *rewritten* table, so the host's own
+    # row count is no longer recoverable from the checkpoint — and rebuilding its
+    # codec needs it (``shrink.host_vocabulary`` pads to exactly this many rows).
+    # It is free here and a second 1.7B load anywhere else.
+    meta["host_vocab"] = int(host_emb.shape[0])
+    del host_emb
     return model, meta
 
 
@@ -99,6 +104,21 @@ def main() -> None:
         f"steps={meta['steps']})",
         flush=True,
     )
+
+    # ``run_eval`` enumerates every ``*.pt`` under the artifacts root, and the
+    # shrink wave put nine more there. This module encodes its eval suites with
+    # ``arm.encode``, which yields *host* ids — scoring those against a rewritten
+    # table would not crash, it would index rows that mean something else and
+    # report the result as that arm's BPB. Refusing is the only honest option
+    # until this path grows the codec rebuild ``hellaswag`` has.
+    if meta.get("stage", 0):
+        raise SystemExit(
+            f"{args.ckpt} is a progressive-shrink checkpoint (stage "
+            f"{meta['stage']}, curriculum {meta.get('curriculum', 'default')}) "
+            "whose model indexes a rewritten vocabulary. Its BPB is already in "
+            f"results/transplant/{name}.json, written by the run that trained it "
+            "with the codec applied to the eval streams."
+        )
 
     arm = get_arm(arm_name, args.arms_dir, args.corpus)
     heads = meta["heads"]

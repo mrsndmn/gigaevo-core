@@ -500,6 +500,66 @@ def test_the_fold_needs_a_fold_rung_to_put_the_case_in():
         plan.fold_stream(shrink.fold_encode(" the", TOK, HOST))
 
 
+# --- asking the codec before applying it ----------------------------------
+#
+# On the corpus, every text the BPB harness scores is inside the active set by
+# construction, so ``apply`` raising is the right and only behaviour. A
+# downstream benchmark is the case that convention does not cover: HellaSwag
+# emits 2,072 of 3,166,583 host tokens (207 surfaces — " mascara",
+# " tablespoons") this ru+en corpus never does.
+
+
+def test_covers_names_exactly_the_ids_apply_would_accept():
+    active = np.array([0, 1, 5], dtype=np.int64)
+    plan = _plan((ShrinkRule("mask"),), active=active)
+    assert plan.covers(np.array([0, 7, 5, 9], dtype=np.int64)).tolist() == [
+        True,
+        False,
+        True,
+        False,
+    ]
+    # The two must agree, or asking first would be a different question from
+    # the one applying answers.
+    with pytest.raises(ValueError, match="maps to nothing"):
+        plan.apply_stream(np.array([7], dtype=np.int64))
+
+
+def test_the_segmenter_spells_out_of_corpus_text_out_of_what_remains():
+    """Rule 2's operation, pointed at a surface the corpus never contained."""
+    active = np.array(
+        [i for i in ACTIVE.tolist() if SURFACES[i] != b" cat"], dtype=np.int64
+    )
+    plan = _plan((ShrinkRule("mask"),), active=active)
+    assert not plan.covers(np.array([SURFACES.index(b" cat")]))[0]
+    pieces = shrink.Segmenter(plan.vocab)(b" cat")
+    assert pieces is not None and len(pieces) > 1
+    assert b"".join(plan.vocab.spell(s, r) for s, r in pieces) == b" cat"
+
+
+def test_the_segmenter_admits_when_the_byte_floor_is_incomplete():
+    """Rule 0 deletes 66 of the 256 single-byte host tokens on the real corpus,
+    so before a ``repiece_tail`` rung a surface can have no segmentation at all.
+    Returning None is what lets a caller stop rather than drop the bytes."""
+    only_the = np.array([SURFACES.index(b"the")], dtype=np.int64)
+    plan = _plan((ShrinkRule("mask"),), active=only_the)
+    assert shrink.Segmenter(plan.vocab)(b"cat") is None
+
+
+@pytest.mark.parametrize(
+    "text", [" The", " THE", "the", " the", "Cat", " tHe", "aBc", "İstanbul"]
+)
+def test_fold_surface_inverts_the_case_the_encoder_read(text):
+    """``fold_encode`` emits (lowercase id, case); this puts the case back. The
+    property is that concatenating them spells the text again — which is what
+    makes it safe to re-piece a folded token the codec has no row for."""
+    enc = shrink.fold_encode(text, TOK, HOST)
+    got = b"".join(
+        shrink.fold_surface(HOST, int(i), int(c))
+        for i, c in zip(enc.ids.tolist(), enc.case.tolist(), strict=True)
+    )
+    assert got == text.encode("utf-8")
+
+
 # --- the init the healing train starts from -------------------------------
 
 
