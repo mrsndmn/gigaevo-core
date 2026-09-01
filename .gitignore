@@ -179,6 +179,11 @@ tmp/
 # Keep UI/demo SVGs checked in
 !demos/**/*.svg
 
+# Keep the tracked summary figures checked in. results/ is ignored wholesale, so
+# a figure only becomes durable by living here and being exempted by name.
+!experiments/figures/*.svg
+!experiments/figures/*.png
+
 # ---------------------------------------------------------------------------
 # GigaEvo experiment runtime artifacts
 # ---------------------------------------------------------------------------

@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <title>Fold case at tokenization, not after it</title>
+  <desc>Merging case variants by token id leaves uppercase text fragmented, because the tokenizer segments it differently before any merge applies. Tokenizing lowercased text and carrying case in a role head instead makes the stem stream case-invariant: agreement between the uppercase and lowercase stem streams rises from 36.9 percent to 99.85 percent, and uppercase BPB falls from 1.9236 to 1.2034 at the same vocabulary size, while every other suite also improves.</desc>
+
+  <rect width="960" height="540" fill="#fcfcfb"/>
+
+  <text x="56" y="52" font-size="25" font-weight="600" fill="#0b0b0b">Fold case at tokenization, not after it</text>
+  <text x="56" y="78" font-size="14" fill="#52514e">Same vocabulary size, same protocol. Only the layer the case rule operates at changes.</text>
+
+  <line x1="56" y1="100" x2="904" y2="100" stroke="#e1e0d9" stroke-width="1"/>
+
+  <!-- mechanism -->
+  <text x="56" y="130" font-size="11.5" font-weight="600" fill="#52514e" letter-spacing="0.6">WHY MERGING IDS IS THE WRONG LAYER</text>
+  <text x="56" y="156" font-size="13.5" fill="#52514e">A merge can only catch variants the tokenizer emitted — and uppercase text is segmented differently before any merge applies:</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
+    <text x="56" y="186" fill="#52514e">' привет'</text>
+    <text x="170" y="186" fill="#52514e">→</text>
+    <text x="196" y="186" fill="#0b0b0b">' пр' · 'ив' · 'ет'</text>
+    <text x="430" y="186" fill="#52514e">3 pieces</text>
+
+    <text x="56" y="210" fill="#52514e">' ПРИВЕТ'</text>
+    <text x="170" y="210" fill="#52514e">→</text>
+    <text x="196" y="210" fill="#0b0b0b">' П' · 'РИ' · 'В' · 'Е' · 'Т'</text>
+    <text x="430" y="210" fill="#eb6834">5 pieces — different rows entirely</text>
+  </g>
+
+  <text x="56" y="242" font-size="13.5" fill="#52514e">92.9% of uppercase tokens <tspan font-style="italic">do</tspan> land in a merged group. The merge fires — on the wrong fragments.</text>
+
+  <!-- the two mechanisms compared -->
+  <g transform="translate(56,278)">
+    <text x="0" y="0" font-size="12.5" fill="#52514e">Agreement between the uppercase and lowercase stem streams</text>
+    <rect x="0" y="16" width="330" height="26" rx="4" fill="#e1e0d9"/>
+    <rect x="0" y="16" width="121.8" height="26" rx="4" fill="#eb6834"/>
+    <text x="340" y="34" font-size="13" fill="#52514e">merge ids</text>
+    <text x="131" y="34" font-size="12.5" font-weight="600" fill="#0b0b0b">36.9%</text>
+
+    <rect x="0" y="50" width="330" height="26" rx="4" fill="#e1e0d9"/>
+    <rect x="0" y="50" width="329.5" height="26" rx="4" fill="#2a78d6"/>
+    <text x="340" y="68" font-size="13" fill="#52514e">fold at tokenization</text>
+    <text x="240" y="68" font-size="12.5" font-weight="600" fill="#fcfcfb">99.85%</text>
+  </g>
+
+  <line x1="56" y1="376" x2="904" y2="376" stroke="#e1e0d9" stroke-width="1"/>
+
+  <!-- per-suite result -->
+  <text x="56" y="404" font-size="11.5" font-weight="600" fill="#2a78d6" letter-spacing="0.6">CLEAN BPB BY EVAL SUITE, AT MATCHED VOCABULARY (17,385 vs 16,632 STEMS)</text>
+
+  <g font-size="13">
+    <text x="56"  y="432" fill="#52514e">suite</text>
+    <text x="240" y="432" fill="#52514e" text-anchor="end">native</text>
+    <text x="380" y="432" fill="#eb6834" text-anchor="end">merge ids</text>
+    <text x="530" y="432" fill="#2a78d6" text-anchor="end">fold</text>
+    <text x="660" y="432" fill="#52514e" text-anchor="end">fold − merge</text>
+  </g>
+  <line x1="56" y1="440" x2="660" y2="440" stroke="#e1e0d9" stroke-width="1"/>
+
+  <g font-size="13.5">
+    <text x="56"  y="462" fill="#0b0b0b">upper</text>
+    <text x="240" y="462" fill="#52514e" text-anchor="end">1.0702</text>
+    <text x="380" y="462" fill="#52514e" text-anchor="end">1.9236</text>
+    <text x="530" y="462" fill="#0b0b0b" font-weight="600" text-anchor="end">1.2034</text>
+    <text x="660" y="462" fill="#0ca30c" font-weight="600" text-anchor="end">−0.720</text>
+
+    <text x="56"  y="484" fill="#0b0b0b">title</text>
+    <text x="240" y="484" fill="#52514e" text-anchor="end">0.8885</text>
+    <text x="380" y="484" fill="#52514e" text-anchor="end">0.9168</text>
+    <text x="530" y="484" fill="#0b0b0b" font-weight="600" text-anchor="end">0.8576</text>
+    <text x="660" y="484" fill="#0ca30c" font-weight="600" text-anchor="end">−0.059</text>
+
+    <text x="56"  y="506" fill="#0b0b0b">clean</text>
+    <text x="240" y="506" fill="#52514e" text-anchor="end">0.7796</text>
+    <text x="380" y="506" fill="#52514e" text-anchor="end">0.7775</text>
+    <text x="530" y="506" fill="#0b0b0b" font-weight="600" text-anchor="end">0.7614</text>
+    <text x="660" y="506" fill="#0ca30c" font-weight="600" text-anchor="end">−0.016</text>
+
+    <text x="56"  y="528" fill="#0b0b0b">lower</text>
+    <text x="240" y="528" fill="#52514e" text-anchor="end">0.8243</text>
+    <text x="380" y="528" fill="#52514e" text-anchor="end">0.8055</text>
+    <text x="530" y="528" fill="#0b0b0b" font-weight="600" text-anchor="end">0.7760</text>
+    <text x="660" y="528" fill="#0ca30c" font-weight="600" text-anchor="end">−0.030</text>
+  </g>
+
+  <g transform="translate(700,452)">
+    <text x="0" y="0" font-size="13.5" font-weight="600" fill="#0b0b0b">84% of the uppercase</text>
+    <text x="0" y="20" font-size="13.5" font-weight="600" fill="#0b0b0b">cost recovered,</text>
+    <text x="0" y="44" font-size="13" fill="#52514e">and clean BPB improves</text>
+    <text x="0" y="62" font-size="13" fill="#52514e">at the same time.</text>
+  </g>
+</svg>

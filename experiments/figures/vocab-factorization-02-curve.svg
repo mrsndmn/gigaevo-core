@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <title>How far the table shrinks before it costs something</title>
+  <desc>Two panels sharing a log compression axis. Top: clean bits-per-byte against the native reference 0.7796 and the +0.01 gate. Bottom: HellaSwag acc_norm against the native 0.6035. The fold route is better than the merge route on both measures at every depth. Compression is free on BPB out to about 8x, while downstream accuracy declines steadily, so the recommended operating point is 4.5x where both are close to native.</desc>
+
+  <rect width="960" height="540" fill="#fcfcfb"/>
+
+  <text x="56" y="46" font-size="24" font-weight="600" fill="#0b0b0b">How far the table shrinks before it costs something</text>
+  <text x="56" y="72" font-size="14" fill="#52514e">Folding case at tokenization is better than merging ids on both measures, at every depth.</text>
+
+  <!-- legend -->
+  <g transform="translate(600,112)">
+    <circle cx="0" cy="-4" r="5" fill="#2a78d6"/>
+    <text x="12" y="0" font-size="12.5" fill="#52514e">fold at tokenization</text>
+    <circle cx="168" cy="-4" r="5" fill="#eb6834"/>
+    <text x="180" y="0" font-size="12.5" fill="#52514e">merge token ids</text>
+  </g>
+
+  <!-- ================= Panel A: clean BPB ================= -->
+  <text x="56" y="112" font-size="13.5" font-weight="600" fill="#0b0b0b">Clean bits per byte <tspan font-weight="400" fill="#52514e">— lower is better</tspan></text>
+
+  <g stroke="#e1e0d9" stroke-width="1">
+    <line x1="110" y1="300" x2="890" y2="300"/>
+    <line x1="110" y1="150" x2="890" y2="150"/>
+  </g>
+
+  <!-- gate band: native .. native+0.01 -->
+  <rect x="110" y="215.1" width="780" height="21.5" fill="#1baf7a" opacity="0.10"/>
+  <line x1="110" y1="236.6" x2="890" y2="236.6" stroke="#52514e" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="116" y="251" font-size="11.5" fill="#52514e">native 0.7796</text>
+  <text x="798" y="211" font-size="11.5" fill="#52514e">+0.01 gate</text>
+
+  <g font-size="11" fill="#52514e">
+    <text x="100" y="304" text-anchor="end">0.750</text>
+    <text x="100" y="240" text-anchor="end">0.780</text>
+    <text x="100" y="154" text-anchor="end">0.820</text>
+  </g>
+
+  <!-- merge route -->
+  <polyline points="231.5,244.9 521.0,241.1 622.4,233.1 688.0,224.6 775.2,200.1 883.4,162.0"
+            fill="none" stroke="#eb6834" stroke-width="2"/>
+  <g fill="#eb6834" stroke="#fcfcfb" stroke-width="2">
+    <circle cx="231.5" cy="244.9" r="5"/><circle cx="521.0" cy="241.1" r="5"/>
+    <circle cx="622.4" cy="233.1" r="5"/><circle cx="688.0" cy="224.6" r="5"/>
+    <circle cx="775.2" cy="200.1" r="5"/><circle cx="883.4" cy="162.0" r="5"/>
+  </g>
+  <text x="688.0" y="216" font-size="11.5" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.7852</text>
+  <text x="878" y="151" font-size="11.5" fill="#52514e" text-anchor="end">0.8144</text>
+
+  <!-- fold route -->
+  <polyline points="249.2,288.4 533.1,275.6" fill="none" stroke="#2a78d6" stroke-width="2"/>
+  <g fill="#2a78d6" stroke="#fcfcfb" stroke-width="2">
+    <circle cx="249.2" cy="288.4" r="5"/><circle cx="533.1" cy="275.6" r="5"/>
+  </g>
+  <text x="249.2" y="279" font-size="11.5" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.7554</text>
+  <text x="533.1" y="266" font-size="11.5" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.7614</text>
+
+  <!-- ================= Panel B: HellaSwag ================= -->
+  <text x="56" y="352" font-size="13.5" font-weight="600" fill="#0b0b0b">HellaSwag acc_norm <tspan font-weight="400" fill="#52514e">— higher is better</tspan></text>
+
+  <g stroke="#e1e0d9" stroke-width="1">
+    <line x1="110" y1="480" x2="890" y2="480"/>
+  </g>
+
+  <line x1="110" y1="386.5" x2="890" y2="386.5" stroke="#52514e" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="116" y="382" font-size="11.5" fill="#52514e">native 0.6035</text>
+  <line x1="110" y1="451.1" x2="890" y2="451.1" stroke="#52514e" stroke-width="1" stroke-dasharray="2 3"/>
+  <text x="116" y="447" font-size="11.5" fill="#52514e">flat control bpe8k-t 0.5389</text>
+
+  <g font-size="11" fill="#52514e">
+    <text x="100" y="484" text-anchor="end">0.510</text>
+    <text x="100" y="390" text-anchor="end">0.604</text>
+  </g>
+
+  <polyline points="231.5,414.0 521.0,427.2 622.4,435.3 688.0,445.9 775.2,458.4 883.4,469.1"
+            fill="none" stroke="#eb6834" stroke-width="2"/>
+  <g fill="#eb6834" stroke="#fcfcfb" stroke-width="2">
+    <circle cx="231.5" cy="414.0" r="5"/><circle cx="521.0" cy="427.2" r="5"/>
+    <circle cx="622.4" cy="435.3" r="5"/><circle cx="688.0" cy="445.9" r="5"/>
+    <circle cx="775.2" cy="458.4" r="5"/><circle cx="883.4" cy="469.1" r="5"/>
+  </g>
+  <text x="688.0" y="461" font-size="11.5" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.5441</text>
+  <text x="878" y="464" font-size="11.5" fill="#52514e" text-anchor="end">0.5209</text>
+
+  <polyline points="249.2,398.4 533.1,418.6" fill="none" stroke="#2a78d6" stroke-width="2"/>
+  <g fill="#2a78d6" stroke="#fcfcfb" stroke-width="2">
+    <circle cx="249.2" cy="398.4" r="5"/><circle cx="533.1" cy="418.6" r="5"/>
+  </g>
+  <text x="249.2" y="391" font-size="11.5" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.5916</text>
+  <text x="533.1" y="411" font-size="11.5" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.5714</text>
+
+  <!-- shared x axis -->
+  <g font-size="11.5" fill="#52514e" text-anchor="middle">
+    <text x="110" y="500">×1</text><text x="305" y="500">×2</text><text x="500" y="500">×4</text>
+    <text x="695" y="500">×8</text><text x="890" y="500">×16</text>
+  </g>
+  <text x="500" y="520" font-size="12.5" fill="#52514e" text-anchor="middle">embedding-table compression vs the active flat table (log scale)</text>
+
+  <!-- recommended operating point -->
+  <line x1="533.1" y1="275.6" x2="533.1" y2="418.6" stroke="#2a78d6" stroke-width="1" stroke-dasharray="3 3" opacity="0.55"/>
+  <text x="548" y="322" font-size="12.5" font-weight="600" fill="#2a78d6">×4.50 — recommended operating point</text>
+  <text x="548" y="340" font-size="12" fill="#52514e">below native BPB, 3.2 HellaSwag points down.</text>
+  <text x="548" y="356" font-size="12" fill="#52514e">Both measures are reported at every depth, because</text>
+  <text x="548" y="372" font-size="12" fill="#52514e">BPB alone keeps improving after accuracy stops.</text>
+</svg>

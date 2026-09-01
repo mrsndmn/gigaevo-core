@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <title>A 4.5x smaller embedding table that beats the model it came from</title>
+  <desc>Progressive vocabulary shrink on frozen Qwen3-1.7B. At 4.50x compression the table scores 0.7614 clean bits per byte against 0.7796 for the pretrained model, and 0.5714 HellaSwag acc_norm against 0.6035. A shallower rung at 1.64x scores 0.7554, the best clean BPB in the programme. Three interpretable rules produce it: delete rows the corpus never uses, fold case at tokenization, re-piece the frequency tail.</desc>
+
+  <rect width="960" height="540" fill="#fcfcfb"/>
+
+  <text x="56" y="58" font-size="26" font-weight="600" fill="#0b0b0b">A 4.5× smaller embedding table that beats</text>
+  <text x="56" y="90" font-size="26" font-weight="600" fill="#0b0b0b">the model it came from</text>
+  <text x="56" y="118" font-size="14" fill="#52514e">Progressive vocabulary shrink · frozen Qwen3-1.7B · ru+en, 230 MB · ~1 GPU-hour per rung</text>
+
+  <line x1="56" y1="142" x2="904" y2="142" stroke="#e1e0d9" stroke-width="1"/>
+
+  <!-- hero row -->
+  <g transform="translate(56,196)">
+    <text x="0" y="0" font-size="52" font-weight="700" fill="#0b0b0b">×4.50</text>
+    <text x="0" y="26" font-size="12.5" fill="#52514e">smaller embedding table</text>
+    <text x="0" y="46" font-size="12.5" fill="#52514e">311M → 34.1M floats</text>
+
+    <text x="300" y="0" font-size="52" font-weight="700" fill="#0b0b0b">0.7614</text>
+    <text x="300" y="26" font-size="12.5" fill="#52514e">clean bits per byte</text>
+    <text x="300" y="46" font-size="12.5" font-weight="600" fill="#0ca30c">0.0182 better than native (0.7796)</text>
+
+    <text x="640" y="0" font-size="52" font-weight="700" fill="#0b0b0b">0.5714</text>
+    <text x="640" y="26" font-size="12.5" fill="#52514e">HellaSwag acc_norm</text>
+    <text x="640" y="46" font-size="12.5" fill="#52514e">3.2 points below native (0.6035)</text>
+  </g>
+
+  <line x1="56" y1="280" x2="904" y2="280" stroke="#e1e0d9" stroke-width="1"/>
+
+  <!-- the rules -->
+  <text x="56" y="312" font-size="11.5" font-weight="600" fill="#2a78d6" letter-spacing="0.6">THREE INTERPRETABLE RULES, APPLIED IN ORDER</text>
+
+  <g transform="translate(56,340)">
+    <rect x="0" y="0" width="268" height="96" rx="8" fill="#2a78d6" opacity="0.08"/>
+    <text x="18" y="26" font-size="14.5" font-weight="600" fill="#0b0b0b">1 · Drop the unused rows</text>
+    <text x="18" y="49" font-size="12.5" fill="#52514e">Only 74,957 of 151,936 host ids</text>
+    <text x="18" y="67" font-size="12.5" fill="#52514e">occur in this corpus at all.</text>
+    <text x="18" y="88" font-size="12.5" font-weight="600" fill="#0b0b0b">152k → 75k · free</text>
+  </g>
+
+  <g transform="translate(346,340)">
+    <rect x="0" y="0" width="268" height="96" rx="8" fill="#2a78d6" opacity="0.08"/>
+    <text x="18" y="26" font-size="14.5" font-weight="600" fill="#0b0b0b">2 · Fold case at tokenization</text>
+    <text x="18" y="49" font-size="12.5" fill="#52514e">Tokenize lowercased text; carry</text>
+    <text x="18" y="67" font-size="12.5" fill="#52514e">case in a 6-value role head.</text>
+    <text x="18" y="88" font-size="12.5" font-weight="600" fill="#0b0b0b">75k → 46k · 0% more tokens</text>
+  </g>
+
+  <g transform="translate(636,340)">
+    <rect x="0" y="0" width="268" height="96" rx="8" fill="#2a78d6" opacity="0.08"/>
+    <text x="18" y="26" font-size="14.5" font-weight="600" fill="#0b0b0b">3 · Re-piece the rare tail</text>
+    <text x="18" y="49" font-size="12.5" fill="#52514e">A stem the corpus uses &lt;100 times</text>
+    <text x="18" y="67" font-size="12.5" fill="#52514e">is spelled from the rows that stay.</text>
+    <text x="18" y="88" font-size="12.5" font-weight="600" fill="#0b0b0b">46k → 17k · +1.8% tokens</text>
+  </g>
+
+  <text x="56" y="474" font-size="13.5" fill="#52514e">Every step is losslessly invertible — verified by round-tripping the full 230 MB stream and all seven eval suites to the original bytes.</text>
+  <text x="56" y="496" font-size="13.5" fill="#52514e">A shallower rung, <tspan font-weight="600" fill="#0b0b0b">×1.64</tspan>, reaches <tspan font-weight="600" fill="#0b0b0b">0.7554</tspan> — the best clean BPB in the programme, 0.0242 below native, at 0.5916 HellaSwag.</text>
+
+  <text x="56" y="524" font-size="11.5" fill="#52514e">Compression is quoted against the active flat table (74,957 × 2048 floats). Noise floor 0.0016 BPB.</text>
+</svg>
