@@ -1,0 +1,332 @@
+"""The acceptance checks, which are the only thing standing between a bad
+generation and a corrupted dataset.
+
+Every failure guarded here is silent by construction: a step that draws nothing
+still produces a PNG, a step that erases the triangle still "changed" the
+picture, a step that resizes the figure makes consecutive frames incomparable,
+and a solution that retypes the golden answer still matches the golden answer.
+None of these raise; they just quietly ship a sample whose reasoning and image
+say different things.
+
+No network and no inference: the model's part is hand-written here.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from experiments.noregeo_synth import dataset as ds
+from experiments.noregeo_synth import guard
+from experiments.noregeo_synth.canvas import build_preamble, view_box
+from experiments.noregeo_synth.configs import CONFIGS_BY_NAME
+from experiments.noregeo_synth.execute import run_steps
+from experiments.noregeo_synth.generate import (
+    _add_usage,
+    golden_point,
+    run_checks,
+    upsert_record,
+)
+from experiments.noregeo_synth.verify import answer_matches, literal_leak
+
+CFG = CONFIGS_BY_NAME["qwen38-27b"]
+
+POINT_ROW = {
+    "qid": 6200,
+    "schema_type": "point",
+    "question": "Triangle A=(7, 2), B=(-6, -5), C=(-6, -9). Find the circumcenter.",
+    "points": [[7, 2], [-6, -5], [-6, -9]],
+    "answer": {"point": [3.4615384615384617, -7.0]},
+    "choices": None,
+}
+
+DRAW_TRIANGLE = (
+    "tri = np.array([P['A'], P['B'], P['C'], P['A']])\n"
+    "ax.plot(tri[:, 0], tri[:, 1], color='tab:blue', lw=2)\n"
+    "mark('A', P['A'])\n"
+)
+DRAW_ANSWER = (
+    "mid_bc = (P['B'] + P['C']) / 2\n"
+    "mid_ab = (P['A'] + P['B']) / 2\n"
+    "d = P['B'] - P['A']\n"
+    "n = np.array([d[1], -d[0]], dtype=float)\n"
+    "O = mid_ab + (mid_bc[1] - mid_ab[1]) / n[1] * n\n"
+    "mark('O', O, color='red')\n"
+    "state['answer'] = O\n"
+)
+
+
+def _solution(*codes: str) -> dict:
+    return {
+        "plan": "test",
+        "steps": [
+            {"title": f"step {i}", "reasoning": "because", "code": c}
+            for i, c in enumerate(codes, 1)
+        ],
+        "final_answer": {"x": 3.4615384615384617, "y": -7.0},
+    }
+
+
+def _check(tmp_path, *codes: str, row: dict = POINT_ROW, cfg=CFG):
+    solution = _solution(*codes)
+    exec_res = run_steps(
+        build_preamble(row, cfg), solution["steps"], tmp_path, cfg, golden_point(row)
+    )
+    return exec_res, run_checks(row, solution, exec_res, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Incrementality
+# ---------------------------------------------------------------------------
+
+
+def test_good_solution_is_accepted(tmp_path):
+    exec_res, checks = _check(tmp_path, DRAW_TRIANGLE, DRAW_ANSWER)
+    assert exec_res.ok, exec_res.error
+    assert checks["problems"] == []
+    assert checks["incremental_ok"] and checks["drawn_ok"] and checks["code_answer_ok"]
+
+
+def test_first_step_that_draws_nothing_is_rejected(tmp_path):
+    """Compared against a blank canvas, `pass` would "change" ~3% of pixels:
+    the grid and the axes that the preamble already drew."""
+    _, checks = _check(tmp_path, "pass", DRAW_TRIANGLE, DRAW_ANSWER)
+    assert checks["incremental_ok"] is False
+    assert any("drew nothing new" in p for p in checks["problems"])
+    assert checks["deltas"][0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_later_step_that_draws_nothing_is_rejected(tmp_path):
+    _, checks = _check(tmp_path, DRAW_TRIANGLE, "x = 1 + 1", DRAW_ANSWER)
+    assert checks["incremental_ok"] is False
+    assert any("drew nothing new" in p for p in checks["problems"])
+
+
+def test_step_that_erases_earlier_content_is_rejected(tmp_path):
+    """A step may add. Painting over the triangle changes pixels — which is
+    what a naive "did something change?" check rewards."""
+    erase = (
+        "ax.add_patch(plt.Rectangle((-20, -20), 60, 60, color='white', zorder=9))\n"
+        "mark('X', np.array([0.0, 0.0]), color='black')\n"
+    )
+    _, checks = _check(tmp_path, DRAW_TRIANGLE, erase, DRAW_ANSWER)
+    assert checks["incremental_ok"] is False
+    assert any("erased" in p for p in checks["problems"])
+
+
+def test_a_legend_that_moves_is_not_erasure(tmp_path):
+    """Seen in a real generation: the last step added a labelled artist, the
+    `loc="best"` legend jumped corners, and 7% of the ink "vanished" with it."""
+    with_legend = DRAW_TRIANGLE + (
+        "ax.plot([-6, 7], [-9, 2], color='tab:purple', label='AC')\n"
+        "ax.legend(loc='upper right', fontsize=8)\n"
+    )
+    moved = DRAW_ANSWER + "ax.legend(loc='lower left', fontsize=8)\n"
+    _, checks = _check(tmp_path, with_legend, moved)
+    assert checks["problems"] == []
+    assert checks["incremental_ok"] is True
+
+
+def test_ink_loss_is_not_reported_when_the_view_grows(tmp_path):
+    """expand_view moves every pixel; that is not erasure."""
+    grow = "expand_view(np.array([40.0, 40.0]), margin=2.0)\nmark('Z', P['C'])\n"
+    _, checks = _check(tmp_path, DRAW_TRIANGLE, grow, DRAW_ANSWER)
+    assert checks["ink_losses"][1] is None
+    assert not any("erased" in p for p in checks["problems"])
+
+
+# ---------------------------------------------------------------------------
+# Answer checks
+# ---------------------------------------------------------------------------
+
+
+def test_missing_state_answer_is_rejected(tmp_path):
+    no_state = DRAW_ANSWER.replace("state['answer'] = O\n", "")
+    _, checks = _check(tmp_path, DRAW_TRIANGLE, no_state)
+    assert checks["code_answer_ok"] is False
+    assert any("state[" in p for p in checks["problems"])
+
+
+def test_code_that_computes_a_different_point_is_rejected(tmp_path):
+    """The regression this whole check exists for: right prose, wrong drawing.
+
+    A sign flip in the perpendicular direction puts the circumcenter at
+    (-2.46, 4.0) while `final_answer` still carries the golden value.
+    """
+    wrong = (
+        "mid_ab = (P['A'] + P['B']) / 2\n"
+        "d = P['B'] - P['A']\n"
+        "n = np.array([d[1], -d[0]], dtype=float)\n"
+        "O = mid_ab + (5.5 / 13.0) * n\n"
+        "mark('O', O, color='red')\n"
+        "state['answer'] = O\n"
+    )
+    _, checks = _check(tmp_path, DRAW_TRIANGLE, wrong)
+    assert checks["code_answer_ok"] is False
+    assert checks["drawn_ok"] is False
+    assert checks["answer_ok"] is True  # the prose alone would have passed
+
+
+def test_unchecked_signals_are_none_not_true(tmp_path):
+    """A sample that never ran must not report `drawn_ok=True`."""
+    _, checks = _check(tmp_path, "raise ValueError('boom')")
+    assert checks["code_answer_ok"] is None
+    assert checks["drawn_ok"] is None
+    assert checks["answer_ok"] is None
+    assert checks["incremental_ok"] is None
+    assert checks["problems"]
+
+
+def test_answer_matches_per_schema():
+    cfg = CFG
+    cls_row = {"schema_type": "classification", "answer": "DEF"}
+    assert answer_matches(cls_row, "DEF", cfg)[0]
+    assert answer_matches(cls_row, "def", cfg)[0]
+    assert not answer_matches(cls_row, "ABC", cfg)[0]
+
+    num_row = {"schema_type": "number", "answer": 17.5}
+    assert answer_matches(num_row, 17.5, cfg)[0]
+    assert answer_matches(num_row, 17.504, cfg)[0]
+    assert not answer_matches(num_row, 18.0, cfg)[0]
+    assert not answer_matches(num_row, "nope", cfg)[0]
+
+    assert answer_matches(POINT_ROW, {"x": 3.4615384615, "y": -7.0}, cfg)[0]
+    assert not answer_matches(POINT_ROW, {"x": 3.0, "y": -7.0}, cfg)[0]
+    assert not answer_matches(POINT_ROW, {"x": None, "y": -7.0}, cfg)[0]
+
+
+def test_literal_leak_flags_a_pasted_answer_but_not_given_coordinates():
+    pasted = [{"code": "O = np.array([3.4615384615384617, -7.0])"}]
+    assert literal_leak(POINT_ROW, pasted)
+    # one matching coordinate is not enough to accuse a step
+    assert not literal_leak(POINT_ROW, [{"code": "y = -7.0"}])
+    # numbers that come from the problem statement are fair game
+    assert not literal_leak(POINT_ROW, [{"code": "A = np.array([7, 2])"}])
+    num_row = {"schema_type": "number", "answer": 17.5, "question": "A=(-1, 0)."}
+    assert literal_leak(num_row, [{"code": "area = 17.5"}])
+    assert not literal_leak(num_row, [{"code": "area = 0.5 * b * h"}])
+
+
+# ---------------------------------------------------------------------------
+# Guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "ax.clear()",
+        "ax.cla()",
+        "plt.close(fig)",
+        "fig.savefig('/tmp/x.png')",
+        "fig.set_size_inches(7, 7)",  # different PNG size => uncomparable frames
+        "ax.set_xlim(0, 1)",  # zooming in hides earlier content
+        "del ax.lines[0]",
+        "getattr(ax, 'cla')()",
+        "ax.lines[0].set_visible(False)",
+        "import os",
+        "from subprocess import run",
+        "np.save('/tmp/x.npy', P['A'])",
+        "open('/tmp/x', 'w').write('hi')",
+        "__builtins__['open']('/tmp/x', 'w')",
+        "ax.plot([0, 1], [0, 1]",  # syntax error
+    ],
+)
+def test_guard_blocks(code):
+    assert guard.check(code), f"guard let through: {code}"
+
+
+@pytest.mark.parametrize("code", [DRAW_TRIANGLE, DRAW_ANSWER, "expand_view(P['A'])"])
+def test_guard_allows_normal_plotting(code):
+    assert guard.check(code) == []
+
+
+def test_guard_rejection_leaves_no_orphan_images(tmp_path):
+    """A blocked repair round must not leave the previous round's PNGs behind
+    pretending to belong to the record."""
+    exec_ok, _ = _check(tmp_path, DRAW_TRIANGLE, DRAW_ANSWER)
+    assert exec_ok.ok and list(tmp_path.glob("step_*.png"))
+    blocked = run_steps(
+        build_preamble(POINT_ROW, CFG),
+        [{"title": "t", "code": "ax.clear()"}],
+        tmp_path,
+        CFG,
+    )
+    assert not blocked.ok
+    assert list(tmp_path.glob("step_*.png")) == []
+
+
+# ---------------------------------------------------------------------------
+# Dataset / canvas plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_named_points_handles_every_shape_in_the_benchmark():
+    assert ds.named_points({"points": None}) == {}
+    assert list(ds.named_points({"points": [[1, 2], [3, 4]]})) == ["A", "B"]
+    assert list(ds.named_points({"points": {"P": [1, 2]}})) == ["P"]
+    poly = ds.named_points({"points": {"polygon": [[0, 0], [1, 0], [1, 1]]}})
+    assert poly["polygon"] == [[0, 0], [1, 0], [1, 1]]
+
+
+def test_view_box_includes_the_answer_point():
+    x0, x1, y0, y1 = view_box(POINT_ROW)
+    ax_, ay = POINT_ROW["answer"]["point"]
+    assert x0 < ax_ < x1 and y0 < ay < y1
+
+
+def test_preamble_binds_points_and_helpers():
+    src = build_preamble(POINT_ROW, CFG)
+    assert '"A": np.array([7' in src
+    assert "def expand_view" in src and "def mark" in src
+
+
+def test_select_rejects_ambiguous_and_malformed_selectors():
+    tasks = [
+        ds.Task("alpha", "a.jsonl", {"qid": 10}),
+        ds.Task("beta", "b.jsonl", {"qid": 10}),
+    ]
+    assert ds.select(tasks, "alpha:10").stem == "alpha"
+    with pytest.raises(KeyError, match="ambiguous"):
+        ds.select(tasks, "10")
+    with pytest.raises(KeyError, match="integer qid"):
+        ds.select(tasks, "alpha:x")
+    with pytest.raises(KeyError, match="no NoReGeo task"):
+        ds.select(tasks, "alpha:11")
+
+
+# ---------------------------------------------------------------------------
+# Bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_record_replaces_instead_of_appending(tmp_path):
+    """The sample directory is rewritten on every run; an append-only log would
+    leave old rows pointing at images that belong to a newer run."""
+    path = tmp_path / "records.jsonl"
+    upsert_record(path, {"task_id": "a:1", "config": "c", "steps": [1]})
+    upsert_record(path, {"task_id": "b:2", "config": "c", "steps": [1]})
+    upsert_record(path, {"task_id": "a:1", "config": "c", "steps": [1, 2]})
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["task_id"] for r in rows] == ["b:2", "a:1"]
+    assert rows[-1]["steps"] == [1, 2]
+    # a different arm keeps its own row for the same task
+    upsert_record(path, {"task_id": "a:1", "config": "other", "steps": []})
+    assert len(path.read_text().splitlines()) == 3
+
+
+def test_records_are_strict_json(tmp_path):
+    """NaN is valid for `json.dump` and invalid for jq, serde and pyarrow."""
+    _, checks = _check(tmp_path, DRAW_TRIANGLE, DRAW_ANSWER)
+    text = json.dumps(checks)
+    json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+
+
+def test_add_usage_sums_nested_counters():
+    total = {"completion_tokens": 5, "details": {"reasoning_tokens": 5}}
+    total = _add_usage(
+        total, {"completion_tokens": 7, "details": {"reasoning_tokens": 6}}
+    )
+    assert total["completion_tokens"] == 12
+    assert total["details"]["reasoning_tokens"] == 11

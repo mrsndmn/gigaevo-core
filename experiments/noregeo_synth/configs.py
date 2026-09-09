@@ -141,8 +141,17 @@ class GenConfig:
     draw_atol: float = 0.25
 
     # incrementality check: fraction of pixels a step must change w.r.t. the
-    # previous step's PNG for the step to count as "drew something new".
+    # previous frame for the step to count as "drew something new". Step 1 is
+    # compared against the rendered preamble, not against a blank image — grid
+    # and axes alone move ~3% of the pixels.
     min_pixel_delta: float = 1e-4
+    # ...and how much of the previously-drawn ink a step may erase. Only
+    # checked while the view box is unchanged, since expand_view legitimately
+    # moves every pixel; the slack covers a legend that jumps to a new corner.
+    max_ink_loss: float = 0.05
+    # Reject solutions that paste the golden answer into the code as a literal
+    # instead of deriving it. Only meaningful together with reveal_answer.
+    reject_pasted_answer: bool = True
 
     note: str = ""
 

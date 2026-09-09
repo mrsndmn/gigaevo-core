@@ -3,8 +3,7 @@
 For each benchmark task the model returns a JSON solution: N reasoning steps,
 each with a matplotlib fragment that adds that step's construction to a shared
 canvas. We execute the fragments in order (one PNG per step), then keep only
-samples where the code ran, every step changed the picture, and the final
-answer equals the benchmark's golden answer.
+samples that survive every check in `verify.py`.
 
 Usage (single-sample smoke run):
 
@@ -19,10 +18,11 @@ Everything about *what* is generated lives in `configs.py`.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+import dataclasses
 import json
 from pathlib import Path
 import random
+import re
 import shutil
 import sys
 import time
@@ -30,29 +30,22 @@ from typing import Any
 
 from . import dataset as ds
 from .canvas import build_preamble
-from .configs import (
-    CONFIGS_BY_NAME,
-    DEFAULT_CONFIG,
-    OUT_DIR,
-    SMOKE_TASK,
-    GenConfig,
-)
+from .configs import CONFIGS_BY_NAME, DEFAULT_CONFIG, OUT_DIR, SMOKE_TASK, GenConfig
 from .credentials import resolve
 from .execute import run_steps
 from .prompts import build_messages, repair_messages, response_schema
-from .verify import answer_matches, contact_sheet, pixel_deltas
+from .verify import answer_matches, compare_frames, contact_sheet, literal_leak
 
 
 def _client(cfg: GenConfig):
     from openai import OpenAI
 
-    creds = resolve()
-    base_url = cfg.base_url or creds.base_url
+    creds = resolve(expected_base_url=cfg.base_url)
     days = creds.expires_in_days
     if days is not None and days < 3:
         print(f"[warn] inference token expires in {days:.1f} days", file=sys.stderr)
     return OpenAI(
-        base_url=base_url, api_key=creds.api_key, timeout=cfg.request_timeout
+        base_url=cfg.base_url, api_key=creds.api_key, timeout=cfg.request_timeout
     ), creds
 
 
@@ -87,6 +80,21 @@ def _call(client, cfg: GenConfig, messages: list[dict], schema: dict):
     return json.loads(msg.content), thinking, usage
 
 
+def _add_usage(total: dict, extra: dict) -> dict:
+    """Sum token counters across repair rounds, nested dicts included."""
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict):
+            total[key] = _add_usage(
+                total.get(key) if isinstance(total.get(key), dict) else {}, value
+            )
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            base = total.get(key)
+            total[key] = (base if isinstance(base, (int, float)) else 0) + value
+        elif key not in total:
+            total[key] = value
+    return total
+
+
 def golden_point(row: dict[str, Any]) -> tuple[float, float] | None:
     """The benchmark's answer as an (x, y) pair, for point-schema tasks."""
     if row.get("schema_type") != "point":
@@ -102,7 +110,12 @@ def golden_point(row: dict[str, Any]) -> tuple[float, float] | None:
 def run_checks(
     row: dict[str, Any], solution: dict, exec_res, cfg: GenConfig
 ) -> dict[str, Any]:
-    """Every acceptance signal for one candidate solution, plus what failed."""
+    """Every acceptance signal for one candidate solution, plus what failed.
+
+    A signal that could not be evaluated (because nothing ran, or because the
+    task's answer schema does not support it) is None, never True: an unchecked
+    box must not read as a passed one.
+    """
     problems: list[str] = []
 
     if not exec_res.ok:
@@ -113,20 +126,43 @@ def run_checks(
             detail = f"Step {failed.index} code:\n```python\n{code}\n```\n\n{detail}"
         problems.append(f"The code did not run:\n{detail}")
 
-    images = [s.image for s in exec_res.steps if s.ok and s.image]
-    deltas = pixel_deltas(images) if images else []
-    dead = [i for i, d in enumerate(deltas, 1) if not d or d < cfg.min_pixel_delta]
-    if dead:
-        problems.append(
-            f"Step(s) {dead} drew nothing new — every step must add something "
-            "visible to the canvas."
-        )
+    step_frames = [s.frame for s in exec_res.steps if s.ok and s.image]
+    comparisons = (
+        compare_frames(step_frames, baseline=exec_res.base_frame) if step_frames else []
+    )
+    deltas = [c["delta"] for c in comparisons]
+    losses = [c["ink_loss"] for c in comparisons]
+
+    incremental_ok: bool | None = None
+    if exec_res.ok:
+        dead = [
+            i
+            for i, d in enumerate(deltas, 1)
+            if d is None or not (d >= cfg.min_pixel_delta)
+        ]
+        erased = [
+            i
+            for i, ink in enumerate(losses, 1)
+            if ink is not None and ink > cfg.max_ink_loss
+        ]
+        incremental_ok = not dead and not erased
+        if dead:
+            problems.append(
+                f"Step(s) {dead} drew nothing new (or changed the figure size) — "
+                "every step must add something visible to the shared canvas."
+            )
+        if erased:
+            problems.append(
+                f"Step(s) {erased} erased what earlier steps had drawn. Steps may "
+                "only add; do not hide, cover or delete existing content."
+            )
 
     ans_ok, ans_detail = answer_matches(row, solution.get("final_answer"), cfg)
     if exec_res.ok and not ans_ok:
         problems.append(f"`final_answer` is wrong: {ans_detail}.")
 
-    code_ok, code_detail = True, "not checked"
+    code_ok: bool | None = None
+    code_detail = "not checked (the code did not run)"
     if exec_res.ok:
         if exec_res.state_answer is None:
             code_ok = False
@@ -142,35 +178,46 @@ def run_checks(
                 "The prose and the drawing must agree with each other."
             )
 
-    drawn_ok, draw_dist = True, exec_res.answer_point_distance
+    # Known weakness: in 10 of the 900 point rows a *given* point lies within
+    # draw_atol of the golden one, so marking the givens satisfies this check
+    # without the answer ever being drawn. The state["answer"] check still has
+    # to pass for those, so nothing is accepted on the drawing alone.
+    drawn_ok: bool | None = None
+    draw_dist = exec_res.answer_point_distance
     if exec_res.ok and row.get("schema_type") == "point":
         drawn_ok = draw_dist is not None and draw_dist <= cfg.draw_atol
         if not drawn_ok:
             where = (
                 "no point is marked at all"
                 if draw_dist is None
-                else (f"the nearest marked point is {draw_dist:.3g} away")
+                else f"the nearest marked point is {draw_dist:.3g} away"
             )
             problems.append(
                 f"The answer is not drawn where it belongs: {where}. "
                 "Mark the answer point at its true coordinates."
             )
 
+    leaks = literal_leak(row, solution["steps"]) if cfg.reject_pasted_answer else []
+    if leaks and cfg.reject_pasted_answer:
+        problems.append(
+            "The answer is pasted into the code instead of computed: "
+            + "; ".join(leaks)
+            + ". Derive it from the constructions of the earlier steps."
+        )
+
     return {
         "deltas": deltas,
-        "incremental_ok": bool(deltas) and not dead,
-        "answer_ok": ans_ok,
+        "ink_losses": losses,
+        "incremental_ok": incremental_ok,
+        "answer_ok": ans_ok if exec_res.ok else None,
         "answer_detail": ans_detail,
         "code_answer_ok": code_ok,
         "code_answer_detail": code_detail,
         "drawn_ok": drawn_ok,
         "draw_distance": draw_dist,
+        "literal_leaks": leaks,
         "problems": problems,
     }
-
-
-def _feedback(solution: dict, exec_res, checks: dict) -> str:
-    return "\n\n".join(checks["problems"])
 
 
 def generate_one(
@@ -202,26 +249,27 @@ def generate_one(
 
     t0 = time.time()
     solution, thinking, usage = _call(client, cfg, messages, schema)
+    thinkings = [thinking]
     exec_res = run_steps(preamble, solution["steps"], sample_dir, cfg, target)
     checks = run_checks(row, solution, exec_res, cfg)
 
     rounds = 0
     while checks["problems"] and rounds < cfg.max_repair_rounds:
         rounds += 1
-        solution, thinking, usage2 = _call(
+        solution, thinking, usage_round = _call(
             client,
             cfg,
-            repair_messages(messages, solution, _feedback(solution, exec_res, checks)),
+            repair_messages(messages, solution, "\n\n".join(checks["problems"])),
             schema,
         )
-        for k, v in usage2.items():
-            if isinstance(v, (int, float)) and isinstance(usage.get(k), (int, float)):
-                usage[k] += v
+        thinkings.append(thinking)
+        usage = _add_usage(usage, usage_round)
         exec_res = run_steps(preamble, solution["steps"], sample_dir, cfg, target)
         checks = run_checks(row, solution, exec_res, cfg)
 
     images = [s.image for s in exec_res.steps if s.ok and s.image]
     deltas = checks["deltas"]
+    losses = checks["ink_losses"]
 
     steps_out = []
     for i, step in enumerate(solution["steps"], 1):
@@ -240,6 +288,7 @@ def generate_one(
                 "exec_ok": bool(res and res.ok),
                 "error": res.error if res else "not executed",
                 "pixel_delta": deltas[i - 1] if i - 1 < len(deltas) else None,
+                "ink_loss": losses[i - 1] if i - 1 < len(losses) else None,
             }
         )
 
@@ -289,16 +338,19 @@ def generate_one(
         "code_answer_detail": checks["code_answer_detail"],
         "drawn_ok": checks["drawn_ok"],
         "draw_distance": checks["draw_distance"],
+        "literal_leaks": checks["literal_leaks"],
         "exec_ok": exec_res.ok,
         "exec_error": exec_res.error,
         "incremental_ok": checks["incremental_ok"],
         "accepted": not checks["problems"],
         "problems": checks["problems"],
         "repair_rounds": rounds,
-        "thinking": thinking,
+        "thinking": thinkings[-1],
+        "thinking_rounds": thinkings,
         "usage": usage,
         "wall_time_s": round(time.time() - t0, 1),
         "preamble": "preamble.py",
+        "base_image": "canvas_base.png" if exec_res.base_frame else None,
         "reference_image": reference,
         "sample_dir": str(sample_dir),
     }
@@ -306,6 +358,72 @@ def generate_one(
         json.dumps(record, ensure_ascii=False, indent=2)
     )
     return record
+
+
+def upsert_record(records_path: Path, record: dict[str, Any]) -> None:
+    """Replace this task's row in records.jsonl instead of appending a copy.
+
+    The sample directory is rewritten from scratch on every generation, so an
+    append-only log would leave earlier rows pointing at images that belong to
+    a later run — a dataset whose reasoning and figures silently disagree.
+    """
+    records_path.parent.mkdir(parents=True, exist_ok=True)
+    kept: list[str] = []
+    if records_path.exists():
+        for line in records_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                other = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (other.get("task_id"), other.get("config")) != (
+                record["task_id"],
+                record["config"],
+            ):
+                kept.append(line)
+    kept.append(json.dumps(record, ensure_ascii=False))
+    tmp = records_path.with_suffix(".jsonl.tmp")
+    tmp.write_text("\n".join(kept) + "\n")
+    tmp.replace(records_path)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def _select_tasks(tasks: list[ds.Task], args) -> list[ds.Task]:
+    selected: list[ds.Task] = []
+    if args.n:
+        pool = [t for t in tasks if not args.stem or t.stem == args.stem]
+        if not pool:
+            stems = sorted({t.stem for t in tasks})
+            raise SystemExit(
+                f"--stem {args.stem!r} matches no task file. Available: "
+                + ", ".join(stems)
+            )
+        if args.n > len(pool):
+            print(
+                f"[warn] --n {args.n} exceeds the pool of {len(pool)}; "
+                f"generating {len(pool)}",
+                file=sys.stderr,
+            )
+        selected = random.Random(args.seed).sample(pool, min(args.n, len(pool)))
+    for spec in args.task or ([] if args.n else [SMOKE_TASK]):
+        selected.append(ds.select(tasks, spec))
+
+    seen: set[str] = set()
+    unique = []
+    for task in selected:
+        if task.task_id not in seen:
+            seen.add(task.task_id)
+            unique.append(task)
+    if len(unique) != len(selected):
+        print(
+            f"[warn] dropped {len(selected) - len(unique)} duplicate selector(s)",
+            file=sys.stderr,
+        )
+    return unique
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -326,21 +444,17 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     cfg = CONFIGS_BY_NAME[args.config]
-    overrides = {}
     if args.model:
-        overrides["model"] = args.model
+        # The model is part of the arm's identity: without renaming, two models
+        # would share one output directory and one records.jsonl.
+        cfg = dataclasses.replace(
+            cfg, model=args.model, name=f"{cfg.name}-{_slug(args.model)}"
+        )
     if args.no_reveal_answer:
-        overrides["reveal_answer"] = False
-    if overrides:
-        cfg = GenConfig(**{**asdict(cfg), **overrides})
+        cfg = dataclasses.replace(cfg, reveal_answer=False)
 
     tasks = ds.load_tasks()
-    selected: list[ds.Task] = []
-    if args.n:
-        pool = [t for t in tasks if not args.stem or t.stem == args.stem]
-        selected = random.Random(args.seed).sample(pool, min(args.n, len(pool)))
-    for spec in args.task or ([] if args.n else [SMOKE_TASK]):
-        selected.append(ds.select(tasks, spec))
+    selected = _select_tasks(tasks, args)
 
     client, creds = _client(cfg)
     print(
@@ -349,15 +463,18 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     records_path = args.out / cfg.name / "records.jsonl"
-    records_path.parent.mkdir(parents=True, exist_ok=True)
-    accepted = 0
+    accepted = failed = 0
     for task in selected:
-        rec = generate_one(task, cfg, args.out, client=client)
+        try:
+            rec = generate_one(task, cfg, args.out, client=client)
+        except Exception as exc:  # one bad completion must not kill the batch
+            failed += 1
+            print(f"  {task.task_id:34s} ERROR {type(exc).__name__}: {exc}")
+            continue
         accepted += rec["accepted"]
-        with records_path.open("a") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        upsert_record(records_path, rec)
         flags = " ".join(
-            f"{k}={'ok' if rec[k] else 'FAIL'}"
+            f"{k}={'ok' if rec[k] else 'n/a' if rec[k] is None else 'FAIL'}"
             for k in (
                 "exec_ok",
                 "incremental_ok",
@@ -366,12 +483,15 @@ def main(argv: list[str] | None = None) -> int:
                 "drawn_ok",
             )
         )
-        flags += f" [{rec['answer_detail']}]"
         print(
             f"  {task.task_id:34s} steps={len(rec['steps'])} "
-            f"repairs={rec['repair_rounds']} {flags} -> {rec['sample_dir']}"
+            f"repairs={rec['repair_rounds']} {flags} [{rec['answer_detail']}]"
         )
-    print(f"accepted {accepted}/{len(selected)} -> {records_path}")
+    print(
+        f"accepted {accepted}/{len(selected)}"
+        + (f", {failed} errored" if failed else "")
+        + f" -> {records_path}"
+    )
     return 0
 
 

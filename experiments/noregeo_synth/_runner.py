@@ -8,11 +8,18 @@ The whole point of a single process for the whole sequence is incrementality:
 the namespace (and therefore the figure) persists across steps, so step k's PNG
 contains everything steps 1..k-1 drew.
 
-Besides the images it reports two things the caller uses to decide whether the
-sample is honest: the value the code itself put in ``state["answer"]``, and how
-far the nearest *marked* point on the finished canvas is from the benchmark's
-golden point. A trace whose prose is right but whose drawing lands somewhere
-else is worse than no trace at all.
+Besides the images it reports what the caller needs to judge whether the sample
+is honest:
+
+* ``base_frame`` — the canvas with the preamble alone, so step 1 can be checked
+  for actually drawing something;
+* per-step ``view_box`` (data limits), ``axes_box`` and ``legend_box`` (pixel
+  rectangles), so the comparison can tell "the picture lost ink" from
+  "expand_view moved every pixel" and from "the legend jumped corners";
+* ``state_answer`` — what the code itself computed;
+* ``answer_point_distance`` — how far the nearest *marked* point is from the
+  benchmark's golden point. A trace whose prose is right but whose drawing
+  lands somewhere else is worse than no trace at all.
 """
 
 from __future__ import annotations
@@ -35,17 +42,71 @@ def _jsonable(value):
     return str(value)
 
 
-def _marked_points(ax):
-    """Points the code explicitly MARKED (scatter offsets + marked vertices).
+def _view_box(ax):
+    return [float(v) for v in (*ax.get_xlim(), *ax.get_ylim())]
 
-    Line vertices without a marker are deliberately excluded: a perpendicular
+
+def _axes_box_px(fig, ax):
+    """The axes rectangle in image pixels: [left, right, top, bottom].
+
+    Frames are compared inside this rectangle only. The per-step title lives
+    outside it, and it changes on every step ("Step 1.", "Step 2.", ...) — a
+    full-frame diff would therefore report a change for a step that drew
+    nothing at all, which is exactly the failure the diff exists to catch.
+    Call after `savefig`, when a renderer exists.
+    """
+    bbox = ax.get_window_extent()
+    height = fig.get_window_extent().height
+    return [
+        int(round(bbox.x0)),
+        int(round(bbox.x1)),
+        int(round(height - bbox.y1)),
+        int(round(height - bbox.y0)),
+    ]
+
+
+def _legend_box_px(fig, ax):
+    """The legend rectangle in image pixels, or None.
+
+    Excluded from frame comparison: with `loc="best"` the legend jumps to a new
+    corner whenever a step adds a labelled artist, which erases its own text
+    where it was and covers content where it lands. That is chrome moving, not
+    a step deleting a construction.
+    """
+    legend = ax.get_legend()
+    if legend is None:
+        return None
+    try:
+        bbox = legend.get_window_extent()
+        height = fig.get_window_extent().height
+    except Exception:
+        return None
+    pad = 2
+    return [
+        int(round(bbox.x0)) - pad,
+        int(round(bbox.x1)) + pad,
+        int(round(height - bbox.y1)) - pad,
+        int(round(height - bbox.y0)) + pad,
+    ]
+
+
+def _marked_points(ax):
+    """Points the code explicitly MARKED.
+
+    Scatter offsets (`PathCollection` only — a `fill_between` polygon or a
+    `LineCollection` reports a phantom offset at the origin), vertices of lines
+    that carry a marker, and the centres of circle/ellipse patches. Line
+    vertices without a marker are deliberately excluded: a perpendicular
     bisector passes through the circumcenter, so counting its sampled vertices
     would let a solution "hit" the answer without ever drawing it.
     """
+    from matplotlib.collections import PathCollection
     import numpy as np
 
     pts = []
     for coll in ax.collections:
+        if not isinstance(coll, PathCollection):
+            continue
         try:
             offsets = np.asarray(coll.get_offsets(), dtype=float)
         except Exception:
@@ -53,12 +114,18 @@ def _marked_points(ax):
         if offsets.size:
             pts.extend(offsets.reshape(-1, 2).tolist())
     for line in ax.lines:
-        marker = line.get_marker()
-        if marker in (None, "None", "", " "):
+        if line.get_marker() in (None, "None", "", " "):
             continue
         data = np.asarray(line.get_xydata(), dtype=float)
         if data.size:
             pts.extend(data.reshape(-1, 2).tolist())
+    for patch in ax.patches:
+        centre = getattr(patch, "center", None)
+        if centre is not None:
+            try:
+                pts.append([float(centre[0]), float(centre[1])])
+            except (TypeError, ValueError, IndexError):
+                pass
     return pts
 
 
@@ -77,7 +144,20 @@ def main() -> None:
         )
         return
 
-    results = []
+    fig, ax = ns["fig"], ns["ax"]
+    base_path = out_dir / "canvas_base.png"
+    fig.savefig(base_path, dpi=job["dpi"], facecolor="white")
+    payload = {
+        "preamble_error": None,
+        "base_frame": {
+            "image": str(base_path),
+            "view_box": _view_box(ax),
+            "axes_box": _axes_box_px(fig, ax),
+            "legend_box": _legend_box_px(fig, ax),
+        },
+        "steps": [],
+    }
+
     for i, step in enumerate(job["steps"], 1):
         rec = {"index": i, "ok": False, "image": None, "error": None}
         try:
@@ -90,15 +170,16 @@ def main() -> None:
             ns["fig"].savefig(path, dpi=job["dpi"], facecolor="white")
             rec["ok"] = True
             rec["image"] = str(path)
+            rec["view_box"] = _view_box(ns["ax"])
+            rec["axes_box"] = _axes_box_px(ns["fig"], ns["ax"])
+            rec["legend_box"] = _legend_box_px(ns["fig"], ns["ax"])
         except Exception:
             rec["error"] = traceback.format_exc(limit=4)
-        results.append(rec)
+        payload["steps"].append(rec)
         if not rec["ok"]:
             break
 
-    payload = {"preamble_error": None, "steps": results}
-
-    if results and all(r["ok"] for r in results):
+    if payload["steps"] and all(r["ok"] for r in payload["steps"]):
         state = ns.get("state", {})
         payload["state_answer"] = _jsonable(
             state.get("answer") if isinstance(state, dict) else None

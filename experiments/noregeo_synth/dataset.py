@@ -70,11 +70,18 @@ def load_tasks(files: tuple[str, ...] = TASK_FILES) -> list[Task]:
 
 def select(tasks: list[Task], spec: str) -> Task:
     """Resolve a "<stem>:<qid>" or bare "<qid>" selector to a single task."""
-    if ":" in spec:
-        stem, _, qid = spec.partition(":")
-        hits = [t for t in tasks if t.stem == stem and t.qid == int(qid)]
+    stem, _, qid_text = spec.partition(":") if ":" in spec else ("", "", spec)
+    try:
+        qid = int(qid_text)
+    except ValueError:
+        raise KeyError(
+            f"bad task selector {spec!r}: expected '<stem>:<qid>' or '<qid>' "
+            "with an integer qid"
+        ) from None
+    if stem:
+        hits = [t for t in tasks if t.stem == stem and t.qid == qid]
     else:
-        hits = [t for t in tasks if t.qid == int(spec)]
+        hits = [t for t in tasks if t.qid == qid]
     if not hits:
         raise KeyError(f"no NoReGeo task matches {spec!r}")
     if len(hits) > 1:
@@ -120,6 +127,36 @@ def _flatten_pairs(obj: Any, out: list[tuple[float, float]]) -> None:
     elif isinstance(obj, dict):
         for item in obj.values():
             _flatten_pairs(item, out)
+
+
+def given_numbers(row: dict[str, Any]) -> list[float]:
+    """Every number the task itself hands the solver.
+
+    Used to tell "the code retyped the golden answer" apart from "the code used
+    a coordinate it was given": the golden answer is deliberately NOT included.
+    """
+    import re
+
+    out: list[float] = []
+    _flatten_numbers(row.get("points"), out)
+    if row.get("choices"):
+        _flatten_numbers(row["choices"], out)
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", str(row.get("question", ""))):
+        out.append(float(m.group()))
+    return out
+
+
+def _flatten_numbers(obj: Any, out: list[float]) -> None:
+    if isinstance(obj, bool):
+        return
+    if isinstance(obj, (int, float)):
+        out.append(float(obj))
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _flatten_numbers(item, out)
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            _flatten_numbers(item, out)
 
 
 def coordinate_pairs(row: dict[str, Any]) -> list[tuple[float, float]]:
