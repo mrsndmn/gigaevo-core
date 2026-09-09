@@ -110,8 +110,14 @@ class GenConfig:
     # a 5-minute retry: the two stragglers in the 27-sample pilot took 683s and
     # 398s, against a 53s median.
     max_tokens: int = 6144
+    # Where a retry may escalate to when the completion was cut off because the
+    # solution genuinely did not fit, rather than because it degenerated.
+    max_tokens_ceiling: int = 16384
     seed: int | None = 1234  # vLLM honours this -> reproducible generations
-    request_timeout: float = 900.0
+    # A healthy call takes ~50-100 s and a degenerate one ends when it hits
+    # max_tokens, so 300 s is generous. It matters because a stalled call holds
+    # a worker (1/8 of a batch run's throughput) for its whole duration.
+    request_timeout: float = 300.0
 
     # Hidden chain-of-thought:
     #   "off"                 -> chat_template_kwargs={"enable_thinking": False}

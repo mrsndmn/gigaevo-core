@@ -42,6 +42,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default=DEFAULT_CONFIG, choices=list(CONFIGS_BY_NAME))
     ap.add_argument("--levels", default="1,4,8,16")
+    ap.add_argument(
+        "--waves",
+        type=int,
+        default=2,
+        help="requests per level = workers * waves (>=2 to reach steady state)",
+    )
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args(argv)
 
@@ -50,28 +56,35 @@ def main(argv: list[str] | None = None) -> int:
     tasks = ds.load_tasks()
     import random
 
-    pool = random.Random(args.seed).sample(tasks, sum(levels))
+    pool = random.Random(args.seed).sample(tasks, sum(levels) * args.waves)
     client, _ = _client(cfg)
 
-    print(f"model={cfg.model}")
+    print(f"model={cfg.model}, {args.waves} waves per level")
     print(
-        f"{'workers':>7} {'wall':>7} {'req/min':>8} {'lat p50':>8} {'lat max':>8} {'tok/s':>7} errors"
+        f"{'workers':>7} {'req/min':>8} {'lat p50':>8} {'lat p90':>8} "
+        f"{'tok/s':>7} {'wall':>7} errors"
     )
     cursor = 0
     for k in levels:
-        batch = pool[cursor : cursor + k]
-        cursor += k
+        count = k * args.waves
+        batch = pool[cursor : cursor + count]
+        cursor += count
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=k) as ex:
             results = list(ex.map(lambda t: _one(client, cfg, t), batch))
         wall = time.time() - t0
-        lat = [r[0] for r in results]
+        lat = sorted(r[0] for r in results)
         toks = sum(r[1] for r in results)
         errs = [r[2] for r in results if r[2]]
+        # Little's law: with k requests in flight and a mean service time of
+        # `mean(lat)`, steady-state throughput is k / mean(lat). Dividing the
+        # batch size by its makespan instead would measure E[max latency] over
+        # a heavy tail, which falls as k grows even at constant throughput.
+        thr = k / st.mean(lat) * 60
         print(
-            f"{k:>7} {wall:>6.1f}s {k / wall * 60:>8.1f} {st.median(lat):>7.1f}s "
-            f"{max(lat):>7.1f}s {toks / wall:>7.1f} {len(errs)}"
-            + (f"  {errs[0]}" if errs else "")
+            f"{k:>7} {thr:>8.1f} {lat[len(lat) // 2]:>7.1f}s "
+            f"{lat[int(0.9 * (len(lat) - 1))]:>7.1f}s {toks / wall:>7.1f} "
+            f"{wall:>6.1f}s {len(errs)}" + (f"  {errs[0]}" if errs else "")
         )
     return 0
 

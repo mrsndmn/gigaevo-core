@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
+import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -45,6 +47,8 @@ from .execute import run_steps
 from .prompts import build_messages, repair_messages, response_schema
 from .verify import answer_matches, compare_frames, contact_sheet, literal_leak
 
+HEARTBEAT_SECONDS = 300.0
+
 
 def _client(cfg: GenConfig):
     from openai import OpenAI
@@ -53,31 +57,66 @@ def _client(cfg: GenConfig):
     days = creds.expires_in_days
     if days is not None and days < 3:
         print(f"[warn] inference token expires in {days:.1f} days", file=sys.stderr)
+    # max_retries=1: the SDK's default of 2 composes with our own retry loop and
+    # with the repair rounds, so one sample could pin a worker for hours.
     return OpenAI(
-        base_url=cfg.base_url, api_key=creds.api_key, timeout=cfg.request_timeout
+        base_url=cfg.base_url,
+        api_key=creds.api_key,
+        timeout=cfg.request_timeout,
+        max_retries=1,
     ), creds
 
 
-def _call(client, cfg: GenConfig, messages: list[dict], schema: dict):
+def _seed_for(cfg: GenConfig, salt: str, attempt: int) -> int | None:
+    """Deterministic per-task seed.
+
+    Derived from the task id rather than being one global constant, so that a
+    resumed run does not replay the exact seed sequence that already failed —
+    the whole premise of re-rolling is that the same seed reproduces the same
+    degenerate sample.
+    """
+    if cfg.seed is None:
+        return None
+    digest = int(hashlib.sha1(salt.encode()).hexdigest()[:8], 16)
+    return (cfg.seed + digest + 7919 * attempt) % (2**31 - 1)
+
+
+def _call(
+    client,
+    cfg: GenConfig,
+    messages: list[dict],
+    schema: dict,
+    salt: str = "",
+):
     """One completion, retried while it comes back unusable.
 
-    An unusable completion is empty content (all the budget went into hidden
-    thinking) or unparseable JSON (the sampler degenerated into whitespace and
-    hit the token cap). Both are properties of *that* sample, so the retry
-    re-rolls the seed instead of asking for the same one again.
+    Unusable means empty content (all the budget went into hidden thinking) or
+    unparseable JSON. Both normally end with `finish_reason="length"`, but for
+    two different reasons that need two different retries: the sampler
+    degenerating into whitespace (re-roll the seed — a bigger budget just burns
+    more), or a solution that genuinely did not fit (raise the budget — a new
+    seed will not make it shorter). So the first retry re-rolls, and later ones
+    also escalate `max_tokens` up to `max_tokens_ceiling`.
+
+    Tokens spent on the failed attempts are returned too: they are most of the
+    cost of exactly the samples the retry exists for, and dropping them would
+    make the records under-report spend.
     """
     last: Exception | None = None
+    spent: dict[str, Any] = {}
+    budget = cfg.max_tokens
     for attempt in range(cfg.call_retries + 1):
         kwargs: dict[str, Any] = dict(
             model=cfg.model,
             messages=messages,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
-            max_tokens=cfg.max_tokens,
+            max_tokens=budget,
             response_format={"type": "json_schema", "json_schema": schema},
         )
-        if cfg.seed is not None:
-            kwargs["seed"] = cfg.seed + 1000 * attempt
+        seed = _seed_for(cfg, salt, attempt)
+        if seed is not None:
+            kwargs["seed"] = seed
         if cfg.thinking == "off":
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         elif cfg.thinking:
@@ -96,17 +135,21 @@ def _call(client, cfg: GenConfig, messages: list[dict], schema: dict):
                     f"empty completion (finish_reason={choice.finish_reason}, "
                     f"thinking chars={len(thinking or '')})"
                 )
-            return json.loads(msg.content), thinking, usage
+            return json.loads(msg.content), thinking, _add_usage(spent, usage)
         except (RuntimeError, json.JSONDecodeError) as exc:
             last = exc
+            _add_usage(spent, usage)
             print(
                 f"[warn] unusable completion (attempt {attempt + 1}/"
                 f"{cfg.call_retries + 1}, {len(msg.content or '')} chars, "
-                f"finish={choice.finish_reason}): {exc}",
+                f"finish={choice.finish_reason}, budget={budget}): {exc}",
                 file=sys.stderr,
             )
+            if choice.finish_reason == "length" and attempt >= 1:
+                budget = min(budget * 2, cfg.max_tokens_ceiling)
     raise RuntimeError(
-        f"no usable completion after {cfg.call_retries + 1} attempts: {last}"
+        f"no usable completion after {cfg.call_retries + 1} attempts "
+        f"(last budget {budget}): {last}"
     )
 
 
@@ -278,7 +321,7 @@ def generate_one(
     target = golden_point(row)
 
     t0 = time.time()
-    solution, thinking, usage = _call(client, cfg, messages, schema)
+    solution, thinking, usage = _call(client, cfg, messages, schema, salt=task.task_id)
     thinkings = [thinking]
     exec_res = run_steps(preamble, solution["steps"], sample_dir, cfg, target)
     checks = run_checks(row, solution, exec_res, cfg)
@@ -291,6 +334,7 @@ def generate_one(
             cfg,
             repair_messages(messages, solution, "\n\n".join(checks["problems"])),
             schema,
+            salt=f"{task.task_id}#repair{rounds}",
         )
         thinkings.append(thinking)
         usage = _add_usage(usage, usage_round)
@@ -390,49 +434,127 @@ def generate_one(
     return record
 
 
-def upsert_record(records_path: Path, record: dict[str, Any]) -> None:
-    """Replace this task's row in records.jsonl instead of appending a copy.
-
-    The sample directory is rewritten from scratch on every generation, so an
-    append-only log would leave earlier rows pointing at images that belong to
-    a later run — a dataset whose reasoning and figures silently disagree.
-    """
-    records_path.parent.mkdir(parents=True, exist_ok=True)
-    kept: list[str] = []
+def read_records(records_path: Path) -> list[dict[str, Any]]:
+    rows = []
     if records_path.exists():
         for line in records_path.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                other = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if (other.get("task_id"), other.get("config")) != (
-                record["task_id"],
-                record["config"],
-            ):
-                kept.append(line)
-    kept.append(json.dumps(record, ensure_ascii=False))
-    tmp = records_path.with_suffix(".jsonl.tmp")
-    tmp.write_text("\n".join(kept) + "\n")
-    tmp.replace(records_path)
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return rows
+
+
+class RecordStore:
+    """`records.jsonl` as a keyed store: one row per (task_id, config).
+
+    Keyed rather than append-only because the sample directory is rewritten
+    from scratch on every generation — an append log leaves earlier rows
+    pointing at images that belong to a later run, i.e. a dataset whose
+    reasoning and figures silently disagree.
+
+    Rows are held in memory and the file is rewritten at most every
+    `flush_interval` seconds. Rewriting per sample is O(n^2): measured on this
+    NFS mount, a 2700-sample run would spend ~8 minutes inside the write lock
+    and ~26 GB of write traffic on it. Each sample also keeps its own
+    `record.json`, so a crash between flushes loses bookkeeping, not data.
+    """
+
+    def __init__(self, path: Path, flush_interval: float = 10.0) -> None:
+        self.path = path
+        self.flush_interval = flush_interval
+        self.lock = threading.Lock()
+        self.rows: dict[tuple[str, str], dict[str, Any]] = {
+            (r.get("task_id"), r.get("config")): r for r in read_records(path)
+        }
+        self._last_flush = time.time()
+
+    def add(self, record: dict[str, Any]) -> None:
+        with self.lock:
+            self.rows[(record["task_id"], record["config"])] = record
+            if time.time() - self._last_flush >= self.flush_interval:
+                self._flush()
+
+    def close(self) -> None:
+        with self.lock:
+            self._flush()
+
+    def _flush(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique tmp name: two runs writing the same --out must not clobber
+        # each other's half-written file.
+        tmp = self.path.with_suffix(f".jsonl.tmp{os.getpid()}")
+        tmp.write_text(
+            "".join(
+                json.dumps(r, ensure_ascii=False) + "\n" for r in self.rows.values()
+            )
+        )
+        tmp.replace(self.path)
+        self._last_flush = time.time()
+
+
+def upsert_record(records_path: Path, record: dict[str, Any]) -> None:
+    """Single-record convenience wrapper around `RecordStore`."""
+    store = RecordStore(records_path, flush_interval=0.0)
+    store.add(record)
+    store.close()
+
+
+def failure_record(
+    task: ds.Task, cfg: GenConfig, out_root: Path, exc: Exception
+) -> dict:
+    """A row for a sample that never produced a solution.
+
+    Without this, a failure after `generate_one` has already wiped the sample
+    directory leaves the *previous* run's `accepted: true` row in place,
+    pointing at PNGs that no longer exist — and `--resume` then skips the task
+    forever.
+    """
+    row = task.row
+    return {
+        "task_id": task.task_id,
+        "qid": task.qid,
+        "source_file": task.file,
+        "category": row.get("category"),
+        "difficulty": row.get("difficulty"),
+        "schema_type": row.get("schema_type"),
+        "question": row.get("question"),
+        "golden_answer": row.get("answer"),
+        "config": cfg.name,
+        "model": cfg.model,
+        "steps": [],
+        "accepted": False,
+        "exec_ok": False,
+        "problems": [f"generation failed: {type(exc).__name__}: {exc}"],
+        "error": f"{type(exc).__name__}: {exc}",
+        "sample_dir": str(out_root / cfg.name / f"{task.stem}_{task.qid}"),
+    }
+
+
+def _artifacts_present(row: dict[str, Any]) -> bool:
+    """Does this row's sample directory still hold what the row claims?"""
+    sample_dir = Path(row.get("sample_dir") or "")
+    if not (sample_dir / "record.json").exists():
+        return False
+    return all(
+        (sample_dir / step["image"]).exists()
+        for step in row.get("steps", [])
+        if step.get("image")
+    )
 
 
 def accepted_task_ids(records_path: Path) -> set[str]:
-    """Tasks already generated and accepted, for `--resume` on a long run."""
-    done: set[str] = set()
-    if not records_path.exists():
-        return done
-    for line in records_path.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if row.get("accepted"):
-            done.add(row.get("task_id"))
-    return done
+    """Tasks already generated, accepted, and still present on disk.
+
+    The on-disk check is what makes `--resume` safe: a row whose images were
+    wiped by a later interrupted attempt has to be regenerated, not skipped.
+    """
+    return {
+        row["task_id"]
+        for row in read_records(records_path)
+        if row.get("accepted") and _artifacts_present(row)
+    }
 
 
 def _slug(text: str) -> str:
@@ -566,18 +688,44 @@ def main(argv: list[str] | None = None) -> int:
         f"samples={len(selected)} workers={workers}"
     )
 
+    store = RecordStore(records_path)
     lock = threading.Lock()
     started = time.time()
     counters = {"done": 0, "accepted": 0, "failed": 0}
+    in_flight: dict[str, float] = {}
+
+    def report(task: ds.Task, rec: dict, note: str) -> None:
+        with lock:
+            store.add(rec)
+            in_flight.pop(task.task_id, None)
+            counters["done"] += 1
+            counters["accepted"] += bool(rec.get("accepted"))
+            counters["failed"] += not rec.get("accepted")
+            done, total = counters["done"], len(selected)
+            # An ETA from fewer completions than there are workers is noise:
+            # the first finisher makes it look like the batch is serial.
+            eta = (
+                f" eta={(total - done) * (time.time() - started) / done / 60:.0f}m"
+                if done >= workers
+                else ""
+            )
+            print(
+                f"[{done}/{total} acc={counters['accepted']}{eta}] "
+                f"{task.task_id:34s} {note}",
+                flush=True,
+            )
 
     def work(task: ds.Task) -> None:
+        with lock:
+            in_flight[task.task_id] = time.time()
         try:
             rec = generate_one(task, cfg, args.out, client=client)
         except Exception as exc:  # one bad completion must not kill the batch
-            with lock:
-                counters["failed"] += 1
-                counters["done"] += 1
-                print(f"  {task.task_id:34s} ERROR {type(exc).__name__}: {exc}")
+            report(
+                task,
+                failure_record(task, cfg, args.out, exc),
+                f"ERROR {type(exc).__name__}: {exc}",
+            )
             return
         flags = " ".join(
             f"{k}={'ok' if rec[k] else 'n/a' if rec[k] is None else 'FAIL'}"
@@ -589,28 +737,42 @@ def main(argv: list[str] | None = None) -> int:
                 "drawn_ok",
             )
         )
-        with lock:
-            # records.jsonl is rewritten in place, so only one writer at a time.
-            upsert_record(records_path, rec)
-            counters["done"] += 1
-            counters["accepted"] += rec["accepted"]
-            done, total = counters["done"], len(selected)
-            rate = (time.time() - started) / max(done, 1)
-            eta = (total - done) * rate / 60
-            print(
-                f"[{done}/{total} acc={counters['accepted']} eta={eta:.0f}m] "
-                f"{task.task_id:34s} steps={len(rec['steps'])} "
-                f"repairs={rec['repair_rounds']} {flags}",
-                flush=True,
-            )
+        report(
+            task,
+            rec,
+            f"steps={len(rec['steps'])} repairs={rec['repair_rounds']} {flags}",
+        )
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(work, selected))
+    def heartbeat() -> None:
+        """Something to look at in the log while a slow sample is in flight."""
+        while not finished.wait(HEARTBEAT_SECONDS):
+            with lock:
+                stuck = sorted(
+                    ((time.time() - t0, tid) for tid, t0 in in_flight.items()),
+                    reverse=True,
+                )
+            if stuck:
+                oldest = ", ".join(f"{tid} ({age / 60:.1f}m)" for age, tid in stuck[:3])
+                print(
+                    f"[heartbeat {counters['done']}/{len(selected)}] "
+                    f"{len(stuck)} in flight, oldest: {oldest}",
+                    flush=True,
+                )
+
+    finished = threading.Event()
+    beat = threading.Thread(target=heartbeat, daemon=True)
+    beat.start()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(work, selected))
+    finally:
+        finished.set()
+        store.close()
 
     elapsed = (time.time() - started) / 60
     print(
         f"accepted {counters['accepted']}/{len(selected)}"
-        + (f", {counters['failed']} errored" if counters["failed"] else "")
+        + (f", {counters['failed']} not accepted" if counters["failed"] else "")
         + f" in {elapsed:.1f} min -> {records_path}"
     )
     return 0

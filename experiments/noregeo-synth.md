@@ -98,18 +98,22 @@ Two findings about the endpoint that shape the config:
 
 ### Throughput
 
-`probe_concurrency.py` measures the endpoint with real prompts. Measured
-2026-09-09 on `Qwen3.8-27B`:
+`probe_concurrency.py` measures the endpoint with real prompts, two waves per
+level, and reports steady-state throughput as `workers / mean_latency`
+(Little's law). Dividing a single batch by its makespan — the first version of
+this probe — measures `E[max latency]` over a heavy tail instead, which falls
+as concurrency rises even at constant throughput; it made 16 workers look 2×
+*worse* than 8 on the strength of one degenerate request. Measured 2026-09-09
+on `Qwen3.8-27B`:
 
-| workers | req/min | latency p50 | note |
-|---|---|---|---|
-| 1 | 0.6 | 101 s | |
-| 4 | 3.9 | 44 s | |
-| 8 | **5.8** | 51 s | the knee — `DEFAULT_WORKERS` |
-| 16 | 3.0 | 54 s | one request degenerated: 117k chars, 322 s |
+| workers | req/min | latency p50 | latency p90 | tok/s |
+|---|---|---|---|---|
+| 8 | 7.7 | 50 s | 88 s | 159 |
+| 16 | 10.3 | 69 s | 220 s | 259 |
 
-The server batches, so latency barely moves while throughput multiplies; past 8
-the returns are small enough that crowding a shared server is not worth it.
+Doubling the workers buys +34% throughput for +38% median and 2.5× p90 latency:
+the server is already batching us at 8. `DEFAULT_WORKERS = 8` is that knee, and
+the shared-server etiquette argument points the same way.
 
 Stratified pilot (one task from each of the 27 files, 8 workers): **27/27
 accepted**, 12.2 min, 53 s median per sample, 4.1 steps on average, 430 KB of

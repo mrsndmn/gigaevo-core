@@ -271,15 +271,20 @@ def contact_sheet(
     out_path: Path,
     suptitle: str = "",
 ) -> Path:
-    """Montage of the per-step PNGs, for eyeballing a sample at a glance."""
+    """Montage of the per-step PNGs, for eyeballing a sample at a glance.
+
+    Built on a bare `Figure`, not `pyplot`: batch runs call this from N worker
+    threads, and pyplot's figure registry is global and unsynchronised
+    (`RuntimeError: OrderedDict mutated during iteration` under load).
+    """
+    from matplotlib.figure import Figure
     import matplotlib.image as mpimg
-    import matplotlib.pyplot as plt
 
     n = len(images)
     cols = min(3, n) or 1
     rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(5.2 * cols, 5.0 * rows))
-    axes = np.atleast_1d(axes).ravel()
+    fig = Figure(figsize=(5.2 * cols, 5.0 * rows))
+    axes = np.atleast_1d(np.asarray(fig.subplots(rows, cols))).ravel()
     for ax, img, title in zip(axes, images, titles):
         ax.imshow(mpimg.imread(str(img)))
         ax.set_title(title, fontsize=10)
@@ -291,5 +296,4 @@ def contact_sheet(
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=110, facecolor="white")
-    plt.close(fig)
     return out_path

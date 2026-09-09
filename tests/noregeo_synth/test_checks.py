@@ -23,7 +23,13 @@ from experiments.noregeo_synth.canvas import build_preamble, view_box
 from experiments.noregeo_synth.configs import CONFIGS_BY_NAME
 from experiments.noregeo_synth.execute import run_steps
 from experiments.noregeo_synth.generate import (
+    RecordStore,
     _add_usage,
+    _call,
+    _seed_for,
+    _stratified,
+    accepted_task_ids,
+    failure_record,
     golden_point,
     run_checks,
     upsert_record,
@@ -309,11 +315,148 @@ def test_upsert_record_replaces_instead_of_appending(tmp_path):
     upsert_record(path, {"task_id": "b:2", "config": "c", "steps": [1]})
     upsert_record(path, {"task_id": "a:1", "config": "c", "steps": [1, 2]})
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    assert [r["task_id"] for r in rows] == ["b:2", "a:1"]
-    assert rows[-1]["steps"] == [1, 2]
+    assert [r["task_id"] for r in rows] == ["a:1", "b:2"]
+    assert rows[0]["steps"] == [1, 2]
     # a different arm keeps its own row for the same task
     upsert_record(path, {"task_id": "a:1", "config": "other", "steps": []})
     assert len(path.read_text().splitlines()) == 3
+
+
+def test_record_store_batches_writes_and_survives_close(tmp_path):
+    path = tmp_path / "records.jsonl"
+    store = RecordStore(path, flush_interval=3600)  # never flush on its own
+    store.add({"task_id": "a:1", "config": "c", "steps": []})
+    assert not path.exists()  # batched, not written per record
+    store.close()
+    assert len(path.read_text().splitlines()) == 1
+    # a second store picks the existing rows up instead of truncating them
+    RecordStore(path, flush_interval=0).add({"task_id": "b:2", "config": "c"})
+    assert len(path.read_text().splitlines()) == 2
+
+
+# ---------------------------------------------------------------------------
+# Batch-run bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def _fake_task(stem="alpha", qid=1, category="Cat A"):
+    return ds.Task(stem, f"{stem}.jsonl", {"qid": qid, "category": category})
+
+
+def test_resume_ignores_rows_whose_images_are_gone(tmp_path):
+    """A run killed mid-sample wipes the directory but leaves the old accepted
+    row behind; resuming must regenerate it, not skip it forever."""
+    path = tmp_path / "records.jsonl"
+    sample = tmp_path / "alpha_1"
+    sample.mkdir()
+    (sample / "record.json").write_text("{}")
+    (sample / "step_01.png").write_bytes(b"x")
+    row = {
+        "task_id": "alpha:1",
+        "config": "c",
+        "accepted": True,
+        "steps": [{"image": "step_01.png"}],
+        "sample_dir": str(sample),
+    }
+    upsert_record(path, row)
+    assert accepted_task_ids(path) == {"alpha:1"}
+
+    (sample / "step_01.png").unlink()  # the interrupted rerun wiped it
+    assert accepted_task_ids(path) == set()
+
+
+def test_failure_record_is_written_for_a_sample_that_never_ran(tmp_path):
+    rec = failure_record(_fake_task(), CFG, tmp_path, RuntimeError("boom"))
+    assert rec["accepted"] is False
+    assert rec["steps"] == []
+    assert "boom" in rec["problems"][0]
+    # and it is enough to keep --resume honest
+    path = tmp_path / "records.jsonl"
+    upsert_record(path, rec)
+    assert accepted_task_ids(path) == set()
+
+
+def test_stratified_takes_from_every_group_and_is_deterministic():
+    tasks = [_fake_task("alpha", q, "Cat A") for q in range(10)] + [
+        _fake_task("beta", q, "Cat B") for q in range(10)
+    ]
+    picked = _stratified(tasks, lambda t: t.stem, 3, seed=0)
+    assert len(picked) == 6
+    assert {t.stem for t in picked} == {"alpha", "beta"}
+    assert [t.task_id for t in picked] == [
+        t.task_id for t in _stratified(tasks, lambda t: t.stem, 3, seed=0)
+    ]
+    # asking for more than a group holds takes the whole group, not an error
+    assert len(_stratified(tasks, lambda t: t.stem, 50, seed=0)) == 20
+
+
+def test_seed_is_per_task_so_a_resume_does_not_replay_the_same_roll():
+    a0 = _seed_for(CFG, "alpha:1", 0)
+    b0 = _seed_for(CFG, "beta:2", 0)
+    a1 = _seed_for(CFG, "alpha:1", 1)
+    assert a0 != b0, "different tasks must not share one seed"
+    assert a0 != a1, "a retry must re-roll"
+    assert a0 == _seed_for(CFG, "alpha:1", 0), "same task must be reproducible"
+
+
+class _FakeChoice:
+    def __init__(self, content, finish_reason="stop"):
+        self.message = type("M", (), {"content": content, "reasoning": None})()
+        self.finish_reason = finish_reason
+
+
+class _FakeClient:
+    """Returns the queued responses in order, recording the request kwargs."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+        outer = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                outer.calls.append(kwargs)
+                content, finish = outer.responses.pop(0)
+                return type(
+                    "R",
+                    (),
+                    {
+                        "choices": [_FakeChoice(content, finish)],
+                        "usage": type(
+                            "U",
+                            (),
+                            {"model_dump": lambda self: {"completion_tokens": 100}},
+                        )(),
+                    },
+                )()
+
+        self.chat = type("C", (), {"completions": _Completions()})()
+
+
+def test_call_retry_escalates_the_budget_and_bills_failed_attempts():
+    """Truncation has two causes: a degenerate sampler (re-roll) and a solution
+    that did not fit (raise the cap). The retry has to try both."""
+    client = _FakeClient(
+        [
+            ("{'broken", "length"),
+            ("{'broken", "length"),
+            ('{"ok": 1}', "stop"),
+        ]
+    )
+    solution, _, usage = _call(client, CFG, [{"role": "user", "content": "x"}], {}, "t")
+    assert solution == {"ok": 1}
+    budgets = [c["max_tokens"] for c in client.calls]
+    assert budgets == [CFG.max_tokens, CFG.max_tokens, CFG.max_tokens * 2]
+    seeds = [c["seed"] for c in client.calls]
+    assert len(set(seeds)) == 3, "every attempt must use a fresh seed"
+    assert usage["completion_tokens"] == 300, "failed attempts cost tokens too"
+
+
+def test_call_gives_up_and_raises_after_the_configured_retries():
+    client = _FakeClient([("{'broken", "length")] * (CFG.call_retries + 1))
+    with pytest.raises(RuntimeError, match="no usable completion"):
+        _call(client, CFG, [{"role": "user", "content": "x"}], {}, "t")
+    assert len(client.calls) == CFG.call_retries + 1
 
 
 def test_records_are_strict_json(tmp_path):
