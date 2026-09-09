@@ -452,6 +452,25 @@ def test_call_retry_escalates_the_budget_and_bills_failed_attempts():
     assert usage["completion_tokens"] == 300, "failed attempts cost tokens too"
 
 
+def test_call_retries_a_transport_failure(monkeypatch):
+    """A gateway hiccup makes the SDK raise before we ever see a message; the
+    full 2700-sample run lost a sample to exactly this."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    client = _FakeClient([('{"ok": 1}', "stop")])
+    original = client.chat.completions.create
+
+    def flaky(**kwargs):
+        if not client.calls:
+            client.calls.append(kwargs)
+            raise json.JSONDecodeError("Expecting value", "", 0)
+        return original(**kwargs)
+
+    client.chat.completions.create = flaky
+    solution, _, _ = _call(client, CFG, [{"role": "user", "content": "x"}], {}, "t")
+    assert solution == {"ok": 1}
+    assert len(client.calls) == 2
+
+
 def test_call_gives_up_and_raises_after_the_configured_retries():
     client = _FakeClient([("{'broken", "length")] * (CFG.call_retries + 1))
     with pytest.raises(RuntimeError, match="no usable completion"):

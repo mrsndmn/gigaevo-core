@@ -122,7 +122,22 @@ def _call(
         elif cfg.thinking:
             kwargs["extra_body"] = {"reasoning_effort": cfg.thinking}
 
-        resp = client.chat.completions.create(**kwargs)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # Transport-level failures land here, not in the parsing branch
+            # below: a gateway hiccup makes the SDK itself raise (seen in the
+            # full run as `JSONDecodeError: line 1 column 1 (char 0)` — a
+            # non-JSON HTTP body). Treat it as a retryable attempt rather than
+            # losing the sample.
+            last = exc
+            print(
+                f"[warn] request failed (attempt {attempt + 1}/"
+                f"{cfg.call_retries + 1}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(min(2**attempt, 8))
+            continue
         choice = resp.choices[0]
         msg = choice.message
         thinking = getattr(msg, "reasoning", None) or getattr(
