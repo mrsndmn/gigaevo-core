@@ -96,6 +96,28 @@ Two findings about the endpoint that shape the config:
   unparseable). `reasoning_effort="low"` is the setting that produces clean
   JSON, and it is the default in `configs.py` for that reason.
 
+### Throughput
+
+`probe_concurrency.py` measures the endpoint with real prompts. Measured
+2026-09-09 on `Qwen3.8-27B`:
+
+| workers | req/min | latency p50 | note |
+|---|---|---|---|
+| 1 | 0.6 | 101 s | |
+| 4 | 3.9 | 44 s | |
+| 8 | **5.8** | 51 s | the knee — `DEFAULT_WORKERS` |
+| 16 | 3.0 | 54 s | one request degenerated: 117k chars, 322 s |
+
+The server batches, so latency barely moves while throughput multiplies; past 8
+the returns are small enough that crowding a shared server is not worth it.
+
+Stratified pilot (one task from each of the 27 files, 8 workers): **27/27
+accepted**, 12.2 min, 53 s median per sample, 4.1 steps on average, 430 KB of
+artifacts per sample. Two samples cost 683 s and 398 s because they hit the
+whitespace degeneration and had to be re-rolled — which is why `max_tokens` is
+capped at 6144 (a good solution needs ~1.8k) and `call_retries` re-rolls the
+seed rather than repeating it.
+
 ## Conclusions
 
 The loop works end to end and the drawing-level check earns its place on

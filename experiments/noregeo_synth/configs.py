@@ -85,6 +85,14 @@ DEFAULT_BASE_URL = "https://inference.airi.net/v1"
 #   BAAI/bge-m3                        8k     (embeddings)
 
 
+# Concurrent samples in flight during a batch run. The endpoint is a shared
+# vLLM server that batches requests, so throughput keeps climbing well past the
+# point where a single request slows down; the ceiling is politeness towards
+# other users of the server, not our own efficiency. Measured with
+# `python -m experiments.noregeo_synth.probe_concurrency` — see the plan doc.
+DEFAULT_WORKERS = 8
+
+
 @dataclass(frozen=True)
 class GenConfig:
     """One generation arm: a model plus the knobs that shape the output."""
@@ -96,7 +104,12 @@ class GenConfig:
     # sampling
     temperature: float = 0.3
     top_p: float = 0.9
-    max_tokens: int = 12288
+    # A well-formed solution costs ~1.8k completion tokens (3.6k for the worst
+    # of 27 measured). The cap is what a *degenerate* generation costs before
+    # it gives up, so keeping it tight is the difference between a 1-minute and
+    # a 5-minute retry: the two stragglers in the 27-sample pilot took 683s and
+    # 398s, against a 53s median.
+    max_tokens: int = 6144
     seed: int | None = 1234  # vLLM honours this -> reproducible generations
     request_timeout: float = 900.0
 
@@ -115,6 +128,13 @@ class GenConfig:
     #       (23k chars, 828 newline runs) but pollutes the code formatting;
     #   "low": 1818 completion tokens, clean JSON, 4 well-formed steps, ~45s.
     thinking: str | None = "low"
+
+    # Retries for a completion that comes back unusable — truncated JSON, or
+    # the whitespace degeneration this endpoint shows a few percent of the
+    # time (one request in a 16-wide probe emitted 117k characters of newlines
+    # and burned the whole token budget). The retry re-rolls the seed, since
+    # repeating the same one reproduces the same degenerate sample.
+    call_retries: int = 2
 
     # solution shape
     min_steps: int = 3

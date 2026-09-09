@@ -18,6 +18,7 @@ Everything about *what* is generated lives in `configs.py`.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import json
 from pathlib import Path
@@ -25,12 +26,20 @@ import random
 import re
 import shutil
 import sys
+import threading
 import time
 from typing import Any
 
 from . import dataset as ds
 from .canvas import build_preamble
-from .configs import CONFIGS_BY_NAME, DEFAULT_CONFIG, OUT_DIR, SMOKE_TASK, GenConfig
+from .configs import (
+    CONFIGS_BY_NAME,
+    DEFAULT_CONFIG,
+    DEFAULT_WORKERS,
+    OUT_DIR,
+    SMOKE_TASK,
+    GenConfig,
+)
 from .credentials import resolve
 from .execute import run_steps
 from .prompts import build_messages, repair_messages, response_schema
@@ -50,34 +59,55 @@ def _client(cfg: GenConfig):
 
 
 def _call(client, cfg: GenConfig, messages: list[dict], schema: dict):
-    kwargs: dict[str, Any] = dict(
-        model=cfg.model,
-        messages=messages,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        max_tokens=cfg.max_tokens,
-        response_format={"type": "json_schema", "json_schema": schema},
-    )
-    if cfg.seed is not None:
-        kwargs["seed"] = cfg.seed
-    if cfg.thinking == "off":
-        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-    elif cfg.thinking:
-        kwargs["extra_body"] = {"reasoning_effort": cfg.thinking}
-    resp = client.chat.completions.create(**kwargs)
-    choice = resp.choices[0]
-    msg = choice.message
-    thinking = getattr(msg, "reasoning", None) or getattr(
-        msg, "reasoning_content", None
-    )
-    usage = resp.usage.model_dump() if resp.usage else {}
-    if not msg.content:
-        raise RuntimeError(
-            f"empty completion (finish_reason={choice.finish_reason}, "
-            f"thinking chars={len(thinking or '')}). Raise `max_tokens` or set "
-            "`thinking='off'` in the config."
+    """One completion, retried while it comes back unusable.
+
+    An unusable completion is empty content (all the budget went into hidden
+    thinking) or unparseable JSON (the sampler degenerated into whitespace and
+    hit the token cap). Both are properties of *that* sample, so the retry
+    re-rolls the seed instead of asking for the same one again.
+    """
+    last: Exception | None = None
+    for attempt in range(cfg.call_retries + 1):
+        kwargs: dict[str, Any] = dict(
+            model=cfg.model,
+            messages=messages,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            max_tokens=cfg.max_tokens,
+            response_format={"type": "json_schema", "json_schema": schema},
         )
-    return json.loads(msg.content), thinking, usage
+        if cfg.seed is not None:
+            kwargs["seed"] = cfg.seed + 1000 * attempt
+        if cfg.thinking == "off":
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        elif cfg.thinking:
+            kwargs["extra_body"] = {"reasoning_effort": cfg.thinking}
+
+        resp = client.chat.completions.create(**kwargs)
+        choice = resp.choices[0]
+        msg = choice.message
+        thinking = getattr(msg, "reasoning", None) or getattr(
+            msg, "reasoning_content", None
+        )
+        usage = resp.usage.model_dump() if resp.usage else {}
+        try:
+            if not msg.content:
+                raise RuntimeError(
+                    f"empty completion (finish_reason={choice.finish_reason}, "
+                    f"thinking chars={len(thinking or '')})"
+                )
+            return json.loads(msg.content), thinking, usage
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            last = exc
+            print(
+                f"[warn] unusable completion (attempt {attempt + 1}/"
+                f"{cfg.call_retries + 1}, {len(msg.content or '')} chars, "
+                f"finish={choice.finish_reason}): {exc}",
+                file=sys.stderr,
+            )
+    raise RuntimeError(
+        f"no usable completion after {cfg.call_retries + 1} attempts: {last}"
+    )
 
 
 def _add_usage(total: dict, extra: dict) -> dict:
@@ -388,12 +418,52 @@ def upsert_record(records_path: Path, record: dict[str, Any]) -> None:
     tmp.replace(records_path)
 
 
+def accepted_task_ids(records_path: Path) -> set[str]:
+    """Tasks already generated and accepted, for `--resume` on a long run."""
+    done: set[str] = set()
+    if not records_path.exists():
+        return done
+    for line in records_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("accepted"):
+            done.add(row.get("task_id"))
+    return done
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+def _stratified(tasks: list[ds.Task], key, per_group: int, seed: int) -> list[ds.Task]:
+    """`per_group` tasks from every group, drawn with a per-group seed."""
+    groups: dict[Any, list[ds.Task]] = {}
+    for task in tasks:
+        groups.setdefault(key(task), []).append(task)
+    out: list[ds.Task] = []
+    for i, name in enumerate(sorted(groups, key=str)):
+        pool = groups[name]
+        if per_group > len(pool):
+            print(
+                f"[warn] {name}: asked for {per_group}, only {len(pool)} exist",
+                file=sys.stderr,
+            )
+        out += random.Random(seed + i).sample(pool, min(per_group, len(pool)))
+    return out
+
+
 def _select_tasks(tasks: list[ds.Task], args) -> list[ds.Task]:
     selected: list[ds.Task] = []
+    if args.per_stem:
+        selected += _stratified(tasks, lambda t: t.stem, args.per_stem, args.seed)
+    if args.per_category:
+        selected += _stratified(
+            tasks, lambda t: t.row.get("category"), args.per_category, args.seed
+        )
     if args.n:
         pool = [t for t in tasks if not args.stem or t.stem == args.stem]
         if not pool:
@@ -408,8 +478,9 @@ def _select_tasks(tasks: list[ds.Task], args) -> list[ds.Task]:
                 f"generating {len(pool)}",
                 file=sys.stderr,
             )
-        selected = random.Random(args.seed).sample(pool, min(args.n, len(pool)))
-    for spec in args.task or ([] if args.n else [SMOKE_TASK]):
+        selected += random.Random(args.seed).sample(pool, min(args.n, len(pool)))
+    explicit = args.task or ([] if selected else [SMOKE_TASK])
+    for spec in explicit:
         selected.append(ds.select(tasks, spec))
 
     seen: set[str] = set()
@@ -437,10 +508,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--stem", help="restrict random sampling to one task file")
     ap.add_argument("--n", type=int, default=0, help="random samples to draw")
+    ap.add_argument(
+        "--per-stem",
+        type=int,
+        default=0,
+        help="draw N tasks from each of the 27 task files (each holds 100)",
+    )
+    ap.add_argument(
+        "--per-category",
+        type=int,
+        default=0,
+        help="draw N tasks from each of the 9 `category` values",
+    )
     ap.add_argument("--seed", type=int, default=0, help="sampling seed")
     ap.add_argument("--out", type=Path, default=OUT_DIR)
     ap.add_argument("--model", help="override the config's model id")
     ap.add_argument("--no-reveal-answer", action="store_true")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="concurrent samples in flight (the endpoint batches them)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip tasks already accepted in records.jsonl",
+    )
     args = ap.parse_args(argv)
 
     cfg = CONFIGS_BY_NAME[args.config]
@@ -455,24 +549,36 @@ def main(argv: list[str] | None = None) -> int:
 
     tasks = ds.load_tasks()
     selected = _select_tasks(tasks, args)
+    records_path = args.out / cfg.name / "records.jsonl"
+
+    if args.resume:
+        done = accepted_task_ids(records_path)
+        before = len(selected)
+        selected = [t for t in selected if t.task_id not in done]
+        print(
+            f"resume: {before - len(selected)} already accepted, {len(selected)} left"
+        )
 
     client, creds = _client(cfg)
+    workers = max(1, min(args.workers, len(selected) or 1))
     print(
         f"model={cfg.model} endpoint={cfg.base_url} creds={creds.source} "
-        f"samples={len(selected)}"
+        f"samples={len(selected)} workers={workers}"
     )
 
-    records_path = args.out / cfg.name / "records.jsonl"
-    accepted = failed = 0
-    for task in selected:
+    lock = threading.Lock()
+    started = time.time()
+    counters = {"done": 0, "accepted": 0, "failed": 0}
+
+    def work(task: ds.Task) -> None:
         try:
             rec = generate_one(task, cfg, args.out, client=client)
         except Exception as exc:  # one bad completion must not kill the batch
-            failed += 1
-            print(f"  {task.task_id:34s} ERROR {type(exc).__name__}: {exc}")
-            continue
-        accepted += rec["accepted"]
-        upsert_record(records_path, rec)
+            with lock:
+                counters["failed"] += 1
+                counters["done"] += 1
+                print(f"  {task.task_id:34s} ERROR {type(exc).__name__}: {exc}")
+            return
         flags = " ".join(
             f"{k}={'ok' if rec[k] else 'n/a' if rec[k] is None else 'FAIL'}"
             for k in (
@@ -483,14 +589,29 @@ def main(argv: list[str] | None = None) -> int:
                 "drawn_ok",
             )
         )
-        print(
-            f"  {task.task_id:34s} steps={len(rec['steps'])} "
-            f"repairs={rec['repair_rounds']} {flags} [{rec['answer_detail']}]"
-        )
+        with lock:
+            # records.jsonl is rewritten in place, so only one writer at a time.
+            upsert_record(records_path, rec)
+            counters["done"] += 1
+            counters["accepted"] += rec["accepted"]
+            done, total = counters["done"], len(selected)
+            rate = (time.time() - started) / max(done, 1)
+            eta = (total - done) * rate / 60
+            print(
+                f"[{done}/{total} acc={counters['accepted']} eta={eta:.0f}m] "
+                f"{task.task_id:34s} steps={len(rec['steps'])} "
+                f"repairs={rec['repair_rounds']} {flags}",
+                flush=True,
+            )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(work, selected))
+
+    elapsed = (time.time() - started) / 60
     print(
-        f"accepted {accepted}/{len(selected)}"
-        + (f", {failed} errored" if failed else "")
-        + f" -> {records_path}"
+        f"accepted {counters['accepted']}/{len(selected)}"
+        + (f", {counters['failed']} errored" if counters["failed"] else "")
+        + f" in {elapsed:.1f} min -> {records_path}"
     )
     return 0
 
