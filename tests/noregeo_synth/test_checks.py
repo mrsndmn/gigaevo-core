@@ -478,6 +478,76 @@ def test_call_gives_up_and_raises_after_the_configured_retries():
     assert len(client.calls) == CFG.call_retries + 1
 
 
+def _raising_client(exc: Exception) -> _FakeClient:
+    client = _FakeClient([])
+
+    def always_raise(**kwargs):
+        client.calls.append(kwargs)
+        raise exc
+
+    client.chat.completions.create = always_raise
+    return client
+
+
+def test_call_does_not_retry_a_deterministic_error(monkeypatch):
+    """A 401 from an expired token answers the same way every time. Retrying it
+    across 2700 samples burns hours and buries the real cause."""
+    import httpx
+    import openai
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    unauthorized = openai.AuthenticationError(
+        "token expired",
+        response=httpx.Response(401, request=request),
+        body=None,
+    )
+    client = _raising_client(unauthorized)
+    with pytest.raises(openai.AuthenticationError):
+        _call(client, CFG, [{"role": "user", "content": "x"}], {}, "t")
+    assert len(client.calls) == 1
+
+
+def test_call_does_not_retry_a_timeout(monkeypatch):
+    """The SDK already retried it once; retrying again multiplies how long one
+    hung request can hold a worker."""
+    import httpx
+    import openai
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    client = _raising_client(openai.APITimeoutError(request=request))
+    with pytest.raises(openai.APITimeoutError):
+        _call(client, CFG, [{"role": "user", "content": "x"}], {}, "t")
+    assert len(client.calls) == 1
+
+
+def test_transport_hiccup_does_not_consume_a_completion_reroll(monkeypatch):
+    """Hiccups and re-rolls have separate budgets: a gateway blip in the middle
+    must not cost the escalation slot a genuinely long solution needs."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    client = _FakeClient([("{'broken", "length"), ('{"ok": 1}', "stop")])
+    original = client.chat.completions.create
+    state = {"hiccuped": False}
+
+    def flaky(**kwargs):
+        if len(client.calls) == 1 and not state["hiccuped"]:
+            state["hiccuped"] = True
+            client.calls.append(kwargs)
+            raise json.JSONDecodeError("Expecting value", "", 0)
+        return original(**kwargs)
+
+    client.chat.completions.create = flaky
+    solution, _, _ = _call(client, CFG, [{"role": "user", "content": "x"}], {}, "t")
+    assert solution == {"ok": 1}
+    # three requests: truncated, hiccup, success — and the hiccup did not
+    # advance the attempt counter, so the budget was still escalated once.
+    assert len(client.calls) == 3
+    assert [c["max_tokens"] for c in client.calls if "max_tokens" in c][-1] == (
+        CFG.max_tokens
+    )
+
+
 def test_records_are_strict_json(tmp_path):
     """NaN is valid for `json.dump` and invalid for jq, serde and pyarrow."""
     _, checks = _check(tmp_path, DRAW_TRIANGLE, DRAW_ANSWER)

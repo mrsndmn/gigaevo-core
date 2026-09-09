@@ -67,6 +67,51 @@ def _client(cfg: GenConfig):
     ), creds
 
 
+def _is_retryable(exc: Exception) -> bool:
+    """Is another identical request worth making?
+
+    Yes for the transient shapes: a connection dropped, a 5xx, a rate limit, a
+    body that was not JSON. No for anything deterministic — a 401 from an
+    expired token and a 400 from an over-long request will answer the same way
+    every time, and retrying them over 2700 samples only burns hours. Timeouts
+    are also a no: the SDK has already retried once, and retrying again
+    multiplies how long one hung request can pin a worker (300 s x 2 x 3 x 3
+    per sample if everything composes).
+    """
+    import openai
+
+    if isinstance(
+        exc,
+        (
+            openai.APITimeoutError,
+            openai.AuthenticationError,
+            openai.PermissionDeniedError,
+            openai.BadRequestError,
+            openai.NotFoundError,
+        ),
+    ):
+        return False
+    return isinstance(
+        exc,
+        (
+            openai.APIConnectionError,
+            openai.RateLimitError,
+            openai.InternalServerError,
+            json.JSONDecodeError,
+        ),
+    )
+
+
+def _retry_after(exc: Exception) -> float | None:
+    """The server's own backoff instruction, when it sent one (429s)."""
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", {}) or {}
+    try:
+        return float(header.get("retry-after"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _seed_for(cfg: GenConfig, salt: str, attempt: int) -> int | None:
     """Deterministic per-task seed.
 
@@ -105,7 +150,9 @@ def _call(
     last: Exception | None = None
     spent: dict[str, Any] = {}
     budget = cfg.max_tokens
-    for attempt in range(cfg.call_retries + 1):
+    attempt = 0
+    hiccups = 0
+    while attempt <= cfg.call_retries:
         kwargs: dict[str, Any] = dict(
             model=cfg.model,
             messages=messages,
@@ -125,18 +172,23 @@ def _call(
         try:
             resp = client.chat.completions.create(**kwargs)
         except Exception as exc:
-            # Transport-level failures land here, not in the parsing branch
-            # below: a gateway hiccup makes the SDK itself raise (seen in the
-            # full run as `JSONDecodeError: line 1 column 1 (char 0)` — a
-            # non-JSON HTTP body). Treat it as a retryable attempt rather than
-            # losing the sample.
+            # Transport-level failures land here rather than in the inspection
+            # branch below: a gateway hiccup makes the SDK itself raise (seen
+            # 4 times in the first 178 samples of the full run as
+            # `JSONDecodeError: line 1 column 1 (char 0)` — a non-JSON body).
+            # Only the transient ones are worth another request, and they get
+            # their own budget so a hiccup does not eat a completion re-roll.
+            if not _is_retryable(exc) or hiccups >= cfg.transport_retries:
+                raise
+            hiccups += 1
             last = exc
+            delay = _retry_after(exc) or min(2**hiccups, 8)
             print(
-                f"[warn] request failed (attempt {attempt + 1}/"
-                f"{cfg.call_retries + 1}): {type(exc).__name__}: {exc}",
+                f"[warn] request failed ({type(exc).__name__}: {exc}); "
+                f"hiccup {hiccups}/{cfg.transport_retries}, retrying in {delay}s",
                 file=sys.stderr,
             )
-            time.sleep(min(2**attempt, 8))
+            time.sleep(delay)
             continue
         choice = resp.choices[0]
         msg = choice.message
@@ -160,11 +212,15 @@ def _call(
                 f"finish={choice.finish_reason}, budget={budget}): {exc}",
                 file=sys.stderr,
             )
+            # Escalate only from the second failure on: the first retry exists
+            # to re-roll a degenerate sample, and a bigger budget would just
+            # let it degenerate for longer.
             if choice.finish_reason == "length" and attempt >= 1:
                 budget = min(budget * 2, cfg.max_tokens_ceiling)
+            attempt += 1
     raise RuntimeError(
         f"no usable completion after {cfg.call_retries + 1} attempts "
-        f"(last budget {budget}): {last}"
+        f"(last budget {budget}): {type(last).__name__}: {last}"
     )
 
 

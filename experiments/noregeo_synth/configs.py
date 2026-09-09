@@ -141,6 +141,13 @@ class GenConfig:
     # and burned the whole token budget). The retry re-rolls the seed, since
     # repeating the same one reproduces the same degenerate sample.
     call_retries: int = 2
+    # Transport hiccups (a gateway returning a non-JSON body, a 5xx, a 429) are
+    # counted separately: they produce nothing to inspect, so they must not
+    # consume one of the `call_retries` re-rolls that exist to escape a bad
+    # sample. Deterministic errors (401, 400) and timeouts are never retried
+    # here -- the first will not start working, and the second would multiply
+    # the time one stalled request can pin a worker.
+    transport_retries: int = 3
 
     # solution shape
     min_steps: int = 3
