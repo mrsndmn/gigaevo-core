@@ -193,6 +193,13 @@ class GenConfig:
     # permanent "failed" record is not.
     min_free_gb: float = 5.0
 
+    # Circuit breaker. An exception taxonomy keeps losing the race with reality:
+    # the endpoint can be down (connection refused), warming up (503), throttling
+    # (429) or hung (timeout), and each shape brands every task failed at its own
+    # pace. Whatever the shape, N generation failures in a row with nothing
+    # succeeding in between means the environment died, not the tasks.
+    max_consecutive_failures: int = 15
+
     note: str = ""
 
 

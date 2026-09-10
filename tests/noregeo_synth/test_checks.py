@@ -422,6 +422,36 @@ def test_environment_failures_stop_the_batch_instead_of_failing_tasks():
     assert batch_stopper(RuntimeError("no usable completion after 3 attempts")) is None
 
 
+def test_a_streak_of_failures_stops_the_batch_and_exits_nonzero(tmp_path, monkeypatch):
+    """The catch-all for outage shapes an exception taxonomy will miss (503 on a
+    warming server, connection refused, hung sockets). Without it, a dead
+    endpoint brands every task failed; without the exit code, the watcher that
+    is supposed to restart the run sees success and stops."""
+    from experiments.noregeo_synth import generate as gen
+
+    monkeypatch.setattr(
+        gen,
+        "_client",
+        lambda cfg: (
+            object(),
+            type("C", (), {"source": "test", "expires_in_days": None})(),
+        ),
+    )
+    monkeypatch.setattr(gen, "check_model_is_served", lambda *a, **k: None)
+
+    def boom(task, cfg, out_root, client=None, **kwargs):
+        raise RuntimeError("no usable completion after 3 attempts")
+
+    monkeypatch.setattr(gen, "generate_one", boom)
+
+    rc = gen.main(["--per-stem", "3", "--workers", "4", "--out", str(tmp_path)])
+    assert rc == 3, "an aborted run must not report success"
+    rows = gen.read_records(tmp_path / CFG.name / "records.jsonl")
+    assert CFG.max_consecutive_failures <= len(rows) < 81, (
+        "the breaker should stop the batch long before all 81 tasks are branded"
+    )
+
+
 def test_model_preflight_refuses_a_roster_without_our_model():
     """One second of checking against 2478 failure rows."""
 

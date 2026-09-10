@@ -396,6 +396,8 @@ def generate_one(
     solution, thinking, usage = _call(client, cfg, messages, schema, salt=task.task_id)
     thinkings = [thinking]
     exec_res = run_steps(preamble, solution["steps"], sample_dir, cfg, target)
+    if child_ran_out_of_space(exec_res):
+        raise OSError(errno.ENOSPC, f"the drawing subprocess: {exec_res.error}")
     checks = run_checks(row, solution, exec_res, cfg)
 
     rounds = 0
@@ -411,6 +413,8 @@ def generate_one(
         thinkings.append(thinking)
         usage = _add_usage(usage, usage_round)
         exec_res = run_steps(preamble, solution["steps"], sample_dir, cfg, target)
+        if child_ran_out_of_space(exec_res):
+            raise OSError(errno.ENOSPC, f"the drawing subprocess: {exec_res.error}")
         checks = run_checks(row, solution, exec_res, cfg)
 
     images = [s.image for s in exec_res.steps if s.ok and s.image]
@@ -516,12 +520,30 @@ def free_gb(path: Path) -> float:
     return shutil.disk_usage(probe).free / 2**30
 
 
+ENOSPC_MARKERS = ("[Errno 28]", "No space left on device")
+
+
 def is_out_of_space(exc: BaseException) -> bool:
-    while exc is not None:
+    # `seen` because `raise X from Y` can build a cycle, which CPython does not
+    # break for explicit causes: without it a worker spins here forever.
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
         if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
             return True
         exc = exc.__cause__ or exc.__context__
     return False
+
+
+def child_ran_out_of_space(exec_res) -> bool:
+    """Did the *drawing subprocess* hit ENOSPC?
+
+    Step PNGs are ~90% of the bytes a sample writes, so a filling volume shows
+    up in the child before it shows up in any parent write — and the child
+    reports failures as strings, which no exception handler would ever see.
+    """
+    blobs = [exec_res.error or ""] + [s.error or "" for s in exec_res.steps]
+    return any(m in blob for blob in blobs for m in ENOSPC_MARKERS)
 
 
 def batch_stopper(exc: BaseException) -> str | None:
@@ -550,9 +572,22 @@ def check_model_is_served(client, cfg: GenConfig) -> None:
     The endpoint's roster changes underneath us: a resumed run once found
     `/v1/models` completely empty. One second here beats 2478 failure rows.
     """
+    import openai
+
     try:
         served = [m.id for m in client.models.list().data]
-    except Exception as exc:  # a broken roster call is not a reason to refuse
+    except (
+        openai.APIConnectionError,
+        openai.APITimeoutError,
+        openai.InternalServerError,
+        openai.AuthenticationError,
+    ) as exc:
+        # The endpoint being unreachable is exactly the state this preflight
+        # exists to catch; shrugging it off would start a run that fails every
+        # task. Only an endpoint that answers but has no /models (some do)
+        # gets the benefit of the doubt below.
+        raise SystemExit(f"{cfg.base_url} is not answering: {exc}") from exc
+    except Exception as exc:
         print(f"[warn] could not list models: {exc}", file=sys.stderr)
         return
     if cfg.model not in served:
@@ -830,25 +865,52 @@ def main(argv: list[str] | None = None) -> int:
     aborted = threading.Event()
     lock = threading.Lock()
     started = time.time()
-    counters = {"done": 0, "accepted": 0, "failed": 0}
+    counters = {"done": 0, "accepted": 0, "failed": 0, "streak": 0}
     in_flight: dict[str, float] = {}
 
     def report(task: ds.Task, rec: dict, note: str) -> None:
         with lock:
-            store.add(rec)
+            try:
+                store.add(rec)
+            except OSError as exc:
+                # This runs outside work()'s handler, so an ENOSPC or a stale
+                # NFS handle here would kill the batch with a bare traceback
+                # instead of the abort path.
+                aborted.set()
+                print(f"[abort] cannot write records: {exc}", flush=True)
             in_flight.pop(task.task_id, None)
             counters["done"] += 1
             counters["accepted"] += bool(rec.get("accepted"))
             counters["failed"] += not rec.get("accepted")
+            # A record with no steps means nothing was generated at all.
+            if rec.get("steps"):
+                counters["streak"] = 0
+            else:
+                counters["streak"] += 1
+                if counters["streak"] >= cfg.max_consecutive_failures:
+                    aborted.set()
+                    print(
+                        f"[abort] {counters['streak']} generation failures in a "
+                        "row with nothing succeeding — treating this as an "
+                        "environment outage, not as bad tasks",
+                        flush=True,
+                    )
             done, total = counters["done"], len(selected)
             # Cheap early warning: catch the volume filling before a write does.
-            if done % 25 == 0 and free_gb(args.out) < cfg.min_free_gb:
-                aborted.set()
-                print(
-                    f"[abort] only {free_gb(args.out):.1f} GB free "
-                    f"(min_free_gb={cfg.min_free_gb}); stopping the batch",
-                    flush=True,
-                )
+            if done == 1 or done % 25 == 0:
+                try:
+                    free = free_gb(args.out)
+                except OSError as exc:
+                    aborted.set()
+                    print(f"[abort] cannot stat the output volume: {exc}", flush=True)
+                    free = float("inf")
+                if free < cfg.min_free_gb:
+                    aborted.set()
+                    print(
+                        f"[abort] only {free:.1f} GB free "
+                        f"(min_free_gb={cfg.min_free_gb}); stopping the batch",
+                        flush=True,
+                    )
             # An ETA from fewer completions than there are workers is noise:
             # the first finisher makes it look like the batch is serial.
             eta = (
@@ -932,7 +994,10 @@ def main(argv: list[str] | None = None) -> int:
             list(pool.map(work, selected))
     finally:
         finished.set()
-        store.close()
+        try:
+            store.close()
+        except OSError as exc:  # must not mask whatever stopped the run
+            print(f"[warn] final records flush failed: {exc}", file=sys.stderr)
 
     elapsed = (time.time() - started) / 60
     print(
@@ -945,7 +1010,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         + f" in {elapsed:.1f} min -> {records_path}"
     )
-    return 0
+    # Distinct code: the watcher (and any human) must be able to tell "finished"
+    # from "stopped early because the environment broke".
+    return 3 if aborted.is_set() else 0
 
 
 if __name__ == "__main__":
