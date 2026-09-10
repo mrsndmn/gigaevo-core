@@ -13,6 +13,7 @@ No network and no inference: the model's part is hand-written here.
 
 from __future__ import annotations
 
+import errno
 import json
 
 import pytest
@@ -30,7 +31,9 @@ from experiments.noregeo_synth.generate import (
     _stratified,
     accepted_task_ids,
     failure_record,
+    free_gb,
     golden_point,
+    is_out_of_space,
     run_checks,
     upsert_record,
 )
@@ -374,6 +377,27 @@ def test_failure_record_is_written_for_a_sample_that_never_ran(tmp_path):
     path = tmp_path / "records.jsonl"
     upsert_record(path, rec)
     assert accepted_task_ids(path) == set()
+
+
+def test_out_of_space_is_recognised_through_a_wrapped_exception():
+    """The batch has to tell "this volume is full" (stop everything) from "this
+    sample failed" (record it and move on). A full shared mount turned 2471 of
+    2696 tasks into permanent failure rows before this existed."""
+    enospc = OSError(errno.ENOSPC, "No space left on device")
+    assert is_out_of_space(enospc)
+    try:
+        try:
+            raise enospc
+        except OSError as exc:
+            raise RuntimeError("while writing the record") from exc
+    except RuntimeError as wrapped:
+        assert is_out_of_space(wrapped)
+    assert not is_out_of_space(OSError(errno.EACCES, "Permission denied"))
+    assert not is_out_of_space(ValueError("nope"))
+
+
+def test_free_gb_reports_a_missing_directory_via_its_parent(tmp_path):
+    assert free_gb(tmp_path / "not" / "created" / "yet") > 0
 
 
 def test_stratified_takes_from_every_group_and_is_deterministic():

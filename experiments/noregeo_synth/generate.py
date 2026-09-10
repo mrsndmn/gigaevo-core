@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -505,6 +506,24 @@ def generate_one(
     return record
 
 
+MB_PER_SAMPLE = 0.5  # measured: 430-490 KB of artifacts per accepted sample
+
+
+def free_gb(path: Path) -> float:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free / 2**30
+
+
+def is_out_of_space(exc: BaseException) -> bool:
+    while exc is not None:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def read_records(records_path: Path) -> list[dict[str, Any]]:
     rows = []
     if records_path.exists():
@@ -759,7 +778,17 @@ def main(argv: list[str] | None = None) -> int:
         f"samples={len(selected)} workers={workers}"
     )
 
+    need_gb = len(selected) * MB_PER_SAMPLE / 1024 + cfg.min_free_gb
+    have_gb = free_gb(args.out)
+    if have_gb < need_gb:
+        raise SystemExit(
+            f"only {have_gb:.1f} GB free on {args.out}, need about "
+            f"{need_gb:.1f} GB for {len(selected)} samples "
+            f"({MB_PER_SAMPLE} MB each plus a {cfg.min_free_gb} GB floor)"
+        )
+
     store = RecordStore(records_path)
+    aborted = threading.Event()
     lock = threading.Lock()
     started = time.time()
     counters = {"done": 0, "accepted": 0, "failed": 0}
@@ -773,6 +802,14 @@ def main(argv: list[str] | None = None) -> int:
             counters["accepted"] += bool(rec.get("accepted"))
             counters["failed"] += not rec.get("accepted")
             done, total = counters["done"], len(selected)
+            # Cheap early warning: catch the volume filling before a write does.
+            if done % 25 == 0 and free_gb(args.out) < cfg.min_free_gb:
+                aborted.set()
+                print(
+                    f"[abort] only {free_gb(args.out):.1f} GB free "
+                    f"(min_free_gb={cfg.min_free_gb}); stopping the batch",
+                    flush=True,
+                )
             # An ETA from fewer completions than there are workers is noise:
             # the first finisher makes it look like the batch is serial.
             eta = (
@@ -787,11 +824,28 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     def work(task: ds.Task) -> None:
+        if aborted.is_set():
+            return  # the volume filled up: leave the task untouched, not failed
         with lock:
             in_flight[task.task_id] = time.time()
         try:
             rec = generate_one(task, cfg, args.out, client=client)
         except Exception as exc:  # one bad completion must not kill the batch
+            if is_out_of_space(exc):
+                # Recording this as a per-task failure would brand every
+                # remaining task unusable within minutes, and `--resume` reads
+                # those rows. Stop the batch instead.
+                if not aborted.is_set():
+                    aborted.set()
+                    print(
+                        f"[abort] out of disk space at {task.task_id} "
+                        f"({free_gb(args.out):.1f} GB free). Freeing space and "
+                        "re-running with --resume picks up from here.",
+                        flush=True,
+                    )
+                with lock:
+                    in_flight.pop(task.task_id, None)
+                return
             report(
                 task,
                 failure_record(task, cfg, args.out, exc),
@@ -844,6 +898,11 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"accepted {counters['accepted']}/{len(selected)}"
         + (f", {counters['failed']} not accepted" if counters["failed"] else "")
+        + (
+            f", ABORTED with {len(selected) - counters['done']} untouched"
+            if aborted.is_set()
+            else ""
+        )
         + f" in {elapsed:.1f} min -> {records_path}"
     )
     return 0

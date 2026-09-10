@@ -186,6 +186,13 @@ class GenConfig:
     # instead of deriving it. Only meaningful together with reveal_answer.
     reject_pasted_answer: bool = True
 
+    # Stop the batch when the volume gets this close to full. The output lives
+    # on a shared 98 TB NFS mount: on 2026-09-10 another tenant filled it
+    # mid-run and 2471 of 2696 tasks turned into ENOSPC failure rows in six
+    # minutes. Failing the run is fine; converting every remaining task into a
+    # permanent "failed" record is not.
+    min_free_gb: float = 5.0
+
     note: str = ""
 
 
