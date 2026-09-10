@@ -30,6 +30,8 @@ from experiments.noregeo_synth.generate import (
     _seed_for,
     _stratified,
     accepted_task_ids,
+    batch_stopper,
+    check_model_is_served,
     failure_record,
     free_gb,
     golden_point,
@@ -398,6 +400,50 @@ def test_out_of_space_is_recognised_through_a_wrapped_exception():
 
 def test_free_gb_reports_a_missing_directory_via_its_parent(tmp_path):
     assert free_gb(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_environment_failures_stop_the_batch_instead_of_failing_tasks():
+    """Both happened on 2026-09-10: a full volume, then the endpoint dropping
+    every deployed model. Each branded ~2500 tasks failed in minutes."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    gone = openai.NotFoundError(
+        "Model 'X' not found", response=httpx.Response(404, request=request), body=None
+    )
+    unauthorized = openai.AuthenticationError(
+        "expired", response=httpx.Response(401, request=request), body=None
+    )
+    assert batch_stopper(OSError(errno.ENOSPC, "No space left on device"))
+    assert batch_stopper(gone)
+    assert batch_stopper(unauthorized)
+    # a task-specific failure must still be recorded per task
+    assert batch_stopper(RuntimeError("no usable completion after 3 attempts")) is None
+
+
+def test_model_preflight_refuses_a_roster_without_our_model():
+    """One second of checking against 2478 failure rows."""
+
+    class _Models:
+        def __init__(self, ids):
+            self.ids = ids
+
+        def list(self):
+            return type(
+                "R", (), {"data": [type("M", (), {"id": i})() for i in self.ids]}
+            )()
+
+    client = type("C", (), {"models": _Models([])})()
+    with pytest.raises(SystemExit, match="none deployed"):
+        check_model_is_served(client, CFG)
+
+    client = type("C", (), {"models": _Models(["some/other-model"])})()
+    with pytest.raises(SystemExit, match="some/other-model"):
+        check_model_is_served(client, CFG)
+
+    client = type("C", (), {"models": _Models([CFG.model])})()
+    check_model_is_served(client, CFG)  # does not raise
 
 
 def test_stratified_takes_from_every_group_and_is_deterministic():

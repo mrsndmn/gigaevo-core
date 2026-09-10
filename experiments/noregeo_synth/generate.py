@@ -524,6 +524,44 @@ def is_out_of_space(exc: BaseException) -> bool:
     return False
 
 
+def batch_stopper(exc: BaseException) -> str | None:
+    """Is this failure about the environment rather than about the task?
+
+    Such failures hit every task equally, so recording them per task brands the
+    whole benchmark unusable in seconds — twice on 2026-09-10: a full volume
+    (2471 rows), then the endpoint dropping every deployed model (2478 rows in
+    18 s). Neither says anything about the tasks, and `--resume` reads those
+    rows. Stop the batch and leave the tasks alone instead.
+    """
+    import openai
+
+    if is_out_of_space(exc):
+        return "the volume is full"
+    if isinstance(exc, openai.NotFoundError):
+        return "the endpoint does not serve this model"
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return "the endpoint rejected our token"
+    return None
+
+
+def check_model_is_served(client, cfg: GenConfig) -> None:
+    """Fail before the first sample if the model is not deployed right now.
+
+    The endpoint's roster changes underneath us: a resumed run once found
+    `/v1/models` completely empty. One second here beats 2478 failure rows.
+    """
+    try:
+        served = [m.id for m in client.models.list().data]
+    except Exception as exc:  # a broken roster call is not a reason to refuse
+        print(f"[warn] could not list models: {exc}", file=sys.stderr)
+        return
+    if cfg.model not in served:
+        raise SystemExit(
+            f"{cfg.model} is not served by {cfg.base_url} right now. "
+            f"Available: {', '.join(served) if served else '(none deployed)'}"
+        )
+
+
 def read_records(records_path: Path) -> list[dict[str, Any]]:
     rows = []
     if records_path.exists():
@@ -772,6 +810,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     client, creds = _client(cfg)
+    check_model_is_served(client, cfg)
     workers = max(1, min(args.workers, len(selected) or 1))
     print(
         f"model={cfg.model} endpoint={cfg.base_url} creds={creds.source} "
@@ -831,16 +870,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             rec = generate_one(task, cfg, args.out, client=client)
         except Exception as exc:  # one bad completion must not kill the batch
-            if is_out_of_space(exc):
+            reason = batch_stopper(exc)
+            if reason:
                 # Recording this as a per-task failure would brand every
                 # remaining task unusable within minutes, and `--resume` reads
                 # those rows. Stop the batch instead.
                 if not aborted.is_set():
                     aborted.set()
                     print(
-                        f"[abort] out of disk space at {task.task_id} "
-                        f"({free_gb(args.out):.1f} GB free). Freeing space and "
-                        "re-running with --resume picks up from here.",
+                        f"[abort] {reason} ({type(exc).__name__} at "
+                        f"{task.task_id}). Nothing else is recorded; fix it and "
+                        "re-run with --resume to pick up from here.",
                         flush=True,
                     )
                 with lock:
