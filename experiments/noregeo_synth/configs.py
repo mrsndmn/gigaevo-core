@@ -445,8 +445,10 @@ EVAL_CONFIGS: list[EvalConfig] = [
     EvalConfig(
         name="qwen35-27b",
         model="Qwen/Qwen3.5-27B",
-        note="previous generation; returned empty completions on image input "
-        "in the pilot, so expect a high unparseable rate",
+        note="previous generation of the same size, for a quality delta. Once "
+        "returned an empty completion on image input, with a token budget small "
+        "enough that hidden thinking could eat all of it; it reads figures "
+        "correctly when given room (re-checked 2026-09-16)",
     ),
 ]
 
