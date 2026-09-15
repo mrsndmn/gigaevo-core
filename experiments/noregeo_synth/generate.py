@@ -183,7 +183,12 @@ def _call(
                 raise
             hiccups += 1
             last = exc
-            delay = _retry_after(exc) or min(2**hiccups, 8)
+            # The cap is per-config: a gateway hiccup clears in seconds, but the
+            # endpoint's *priority* throttle (429 "Wait the owner") sheds every
+            # request for minutes at a time, and backing off by 8 s six times
+            # just burns the retry budget inside one throttled window.
+            cap = getattr(cfg, "retry_backoff_cap", 8.0)
+            delay = _retry_after(exc) or min(2**hiccups, cap)
             print(
                 f"[warn] request failed ({type(exc).__name__}: {exc}); "
                 f"hiccup {hiccups}/{cfg.transport_retries}, retrying in {delay}s",

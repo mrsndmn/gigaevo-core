@@ -344,11 +344,12 @@ QUESTION_REPAIRS: dict[str, dict[str, object]] = {
 # vertex order. Kept in the run, reported apart from the headline.
 FIGURE_UNDERSPECIFIED: tuple[str, ...] = ("shape_symmetry",)
 
-# Half of `DEFAULT_WORKERS`. An eval request is much cheaper than a generation
-# request, so the endpoint's *priority* throttle (429 "Too many requests to
-# model. Wait the owner") is reached at a lower concurrency than the generation
-# run ever saw: 4 workers took 429s on 2026-09-15, 8 would be worse.
-DEFAULT_EVAL_WORKERS = 4
+# Far below `DEFAULT_WORKERS`. The endpoint's *priority* throttle (429 "Too
+# many requests to model. Wait the owner") sheds eval traffic at a concurrency
+# the generation run never hit: on 2026-09-15 four workers took 429s on every
+# request for minutes at a time. Two is a request in flight plus one waiting,
+# which is what a shared endpoint under someone else's priority allows.
+DEFAULT_EVAL_WORKERS = 2
 
 
 @dataclass(frozen=True)
@@ -375,6 +376,9 @@ class EvalConfig:
     # shared endpoint rather than gateway hiccups, and giving up on one turns a
     # throttled minute into a permanently unscored row.
     transport_retries: int = 6
+    # ...and each wait is allowed to grow to a minute, because the throttle it
+    # is waiting out lasts minutes, not seconds.
+    retry_backoff_cap: float = 60.0
     max_consecutive_failures: int = 15
     min_free_gb: float = 5.0
 

@@ -78,10 +78,16 @@ turning a geometry test into a tick-reading test.
 ## Results
 
 Pilot, 2026-09-15, `Qwen/Qwen3.8-27B`, 2 tasks × 5 arms: the loop runs, the
-repairs fire, the swap arm scores against both configurations. The endpoint
-was throttling (429 "Too many requests to model") at 4 workers, which is why
-`DEFAULT_EVAL_WORKERS` is 4 and `transport_retries` is 6 rather than the
-generation run's 3.
+repairs fire, the swap arm scores against both configurations.
+
+The endpoint then went into a *priority* throttle — 429 "Too many requests to
+model. Wait the owner" on every request, for minutes at a time — which shapes
+three knobs: `DEFAULT_EVAL_WORKERS` is 2 (four workers had every request shed),
+`transport_retries` is 6 rather than the generation run's 3, and
+`retry_backoff_cap` is 60 s, because backing off by 8 s six times only burns
+the retry budget inside a single throttled window. The run rides it out:
+`eval_blind` aborts with exit 3 rather than branding tasks failed, and
+`run/noregeo_eval/run_grid.sh` retries every 10 minutes.
 
 Separate 10-task probe of raw read-off ability, same day: asked only to read
 the labelled points off the figure, `Medgemma-27b-it` placed 48% of points
