@@ -54,13 +54,15 @@ from .configs import (
     EVAL_CONFIGS_BY_NAME,
     EVAL_IMAGE_FIELD,
     EVAL_OUT_DIR,
+    EXCLUDED_STEMS,
+    FIGURE_ANSWER_IN_TITLE,
     FIGURE_UNDERSPECIFIED,
     QUESTION_REPAIRS,
     SWAP_RULE,
     SWAP_SCALE,
     EvalConfig,
 )
-from .figures import iter_points, render_dots, scale_points, view_box_for
+from .figures import iter_points, render_dots, scale_points, union_view_box
 
 # Reused rather than reimplemented: the retry policy (`_call`), the "is this
 # failure about the environment?" taxonomy and the record store all exist
@@ -180,6 +182,10 @@ def swapped_answer(task: ds.Task, scale: float) -> Any:
 
 def arm_applies(task: ds.Task, arm: str) -> str | None:
     """None if the arm can run on this task, else why it cannot."""
+    if task.stem in EXCLUDED_STEMS:
+        return EXCLUDED_STEMS[task.stem]
+    if arm in (ARM_FIGURE, ARM_BOTH) and task.stem in FIGURE_ANSWER_IN_TITLE:
+        return "the dots figure states the answer in its title"
     if arm in RENDERED_ARMS and task.stem not in SWAP_RULE:
         return "scale-invariant answer (nothing to discriminate)"
     if arm in RENDERED_ARMS and not ds.named_points(task.row):
@@ -234,10 +240,12 @@ def build_request(
     elif arm in RENDERED_ARMS:
         scale = SWAP_SCALE if arm == ARM_SWAP else 1.0
         meta["scale"] = scale
-        # One view box for both arms, computed from the ORIGINAL configuration:
-        # a fitted box would make the scaled figure pixel-identical to the
-        # control apart from the tick labels.
-        view = view_box_for(points)
+        # One view box for both arms, wide enough for BOTH scales. Deriving it
+        # from the drawn configuration alone would make the scaled figure
+        # pixel-identical to the control apart from the tick labels; deriving
+        # it from the unscaled one alone pushed shrunken configurations off the
+        # canvas (see `union_view_box`).
+        view = union_view_box([points, scale_points(points, SWAP_SCALE)])
         drawn = scale_points(points, scale) if scale != 1.0 else points
         image_path = out_dir / "figures" / f"{task.stem}_{task.qid}_{arm}.png"
         render_dots(drawn, f"Task {task.qid}: {task.stem}", image_path, view=view)
@@ -364,7 +372,8 @@ def evaluate_one(
     # The falsification arm scores the same answer twice: against the figure and
     # against the stale text. Which one it follows is the measurement.
     if arm in RENDERED_ARMS:
-        text_side = score_answer(req["ask_row"], task.row.get("answer"), final, cfg)
+        text_gold = task.row.get("answer")
+        text_side = score_answer(req["ask_row"], text_gold, final, cfg)
         record["follows_figure"] = scored["ok"]
         record["follows_text"] = text_side["ok"]
         # Read-off error puts a correct reading just outside the strict
@@ -372,7 +381,16 @@ def evaluate_one(
         # neither" — the one bucket that means nothing.
         record["follows_figure_close"] = scored["close"]
         record["follows_text_close"] = text_side["close"]
-        record["text_answer"] = task.row.get("answer")
+        record["text_answer"] = text_gold
+        # ...but a loose tolerance only discriminates when the two goldens are
+        # further apart than the tolerance itself. They are not on the small
+        # answers (incircle radii run 1-3, and `loose_num_atol` is 0.5), where
+        # the unscaled answer passes as the scaled one and a row would be
+        # counted under BOTH loose columns. Scoring the text golden as if it
+        # were the model's answer is exactly that test.
+        record["loose_separable"] = not score_answer(
+            req["ask_row"], req["golden"], text_gold, cfg
+        )["close"]
     return record
 
 
@@ -424,7 +442,7 @@ def summarise(rows: list[dict[str, Any]], by_stem: bool = False) -> str:
         out.append("falsification (which source the answer follows)")
         head = (
             f"{'arm':14s} {'n':>5s} {'figure':>8s} {'text':>8s} {'neither':>8s}"
-            f"{'figure~':>9s} {'text~':>8s}"
+            f"{'figure~':>9s} {'text~':>8s}{'ambig':>9s}"
         )
         out.append(head)
         out.append("-" * len(head))
@@ -437,16 +455,23 @@ def summarise(rows: list[dict[str, Any]], by_stem: bool = False) -> str:
             neither = sum(
                 not r.get("follows_figure") and not r.get("follows_text") for r in got
             )
-            fig_c = sum(bool(r.get("follows_figure_close")) for r in got)
-            txt_c = sum(bool(r.get("follows_text_close")) for r in got)
+            # The loose columns are computed only where the two goldens are
+            # further apart than the loose tolerance; elsewhere they would
+            # count the same row twice.
+            sep = [r for r in got if r.get("loose_separable")]
+            fig_c = sum(bool(r.get("follows_figure_close")) for r in sep)
+            txt_c = sum(bool(r.get("follows_text_close")) for r in sep)
             out.append(
                 f"{arm:14s} {len(got):5d} {_pct(fig, len(got)):>8s} "
                 f"{_pct(txt, len(got)):>8s} {_pct(neither, len(got)):>8s}"
-                f"{_pct(fig_c, len(got)):>9s} {_pct(txt_c, len(got)):>8s}"
+                f"{_pct(fig_c, len(sep)):>9s} {_pct(txt_c, len(sep)):>8s}"
+                f"{len(got) - len(sep):9d}"
             )
         out.append(
-            "  `~` = loose tolerance. On swap-control the figure and the text "
-            "agree by construction, so its two columns coincide; it is there to "
+            "  `~` = loose tolerance, over the rows where the two goldens are "
+            "further apart than that tolerance; the rest are counted under "
+            "`ambig`. On swap-control the figure and the text agree by "
+            "construction, so every row is ambiguous and the arm exists only to "
             "show the model can answer at all with our renderer in the prompt."
         )
 
@@ -480,20 +505,36 @@ def summarise(rows: list[dict[str, Any]], by_stem: bool = False) -> str:
 
 
 def _select_tasks(tasks: list[ds.Task], args) -> list[ds.Task]:
+    import random
+
+    # `--stem` narrows every selector below it, including the fallback. Without
+    # that, `--stem X` on its own quietly evaluated one task from each of the 27
+    # stems — 27 tasks' worth of paid requests on the tasks not asked for.
+    pool = [t for t in tasks if not args.stem or t.stem == args.stem]
+    if args.stem and not pool:
+        stems = ", ".join(sorted({t.stem for t in tasks}))
+        raise SystemExit(
+            f"--stem {args.stem!r} matches no task file. Available: {stems}"
+        )
+
     selected: list[ds.Task] = []
     if args.per_stem:
-        selected += _stratified(tasks, lambda t: t.stem, args.per_stem, args.seed)
+        selected += _stratified(pool, lambda t: t.stem, args.per_stem, args.seed)
     if args.n:
-        import random
-
-        pool = [t for t in tasks if not args.stem or t.stem == args.stem]
-        if not pool:
-            raise SystemExit(f"--stem {args.stem!r} matches no task file")
+        if args.n > len(pool):
+            print(
+                f"[warn] --n {args.n} exceeds the pool of {len(pool)}; "
+                f"evaluating {len(pool)}",
+                file=sys.stderr,
+            )
         selected += random.Random(args.seed).sample(pool, min(args.n, len(pool)))
     for spec in args.task or []:
-        selected.append(ds.select(tasks, spec))
+        try:
+            selected.append(ds.select(tasks, spec))
+        except KeyError as exc:
+            raise SystemExit(f"--task {spec!r}: {exc}") from exc
     if not selected:
-        selected = _stratified(tasks, lambda t: t.stem, 1, args.seed)
+        selected = _stratified(pool, lambda t: t.stem, 1, args.seed)
 
     seen: set[str] = set()
     unique = []
@@ -607,6 +648,10 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                 return
+            # The flags travel with the failure too: a flagged row that errors
+            # belongs in `excluded`, not in the `errors` count of the headline
+            # it was never going to be part of.
+            _, rmeta = repair_image_question(task)
             record = {
                 "task_id": task.task_id,
                 "config": f"{cfg.name}:{arm}",
@@ -619,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ok": False,
                 "close": False,
                 "error": f"{type(exc).__name__}: {exc}",
+                **({} if arm != ARM_FIGURE else rmeta),
             }
         with lock:
             store.add(record)

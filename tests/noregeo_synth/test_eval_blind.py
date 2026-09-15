@@ -25,14 +25,19 @@ from experiments.noregeo_synth.configs import (
     ARM_SWAP,
     ARM_SWAP_CONTROL,
     ARM_TEXT,
+    ARMS,
     EVAL_CONFIGS_BY_NAME,
+    EXCLUDED_STEMS,
+    FIGURE_ANSWER_IN_TITLE,
     SWAP_RULE,
     SWAP_SCALE,
 )
 from experiments.noregeo_synth.figures import (
+    DEFAULT_VIEW,
     iter_points,
     render_dots,
     scale_points,
+    union_view_box,
     view_box_for,
 )
 
@@ -436,6 +441,174 @@ def test_records_are_keyed_per_arm(tmp_path):
         store.add({"task_id": "triangle_area:9000", "config": f"cfg:{arm}", "arm": arm})
     store.close()
     assert len(read_records(path)) == 5
+
+
+# ---------------------------------------------------------------------------
+# Stems the benchmark ships broken
+# ---------------------------------------------------------------------------
+
+
+BISECTOR_FAR = {
+    "qid": 8103,
+    "schema_type": "point",
+    # The real bisector:8103. Every point is far outside the benchmark's
+    # default view AND far from the origin, so a box fitted to the unscaled
+    # configuration excludes all three scaled points: this task rendered as an
+    # empty grid before `union_view_box`.
+    "points": {"A": [-13, 15], "B": [-18, -19], "C": [-13, -20]},
+    "answer": {"point": [-13.0, -15.47784012887197]},
+    "question": "Triangle A=(-13, 15), B=(-18, -19), C=(-13, -20); bisector at A.",
+    "image_question": "Refer to the input image. Where does the bisector at A meet BC?",
+    "choices": None,
+    "image_choices": None,
+    "im_dots_path": "/images/task_08103_bisector.png",
+}
+
+SPECIAL_LINES = {
+    "qid": 10001,
+    "schema_type": "classification",
+    "points": {"A": [0, 0], "B": [4, 0], "C": [0, 4], "D": [2, 2]},
+    "answer": "altitude",
+    "question": "Triangle A=(0, 0), B=(4, 0), C=(0, 4); red segment from B to D=(2, 2). What is it?",
+    "image_question": "Refer to the input image. Is the segment from B to D a median, altitude, or bisector?",
+    "choices": ["median", "altitude", "bisector"],
+    "image_choices": ["median", "altitude", "bisector"],
+    # ...and the figure is titled "Task 10001: altitude".
+    "im_dots_path": "/images/task_10001_altitude.png",
+}
+
+
+@pytest.mark.parametrize("stem", sorted(EXCLUDED_STEMS))
+@pytest.mark.parametrize("arm", list(ARMS))
+def test_broken_stems_are_skipped_on_every_arm(stem, arm):
+    """outer_circle_radius asks for a length and answers with a point;
+    triangle_type is a byte-identical duplicate of inner_circle_radius."""
+    reason = eb.arm_applies(task({**TRIANGLE_AREA, "schema_type": "point"}, stem), arm)
+    assert reason == EXCLUDED_STEMS[stem]
+
+
+def test_excluded_stems_carry_no_swap_rule():
+    for stem in EXCLUDED_STEMS:
+        assert stem not in SWAP_RULE
+
+
+@pytest.mark.parametrize("arm", [ARM_FIGURE, ARM_BOTH])
+def test_stem_whose_figure_title_is_the_answer_skips_the_figure_arms(arm):
+    assert eb.arm_applies(task(SPECIAL_LINES, "special_lines"), arm) is not None
+    assert "title" in eb.arm_applies(task(SPECIAL_LINES, "special_lines"), arm)
+
+
+def test_that_stem_still_runs_on_the_text_arm():
+    assert eb.arm_applies(task(SPECIAL_LINES, "special_lines"), ARM_TEXT) is None
+    assert "special_lines" in FIGURE_ANSWER_IN_TITLE
+
+
+# ---------------------------------------------------------------------------
+# The perturbed figure has to be visible
+# ---------------------------------------------------------------------------
+
+
+def test_union_view_box_holds_both_scales_when_the_default_does_not_fit():
+    points = ds.named_points(BISECTOR_FAR)
+    assert view_box_for(points) != DEFAULT_VIEW  # a fitted box, the risky case
+    scaled = scale_points(points, SWAP_SCALE)
+    fitted = view_box_for(points)
+    off = [
+        xy
+        for _, xy in iter_points(scaled)
+        if not (fitted[0] <= xy[0] <= fitted[1] and fitted[2] <= xy[1] <= fitted[3])
+    ]
+    assert off, "this fixture is supposed to fall outside the unscaled box"
+
+    shared = union_view_box([points, scaled])
+    for group in (points, scaled):
+        for _, (x, y) in iter_points(group):
+            assert shared[0] <= x <= shared[1]
+            assert shared[2] <= y <= shared[3]
+
+
+def test_swap_figure_is_not_blank(tmp_path):
+    """The failure this guards: an empty grid scored as "did not read it"."""
+    import matplotlib.image as mpimg
+    import numpy as np
+
+    t = task(BISECTOR_FAR, "bisector")
+    swap = eb.build_request(t, ARM_SWAP, CFG, tmp_path)
+    control = eb.build_request(t, ARM_SWAP_CONTROL, CFG, tmp_path)
+
+    def drawn_points(path):
+        arr = mpimg.imread(path)[..., :3]
+        # The scatter markers are the only saturated colour on the canvas.
+        return int(np.sum(np.ptp(arr, axis=-1) > 0.35))
+
+    assert drawn_points(swap["meta"]["image"]) > 0
+    assert drawn_points(control["meta"]["image"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
+
+
+def test_stem_flag_alone_does_not_sample_every_other_stem():
+    from types import SimpleNamespace
+
+    tasks = [
+        task({**TRIANGLE_AREA, "qid": q}, stem)
+        for stem in ("triangle_area", "bisector", "midpoint")
+        for q in range(3)
+    ]
+    args = SimpleNamespace(stem="triangle_area", n=0, per_stem=0, task=None, seed=0)
+    selected = eb._select_tasks(tasks, args)
+    assert {t.stem for t in selected} == {"triangle_area"}
+
+
+def test_unknown_stem_is_an_error_not_a_full_sweep():
+    from types import SimpleNamespace
+
+    tasks = [task(TRIANGLE_AREA, "triangle_area")]
+    args = SimpleNamespace(stem="nope", n=0, per_stem=0, task=None, seed=0)
+    with pytest.raises(SystemExit):
+        eb._select_tasks(tasks, args)
+
+
+# ---------------------------------------------------------------------------
+# The loose columns only discriminate where the two goldens are apart
+# ---------------------------------------------------------------------------
+
+
+def test_loose_columns_skip_rows_where_the_two_goldens_are_indistinguishable():
+    # An incircle radius of 1.3 halves to 0.65; `loose_num_atol` is 0.5, so the
+    # unscaled answer passes as the scaled one and the row must not count.
+    rows = [
+        {
+            "arm": ARM_SWAP,
+            "ok": False,
+            "close": True,
+            "follows_figure": False,
+            "follows_text": False,
+            "follows_figure_close": True,
+            "follows_text_close": True,
+            "loose_separable": False,
+            "stem": "s",
+        },
+        {
+            "arm": ARM_SWAP,
+            "ok": True,
+            "close": True,
+            "follows_figure": True,
+            "follows_text": False,
+            "follows_figure_close": True,
+            "follows_text_close": False,
+            "loose_separable": True,
+            "stem": "s",
+        },
+    ]
+    text = eb.summarise(rows)
+    start = next(i for i, ln in enumerate(text.splitlines()) if ln.startswith("falsi"))
+    line = next(ln for ln in text.splitlines()[start:] if ln.startswith(ARM_SWAP + " "))
+    assert line.strip().endswith("1")  # one ambiguous row, reported not hidden
+    assert "100.0%" in line  # the separable row: followed the figure
 
 
 def test_figure_arm_uses_the_image_choice_list(no_download, tmp_path):

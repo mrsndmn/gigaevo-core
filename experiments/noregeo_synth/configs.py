@@ -257,10 +257,34 @@ EVAL_OUT_DIR = REPO_ROOT / "run" / "noregeo_eval"
 
 # `im_path` (images_full/) PRINTS THE ANSWER IN THE FIGURE TITLE — e.g.
 # "Task 9000: area = 17.50" — so it is unusable for evaluation and this module
-# never names it. `im_dots_path` (images/) is the clean one: the given points,
-# labelled, on a grid, with the task parameter (the mirror axis, the rotation
-# angle) in the title and nothing else.
+# never names it. `im_dots_path` (images/) is the clean one on 26 of the 27
+# stems: the given points, labelled, on a grid, with the task parameter (the
+# mirror axis, the rotation angle) in the title.
 EVAL_IMAGE_FIELD = "im_dots_path"
+
+# ...and the 27th. `special_lines` asks "is the segment from B to D a median,
+# altitude, or bisector?" and titles its dots figure with the answer ("Task
+# 10001: altitude") on 100 rows out of 100. The figure arms would be reading
+# the caption, not the geometry, so they skip the stem; the text arm is fine.
+FIGURE_ANSWER_IN_TITLE: tuple[str, ...] = ("special_lines",)
+
+# Stems dropped from every arm, with the reason logged at selection time:
+#
+#   outer_circle_radius — the question asks for the circumradius (a length) and
+#       the golden answer is the circum*center* (`schema_type: "point"`, 100 of
+#       100 rows, verified against an independent solver). A model that answers
+#       the question as asked is scored wrong, whichever arm it is in. This is
+#       the same mislabelling as `triangle_type`, which asks for the incircle
+#       radius under a triangle-classification name — there the question and
+#       the answer at least agree.
+#   triangle_type — byte-identical to `inner_circle_radius`, all 100 rows
+#       (same qids, same questions, same answers, same figures). Keeping both
+#       gives incircle radius double weight in every average.
+EXCLUDED_STEMS: dict[str, str] = {
+    "outer_circle_radius": "question asks for the circumradius, golden answer "
+    "is the circumcenter",
+    "triangle_type": "byte-identical duplicate of inner_circle_radius",
+}
 
 # The arms. `swap` is the falsification test: the model gets the ORIGINAL text
 # question (coordinates and all) together with a figure of a *scaled* version
@@ -275,10 +299,13 @@ ARM_SWAP = "swap"  # text question + figure of a scaled configuration
 ARM_SWAP_CONTROL = "swap-control"  # same, scale 1.0
 ARMS: tuple[str, ...] = (ARM_TEXT, ARM_FIGURE, ARM_BOTH, ARM_SWAP, ARM_SWAP_CONTROL)
 
-# Scale factor for the `swap` arm. 0.5 rather than 2.0 so that every scaled
-# configuration still fits the benchmark's fixed [-10.5, 10.5] view box: the
+# Scale factor for the `swap` arm. 0.5 rather than 2.0 so that the scaled
+# configuration stays inside the benchmark's fixed [-10.5, 10.5] view box: the
 # swapped figure differs from the control by the *configuration*, not by the
-# axis range, which would be a giveaway that needs no geometry to spot.
+# axis range, which would be a giveaway that needs no geometry to spot. The 141
+# configurations that leave that box anyway get a view fitted to the union of
+# both scales (`figures.union_view_box`) — fitting it to the unscaled points
+# alone put the shrunken configuration partly or wholly off-canvas.
 SWAP_SCALE = 0.5
 
 # How each stem's golden answer transforms when the whole configuration is
@@ -302,9 +329,6 @@ SWAP_RULE: dict[str, str] = {
     "parallelogram_perimeter": "length",
     "segment_length": "length",
     "inner_circle_radius": "length",
-    "outer_circle_radius": "length",
-    # The file is named triangle_type but its rows ask for the incircle radius.
-    "triangle_type": "length",
     "midpoint": "point",
     "center_coordinates": "point",
     "intersection": "point",

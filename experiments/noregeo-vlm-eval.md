@@ -49,6 +49,20 @@ Checked over all 2700 rows before a single request was sent:
 * **`im_path` prints the answer into the figure title** ("Task 9000: area =
   17.50"). It is unusable for evaluation; `EVAL_IMAGE_FIELD` pins the eval to
   `im_dots_path`, and a test asserts `images_full/` is never fetched.
+* **`im_dots_path` leaks the answer too — on one stem.** `special_lines` asks
+  "is the segment from B to D a median, altitude, or bisector?" and titles its
+  dots figure with the answer ("Task 10001: altitude") on 100 rows out of 100.
+  The figure arms skip that stem; the text arm keeps it.
+* **`outer_circle_radius` asks a question its golden answer does not answer.**
+  The question says "Find the circumradius" — a length — and all 100 rows carry
+  `schema_type: "point"` with the circum*center* as the answer. Excluded from
+  every arm. It also means the 91 accepted `outer_circle_radius` traces in the
+  synthesis dataset derive a circumcenter under a question that asks for a
+  radius.
+* **`triangle_type` is a byte-identical duplicate of `inner_circle_radius`**,
+  all 100 rows. Excluded, so incircle radius is not counted twice — and the
+  synthesis dataset's 199 accepted traces across the pair cover 100 distinct
+  problems, not 200.
 * `image_question` never contains coordinates — the vision arm is clean.
 * `image_answer` equals `answer` on every row, so one scoring path serves both.
 * Two stems ship an unrendered template: `shape_symmetry` asks about the
@@ -74,6 +88,20 @@ configuration inside the benchmark's fixed view box, so the swapped figure and
 its control share one set of axes and differ in the configuration alone; a
 fitted view would have made them pixel-identical apart from the tick labels,
 turning a geometry test into a tick-reading test.
+
+Two traps inside that idea, both caught by review before any numbers were
+taken:
+
+* the shared view box has to hold **both** scales. Fitted to the unscaled
+  configuration alone, scaling towards the origin put at least one point
+  off-canvas on 57 of the swap-eligible tasks and produced an entirely empty
+  grid on 11 of them — which the arm would then have scored as "the model did
+  not read the figure", for a figure with nothing in it;
+* a loose tolerance only discriminates while the two goldens are further apart
+  than the tolerance. On incircle radii (1–3, halving to 0.5–1.5, against
+  `loose_num_atol = 0.5`) they are not, and the row would count in the
+  `figure~` and `text~` columns at once. Those rows are now counted under
+  `ambig` instead.
 
 ## Results
 
@@ -102,9 +130,21 @@ Pending the full run. The two numbers that matter are the `text` → `figure`
 drop and the `swap` arm's figure-vs-text split; the second is the one that says
 whether a figure-arm score means reading or recall.
 
+After the exclusions the arms cover 2500 (text), 2400 (figure, both) and 1400
+(swap, swap-control) of the 2700 rows; every skip is logged with its reason at
+selection time.
+
 ## Changelog
 
 - **2026-09-15** — audit of the benchmark's vision fields (answer-leaking
   `im_path`, two unrendered question templates); `eval_blind.py`, `figures.py`,
   the eval grid in `configs.py` and `tests/noregeo_synth/test_eval_blind.py`;
   pilot on 2 tasks × 5 arms.
+- **2026-09-16** — adversarial review, three defects fixed before the grid ran:
+  `outer_circle_radius` crashed the swap arm on all 100 rows (its answer is a
+  point, not a length) and now sits in `EXCLUDED_STEMS` along with the
+  duplicate `triangle_type`; `special_lines` titles its dots figure with the
+  answer, so the figure arms skip it; the swap view box is the union of both
+  scales, which un-blanks 57 figures. Plus: `--stem` no longer silently
+  evaluates every other stem, and the loose falsification columns skip the rows
+  where the two goldens are closer than the tolerance.

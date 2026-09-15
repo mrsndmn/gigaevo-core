@@ -84,6 +84,26 @@ def scale_points(points: dict[str, Any], scale: float) -> dict[str, Any]:
     return {name: _walk(value) for name, value in points.items()}
 
 
+def union_view_box(
+    point_sets: list[dict[str, Any]], pad: float = 1.0
+) -> tuple[float, float, float, float]:
+    """One view box that contains every one of the given configurations.
+
+    The falsification arm draws the same configuration at two scales and has to
+    draw both in the same axes. Fitting the box to the unscaled points alone is
+    not enough: scaling by 0.5 pulls the configuration towards the origin, and
+    for the 141 configurations that leave [-10.5, 10.5] the origin can be
+    outside their fitted box — 57 of them lost at least one point off-canvas
+    and 11 rendered as an empty grid, which the arm then scored as "did not
+    read the figure".
+    """
+    merged: dict[str, Any] = {}
+    for i, points in enumerate(point_sets):
+        for name, value in points.items():
+            merged[f"{i}:{name}"] = value
+    return view_box_for(merged, pad=pad)
+
+
 def view_box_for(
     points: dict[str, Any], pad: float = 1.0
 ) -> tuple[float, float, float, float]:
