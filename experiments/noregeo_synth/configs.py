@@ -238,3 +238,199 @@ DEFAULT_CONFIG = EXPERIMENT_CONFIGS[0].name
 # `elementary_calculations/center_coordinates`), so a sample is addressed as
 # "<file-stem>:<qid>".
 SMOKE_TASK = "outer_circle_center:6200"
+
+
+# ===========================================================================
+# Coordinate-blind evaluation
+# ===========================================================================
+#
+# Plan: `experiments/noregeo-vlm-eval.md`. Measures whether a VLM can solve a
+# NoReGeo task when the coordinates are NOT in the text and the only source of
+# them is the picture — and, with the `swap` arm, whether it is reading the
+# picture at all or answering from the text it was also given.
+#
+# The benchmark already ships the vision arm: every row carries
+# `image_question` / `image_answer` / `im_path` / `im_dots_path`, and no
+# `image_question` contains coordinates (audited over all 2700 rows).
+
+EVAL_OUT_DIR = REPO_ROOT / "run" / "noregeo_eval"
+
+# `im_path` (images_full/) PRINTS THE ANSWER IN THE FIGURE TITLE — e.g.
+# "Task 9000: area = 17.50" — so it is unusable for evaluation and this module
+# never names it. `im_dots_path` (images/) is the clean one: the given points,
+# labelled, on a grid, with the task parameter (the mirror axis, the rotation
+# angle) in the title and nothing else.
+EVAL_IMAGE_FIELD = "im_dots_path"
+
+# The arms. `swap` is the falsification test: the model gets the ORIGINAL text
+# question (coordinates and all) together with a figure of a *scaled* version
+# of the same configuration. A model that reads the picture answers for the
+# scaled configuration; one that pattern-matches the text answers for the
+# original. `swap-control` is the same thing at scale 1.0 — it separates "the
+# model follows the text" from "the model cannot parse our renderer".
+ARM_TEXT = "text"  # text question with coordinates, no image
+ARM_FIGURE = "figure"  # image_question + dots figure: coordinate-blind
+ARM_BOTH = "both"  # text question + dots figure: does vision add anything
+ARM_SWAP = "swap"  # text question + figure of a scaled configuration
+ARM_SWAP_CONTROL = "swap-control"  # same, scale 1.0
+ARMS: tuple[str, ...] = (ARM_TEXT, ARM_FIGURE, ARM_BOTH, ARM_SWAP, ARM_SWAP_CONTROL)
+
+# Scale factor for the `swap` arm. 0.5 rather than 2.0 so that every scaled
+# configuration still fits the benchmark's fixed [-10.5, 10.5] view box: the
+# swapped figure differs from the control by the *configuration*, not by the
+# axis range, which would be a giveaway that needs no geometry to spot.
+SWAP_SCALE = 0.5
+
+# How each stem's golden answer transforms when the whole configuration is
+# scaled by `s` about the origin. This is what makes the falsification arm
+# possible without writing a solver per task type:
+#
+#   "area"      -> answer * s**2
+#   "length"    -> answer * s
+#   "point"     -> answer coordinates * s
+#   (absent)    -> invariant, and therefore useless as a discriminator
+#
+# Classification stems are all invariant (collinear stays collinear, parallel
+# stays parallel), so they are absent here and the swap arm skips them — 1100
+# of 2700 rows. `reflection` and `rotation_point` stay in because reflection
+# across a coordinate axis and rotation about the origin both commute with
+# scaling about the origin.
+SWAP_RULE: dict[str, str] = {
+    "triangle_area": "area",
+    "parallelogram_area": "area",
+    "triangle_perimeter": "length",
+    "parallelogram_perimeter": "length",
+    "segment_length": "length",
+    "inner_circle_radius": "length",
+    "outer_circle_radius": "length",
+    # The file is named triangle_type but its rows ask for the incircle radius.
+    "triangle_type": "length",
+    "midpoint": "point",
+    "center_coordinates": "point",
+    "intersection": "point",
+    "bisector": "point",
+    "inner_circle_center": "point",
+    "outer_circle_center": "point",
+    "reflection": "point",
+    "rotation_point": "point",
+}
+
+# Two stems ship a vision question with an unrendered template, so the datum
+# the question turns on is missing from BOTH the text and the picture. The
+# repair lifts it out of the *text* question:
+#
+#   shape_symmetry: "...symmetric about the {axis}-axis?" -> X or Y. The axis
+#       is a given, not a coordinate, so the repaired row stays in the headline.
+#   symmetry:       "...symmetric about None?" (50 of 100 rows) -> the centre,
+#       e.g. "point O=(-4, -3)". That DOES put coordinates back into the
+#       prompt, and the centre is not drawn in the figure either, so these rows
+#       are reported separately and excluded from the headline number.
+QUESTION_REPAIRS: dict[str, dict[str, object]] = {
+    "shape_symmetry": {
+        "placeholder": "{axis}",
+        "pattern": r"symmetric about ([XY])-axis",
+        "injects_coordinates": False,
+    },
+    "symmetry": {
+        "placeholder": "None",
+        "pattern": r"symmetric about (point O=\([^)]*\)|line [^?]+)",
+        "injects_coordinates": True,
+    },
+}
+
+# Stems whose *figure* cannot carry the question even after the repair. The
+# shape_symmetry dots image plots the polygon's vertices unlabelled and without
+# edges, so "is the polygon symmetric" additionally requires guessing the
+# vertex order. Kept in the run, reported apart from the headline.
+FIGURE_UNDERSPECIFIED: tuple[str, ...] = ("shape_symmetry",)
+
+# Half of `DEFAULT_WORKERS`. An eval request is much cheaper than a generation
+# request, so the endpoint's *priority* throttle (429 "Too many requests to
+# model. Wait the owner") is reached at a lower concurrency than the generation
+# run ever saw: 4 workers took 429s on 2026-09-15, 8 would be worse.
+DEFAULT_EVAL_WORKERS = 4
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    """One evaluated model, plus how its answers are scored."""
+
+    name: str
+    model: str
+    base_url: str = DEFAULT_BASE_URL
+
+    # Greedy: this is a measurement, not a generation run, so we want the
+    # model's single best answer rather than a sample from its distribution.
+    temperature: float = 0.0
+    top_p: float = 1.0
+    max_tokens: int = 2048
+    # Reached only by the retry path in `generate._call`, which escalates the
+    # budget when a completion was cut off rather than degenerate.
+    max_tokens_ceiling: int = 6144
+    seed: int | None = 1234
+    thinking: str | None = "low"
+    request_timeout: float = 300.0
+    call_retries: int = 2
+    # Higher than the generation run's 3: the failures here are 429s from a
+    # shared endpoint rather than gateway hiccups, and giving up on one turns a
+    # throttled minute into a permanently unscored row.
+    transport_retries: int = 6
+    max_consecutive_failures: int = 15
+    min_free_gb: float = 5.0
+
+    # Scoring. The strict tolerances are the ones `verify.py` already uses, so
+    # a figure-arm answer is held to the same standard as a generated trace.
+    num_rtol: float = 1e-2
+    num_atol: float = 1e-2
+    point_atol: float = 0.05
+    # ...and a loose pass recorded alongside it. The difference between the two
+    # separates "read the picture slightly wrong" from "did not read it": a
+    # model that misplaces one vertex by a grid square lands here, not at zero.
+    loose_num_rtol: float = 0.05
+    loose_num_atol: float = 0.5
+    loose_point_atol: float = 0.75
+
+    note: str = ""
+
+
+EVAL_CONFIGS: list[EvalConfig] = [
+    EvalConfig(
+        name="qwen38-27b",
+        model="Qwen/Qwen3.8-27B",
+        note="the model that generated the synthesis dataset",
+    ),
+    # `thinking=None` for the Medgemma arms: they are not reasoning models, and
+    # `reasoning_effort` on a model that does not take it is a 400 — which the
+    # retry policy (correctly) does not retry.
+    EvalConfig(
+        name="medgemma-27b",
+        model="Google/Medgemma-27b-it",
+        thinking=None,
+        note="best coordinate read-off in the 2026-09-15 pilot",
+    ),
+    EvalConfig(
+        name="medgemma-4b",
+        model="Google/Medgemma-1.5-4b-it",
+        thinking=None,
+        note="small VLM: how much of this is model size",
+    ),
+    EvalConfig(
+        name="qwen35-27b",
+        model="Qwen/Qwen3.5-27B",
+        note="previous generation; returned empty completions on image input "
+        "in the pilot, so expect a high unparseable rate",
+    ),
+]
+
+# `Openai/Gpt-oss-120b` is deliberately NOT in the grid: the endpoint accepts
+# an image payload for it and the model then answers "I can't see images", so
+# its figure-arm score would measure the gateway, not the model. It is useful
+# as a blind control (`--config gptoss-120b-blind`), and only as that.
+BLIND_CONTROL = EvalConfig(
+    name="gptoss-120b-blind",
+    model="Openai/Gpt-oss-120b",
+    note="NOT multimodal despite accepting the payload: blind control only",
+)
+
+EVAL_CONFIGS_BY_NAME = {c.name: c for c in [*EVAL_CONFIGS, BLIND_CONTROL]}
+DEFAULT_EVAL_CONFIG = EVAL_CONFIGS[0].name
