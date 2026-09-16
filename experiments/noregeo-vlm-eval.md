@@ -122,17 +122,65 @@ the labelled points off the figure, `Medgemma-27b-it` placed 48% of points
 within ±0.5, `Qwen3.8-27B` 22% (and failed to return parseable JSON on 7 of 10
 attempts). That is the capability everything else rests on.
 
-Full grid: pending.
+### The grid, 2026-09-16
+
+3 tasks per stem, both models, every arm — 303 jobs each, finished 05:11.
+Exact / loose, over the rows that survived the exclusions:
+
+| model | text | figure | both | swap | swap-control |
+|---|---|---|---|---|---|
+| Qwen3.8-27B | 97.3 / 98.7 (75) | **88.1** / 91.0 (67) | 97.2 / 97.2 (72) | 40.5 / 83.3 (42) | 97.6 / 100.0 (42) |
+| Medgemma-27b | 73.0 / 73.0 (74) | **19.7** / 24.2 (66) | 93.5 / 93.5 (62) | 0.0 / 22.0 (41) | 14.6 / 31.7 (41) |
+
+Falsification — which source the answer follows, strict / loose:
+
+| model | follows figure | follows text | neither (strict) |
+|---|---|---|---|
+| Qwen3.8-27B | 40.5 / **83.3** | 2.4 / **4.8** | 57.1 |
+| Medgemma-27b | 0.0 / 22.0 | 0.0 / 4.9 | 100.0 |
+
+Errors: 0 for Qwen, 14 for Medgemma (all "no usable completion after 3
+attempts" — schema-invalid output, 10 of them in the `both` arm, which is why
+that arm's 93.5% is over 62 surviving rows and not 72).
 
 ## Conclusions
 
-Pending the full run. The two numbers that matter are the `text` → `figure`
-drop and the `swap` arm's figure-vs-text split; the second is the one that says
-whether a figure-arm score means reading or recall.
+**The gap is real and model-dependent.** Moving the coordinates from the text
+into the picture costs Qwen3.8-27B 9 points (97.3 → 88.1) and Medgemma-27b 53
+(73.0 → 19.7). A single number for "VLMs cannot read figures" would have been
+wrong in both directions.
+
+**Qwen3.8-27B is genuinely reading the figure, not recalling the benchmark.**
+In the falsification arm it answers for the drawn configuration 83% of the time
+and for the stale text it was also given 5% of the time. Recall of a public
+benchmark and text-shortcutting both look like the second number, and it is not
+there.
+
+**What it lacks is metric precision, not comprehension.** 18 of the 42 swap
+rows read the configuration correctly and still missed the strict tolerance,
+by 0.23–0.48 — a quarter to half a grid square. The strict-to-loose jump
+(40.5 → 83.3) is that error and nothing else. So the capability to buy with
+training is *reading the grid accurately*, not *attending to the image*; the
+figure arm's per-stem losses agree, being spread thin (1/3 on `parallel_lines`,
+2/3 on seven others) rather than concentrated in a category.
+
+**The swap-control earns its place.** Medgemma answers 93.5% with the
+benchmark's own figure beside the text, and 14.6% with ours plus the
+"the figure is authoritative" instruction. Without that control its 0%
+"follows figure" would read as a preference for the text; with it, the honest
+reading is that it cannot use the rendered figure at all, and its swap row says
+nothing about preference.
+
+Caveats: 3 tasks per stem is a coarse sample, and Medgemma's `both` arm lost 10
+rows to unusable completions, which could flatter it.
 
 After the exclusions the arms cover 2500 (text), 2400 (figure, both) and 1400
 (swap, swap-control) of the 2700 rows; every skip is logged with its reason at
 selection time.
+
+Next: this is the baseline for the coordinate-blind regeneration — traces where
+the model sees the figure and the question carries no coordinates, filtered by
+the same automatic checker as the text-arm dataset.
 
 ## Changelog
 
@@ -148,3 +196,7 @@ selection time.
   scales, which un-blanks 57 figures. Plus: `--stem` no longer silently
   evaluates every other stem, and the loose falsification columns skip the rows
   where the two goldens are closer than the tolerance.
+- **2026-09-16** — the grid ran: 3 tasks per stem × 5 arms × 2 models, 606 jobs,
+  finished 05:11. Qwen3.8-27B loses 9 points going coordinate-blind and follows
+  the drawn configuration over the stale text 83% to 5%; Medgemma-27b loses 53
+  and cannot use the rendered figure at all.
