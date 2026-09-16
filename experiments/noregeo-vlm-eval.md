@@ -164,15 +164,37 @@ training is *reading the grid accurately*, not *attending to the image*; the
 figure arm's per-stem losses agree, being spread thin (1/3 on `parallel_lines`,
 2/3 on seven others) rather than concentrated in a category.
 
-**The swap-control earns its place.** Medgemma answers 93.5% with the
-benchmark's own figure beside the text, and 14.6% with ours plus the
-"the figure is authoritative" instruction. Without that control its 0%
-"follows figure" would read as a preference for the text; with it, the honest
-reading is that it cannot use the rendered figure at all, and its swap row says
-nothing about preference.
+**The swap-control earns its place, but it is not a clean single-variable
+control.** It differs from `both` in two ways at once: the figure is ours
+rather than the benchmark's, *and* the prompt carries the "the text is stale,
+the image is authoritative" instruction. Medgemma answers 93.5% on `both` and
+14.6% on `swap-control`, and that 79-point drop cannot be attributed to one of
+the two by the arms as they stand.
 
-Caveats: 3 tasks per stem is a coarse sample, and Medgemma's `both` arm lost 10
-rows to unusable completions, which could flatter it.
+The renderer is nonetheless exonerated by a paired comparison against the
+`figure` arm, on the tasks both arms scored:
+
+| model | figure (benchmark's PNG) | swap-control (ours) | n |
+|---|---|---|---|
+| Qwen3.8-27B | 95.2% | 97.6% | 42 |
+| Medgemma-27b | 7.5% | 15.0% | 40 |
+
+Our figure is no harder than the benchmark's for either model — Medgemma
+actually does better on it. So what the instruction does is push the model off
+the text and onto a read-off it cannot perform, and Medgemma's own `reasoning`
+shows exactly that: on `center_coordinates:6017` it states "the coordinates of
+point A are (-4, 8) and of point B are (-2, -2)" and computes a midpoint of
+(-3, 3) against a golden (-3.5, 3.5) — it is not refusing and not blind, it is
+misreading. Its swap row therefore says nothing about a text-vs-figure
+preference: it cannot read either figure accurately enough to express one.
+
+Caveats: 3 tasks per stem is a coarse sample; Medgemma's `both` arm lost 10
+rows to unusable completions, which could flatter it; and in `swap-control` the
+figure agrees with the text by construction, so a model that quietly ignores
+the instruction and answers from the text still scores — which is why
+Qwen's 97.6% there sits above its 88.1% on the `figure` arm. Separating the
+renderer from the instruction needs a sixth arm (our figure, no instruction),
+which this grid does not have.
 
 After the exclusions the arms cover 2500 (text), 2400 (figure, both) and 1400
 (swap, swap-control) of the 2700 rows; every skip is logged with its reason at
