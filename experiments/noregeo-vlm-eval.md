@@ -171,13 +171,24 @@ the image is authoritative" instruction. Medgemma answers 93.5% on `both` and
 14.6% on `swap-control`, and that 79-point drop cannot be attributed to one of
 the two by the arms as they stand.
 
-The renderer is nonetheless exonerated by a paired comparison against the
-`figure` arm, on the tasks both arms scored:
+The renderer is nonetheless exonerated by a paired comparison across the three
+figure-bearing arms, over the tasks scored in all of them (exact / loose):
 
-| model | figure (benchmark's PNG) | swap-control (ours) | n |
-|---|---|---|---|
-| Qwen3.8-27B | 95.2% | 97.6% | 42 |
-| Medgemma-27b | 7.5% | 15.0% | 40 |
+| model | n | figure (benchmark's PNG) | swap-control (ours, ×1) | swap (ours, ×0.5) |
+|---|---|---|---|---|
+| Qwen3.8-27B | 42 | 95.2 / 100.0 | 97.6 / 100.0 | 40.5 / 83.3 |
+| Medgemma-27b | 39 | 7.7 / 15.4 | 15.4 / 30.8 | 0.0 / 23.1 |
+
+Two things fall out of the third column. First, `swap` differs from
+`swap-control` in exactly one variable — the drawn configuration — so the
+97.6 → 40.5 collapse is caused by nothing but halving the coordinates: points
+that sat on grid nodes now sit between them. Loose accuracy barely moves
+(100.0 → 83.3), which is the sharpest form of the precision claim: the
+configuration still comes through, the exact numbers do not. Second, the
+paired subset is the 14 scale-sensitive stems, all of them point- or
+number-answered, so its absolute numbers sit below the headline, which
+includes classification stems with two options to choose between (Medgemma's
+`figure` is 7.7% here against 19.7% overall).
 
 Our figure is no harder than the benchmark's for either model — Medgemma
 actually does better on it. So what the instruction does is push the model off
