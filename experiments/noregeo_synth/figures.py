@@ -144,6 +144,14 @@ def render_dots(
     and its control share one set of axes: with a fitted view the scaled figure
     would look pixel-identical to the control except for the tick labels, and
     the falsification test would be a tick-reading test.
+
+    `title` is not decoration. The benchmark's own dots figures put the task's
+    *parameter* in the title on 200 rows — "reflect P across X-axis",
+    "rotate P by 90°" — and a caller that passes a bare task name there loses
+    it. The swap arms can afford that because they also hand the model the
+    original text question, which states the parameter; anything driven by
+    `image_question` alone (the coordinate-blind regeneration) cannot, and must
+    put the parameter in the title itself or those tasks become unanswerable.
     """
     from matplotlib.figure import Figure
 
