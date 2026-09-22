@@ -41,7 +41,10 @@ shared credential file, not embedded in manifests or staged code.
 
 ## Results
 
-Pending launch.
+Submitted MLS job `lm-mpi-job-9b114238-dacb-4986-9d57-c6db23fc24c0`
+from commit `bb6bafe0f8fd49caafdac2863d52683edcc8e574`. The job is running;
+the first fresh text baselines were saved successfully and paired rollouts
+have started. Final metrics are pending.
 
 ## Conclusions
 
@@ -54,3 +57,5 @@ Pending evaluation. The earlier one-task smoke test establishes operation only.
 - 2026-09-23 — Review fixes: drawing timeouts are terminal failures, resume
   recovers the first action from both arms and rejects mismatches, concurrent
   report writers use unique temporary files.
+
+- 2026-09-23 — Submitted and verified worker startup; first endpoint responses saved.
