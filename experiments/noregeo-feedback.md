@@ -12,6 +12,10 @@ and knowing that execution succeeded.
 model, budgets and observation modes live in `feedback.py:experiment_configs`.
 Run with `python -m experiments.noregeo_synth.feedback --task <stem>:<qid>`.
 Read saved results with `--summary --out <run directory>`.
+For a standalone visual comparison, run
+`python -m experiments.noregeo_synth.feedback_report --run <run directory> --out <report.html>`.
+The report embeds the figures, compares steps side by side, and separates human
+notes (`--note`) from automatic checks. It requires no network access to open.
 
 Both arms branch from the same first action and retain the full action history.
 Generated snippets execute locally through the existing guarded subprocess;
@@ -50,3 +54,5 @@ does not establish a benefit from image feedback.
 - 2026-09-23 — Added paired stepwise rollouts and local feedback-isolation tests.
 
 - 2026-09-23 — Review: preserve a live drawing process; continue other measurements after recoverable rollout failures.
+
+- 2026-09-23 — Added standalone HTML analysis of saved rollouts.
