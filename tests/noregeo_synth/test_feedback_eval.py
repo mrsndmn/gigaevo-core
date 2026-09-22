@@ -134,6 +134,8 @@ def test_job_manifest_does_not_contain_token_and_maps_paths():
         "/workspace-SR004.nfs2/"
     )
     assert "--run --out /workspace-SR004.nfs2/" in job["script"]
+    assert "\n" not in job["script"]
+    assert " && " in job["script"]
     assert launch.JOB_ID.fullmatch("lm-mpi-job-48fcb78d-e22e-4076-a28d-f92f4e1d6b0c")
     assert not launch.JOB_ID.fullmatch("lm-mpi-job-48fcb78d")
 

@@ -84,7 +84,7 @@ def payload(commit, out, credential_file):
         "--out",
         to_job_path(out),
     ]
-    script = f"set -eu\ncd {shlex.quote(workdir)}\n" + shlex.join(command)
+    script = f"cd {shlex.quote(workdir)} && " + shlex.join(command)
     return {
         "job": {
             "description": DESCRIPTION,
