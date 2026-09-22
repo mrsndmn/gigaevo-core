@@ -51,3 +51,6 @@ Pending evaluation. The earlier one-task smoke test establishes operation only.
 
 - 2026-09-23 — Planned matched historical comparison, fresh text baseline,
   resumable paired rollouts, HTML summaries and MLS launcher.
+- 2026-09-23 — Review fixes: drawing timeouts are terminal failures, resume
+  recovers the first action from both arms and rejects mismatches, concurrent
+  report writers use unique temporary files.

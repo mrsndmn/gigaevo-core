@@ -238,7 +238,14 @@ def rollout(task, experiment, out, client, call=_call, first_step=None):
                 raise ValueError("invalid step object")
             record["steps"].append(step)
             messages.append({"role": "assistant", "content": json.dumps(step)})
-            result = session.step(step)
+            try:
+                result = session.step(step)
+            except Exception as exc:
+                if batch_stopper(exc):
+                    raise
+                record["status"] = "execution_failed"
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                return record
             write_json(out / f"execution_{i:02d}.json", asdict(result))
             if not result.ok:
                 record["status"] = "execution_failed"

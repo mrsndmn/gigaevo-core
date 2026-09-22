@@ -15,6 +15,7 @@ from html import escape
 import json
 import math
 from pathlib import Path
+import tempfile
 import threading
 
 from . import dataset as ds
@@ -49,12 +50,22 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
-def write(path, value):
+def atomic_text(path, content):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-    temp.replace(path)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=path.name + ".", delete=False
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(content)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write(path, value):
+    atomic_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def digest(path):
@@ -127,7 +138,25 @@ def stored(out, task_id, arm):
         if arm == "text"
         else arm_directory(out, task_id, arm) / "record.json"
     )
-    return read(path) if path.exists() else None
+    try:
+        return read(path)
+    except FileNotFoundError:
+        return None
+
+
+def recover_first_step(out, task_id):
+    shared_file = task_directory(out, task_id) / "first_step.json"
+    candidates = [read(shared_file)] if shared_file.exists() else []
+    for arm in ("history", "canvas"):
+        record = stored(out, task_id, arm)
+        if record and record.get("steps"):
+            candidates.append(record["steps"][0])
+    if any(candidate != candidates[0] for candidate in candidates):
+        raise ValueError(f"conflicting first actions: {task_id}")
+    if candidates:
+        write(shared_file, candidates[0])
+        return candidates[0]
+    return None
 
 
 def finished(record, arm):
@@ -172,7 +201,7 @@ def comparison(out):
     snapshot = read(out / "inputs.json")
     ids = [ds.Task(**t).task_id for t in snapshot["tasks"]]
     old = {(r["task_id"], r["arm"]): r for r in snapshot["historical"]}
-    rows, pairs = [], []
+    rows, pairs, protocol_errors = [], [], []
     for arm in ("text", "history", "canvas"):
         records = [stored(out, tid, arm) for tid in ids]
         done = [r for r in records if finished(r, arm)]
@@ -201,7 +230,14 @@ def comparison(out):
     for tid in ids:
         h, c = stored(out, tid, "history"), stored(out, tid, "canvas")
         if finished(h, "history") and finished(c, "canvas"):
-            pairs.append((h, c))
+            if (
+                not h.get("steps")
+                or not c.get("steps")
+                or h["steps"][0] != c["steps"][0]
+            ):
+                protocol_errors.append(tid)
+            else:
+                pairs.append((h, c))
     matched = []
     for old_arm in ("text", "both", "figure", "swap", "swap-control"):
         # Swapped configurations have different gold answers: descriptive only,
@@ -243,7 +279,12 @@ def comparison(out):
                     "new_correct": new_correct,
                 }
             )
-    data = {"rows": rows, "paired": paired_counts(pairs), "matched": matched}
+    data = {
+        "rows": rows,
+        "paired": paired_counts(pairs),
+        "matched": matched,
+        "protocol_errors": protocol_errors,
+    }
     write(out / "comparison.json", data)
     html = [
         '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -256,6 +297,12 @@ def comparison(out):
     for row in rows:
         html.append(
             f"<tr><td>{row['arm']}</td><td>{row['finished']} / {row['planned']}</td><td>{row['correct']}</td><td>{row['accepted'] if row['accepted'] is not None else '—'}</td><td>{row['errors']}</td></tr>"
+        )
+    if protocol_errors:
+        html.append(
+            "<p>Нарушен общий первый шаг; пары исключены: "
+            + escape(", ".join(protocol_errors))
+            + "</p>"
         )
     p = data["paired"]
     html += [
@@ -280,7 +327,7 @@ def comparison(out):
             else f"<li>{escape(tid)} — ожидает прогона</li>"
         )
     html += ["</ul></main></html>"]
-    (out / "comparison.html").write_text("".join(html))
+    atomic_text(out / "comparison.html", "".join(html))
     return data
 
 
@@ -306,7 +353,7 @@ def evaluate_task(task, out, stop, spec=SPEC):
                 raise
         write(directory / "text.json", result)
     shared_file = directory / "first_step.json"
-    shared = read(shared_file) if shared_file.exists() else None
+    shared = recover_first_step(out, task.task_id)
     for arm in feedback_configs:
         if stop.is_set():
             break
@@ -377,6 +424,7 @@ def run(out, spec=SPEC):
         for t in tasks
         for arm in ("text", "history", "canvas")
     )
+    complete = complete and not comparison(out)["protocol_errors"]
     if complete:
         write(
             out / "complete.json",
