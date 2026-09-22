@@ -41,11 +41,28 @@ def git(*args):
     ).strip()
 
 
+def parse_mls_output(output):
+    # This installed CLI prints a Python-dict diagnostic before its JSON
+    # submission response. Parse the trailing complete JSON object only.
+    output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", output):
+        try:
+            value, end = decoder.raw_decode(output[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and not output[match.start() + end :].strip():
+            return value
+    raise ValueError(
+        "MLS CLI did not return a final JSON response; inspect job list before retrying"
+    )
+
+
 def mls(*args):
     proc = subprocess.run(
         [MLS, "job", *args, "-O", "json"], capture_output=True, text=True, check=True
     )
-    value = json.loads(proc.stdout)
+    value = parse_mls_output(proc.stdout)
     if value.get("error_code") or value.get("error_message"):
         raise RuntimeError(
             f"MLS request failed: {value.get('error_code')}: {value.get('error_message')}"

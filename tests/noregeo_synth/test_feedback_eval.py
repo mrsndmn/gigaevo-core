@@ -200,3 +200,14 @@ def test_real_drawing_timeouts_count_as_terminal_wrong_pair(tmp_path, monkeypatc
     metrics = ev.comparison(tmp_path)
     assert metrics["paired"]["n"] == 1
     assert metrics["paired"]["neither"] == 1
+
+
+def test_mls_submission_diagnostic_prefix():
+    output = 'result_json {\'script\': \'echo test\', \'env\': {}}\n{"status": "ok", "job_name": "lm-mpi-job-48fcb78d-e22e-4076-a28d-f92f4e1d6b0c"}\n'
+    assert launch.parse_mls_output(output)["status"] == "ok"
+    assert (
+        launch.parse_mls_output('{"status": "error", "error_code": 4}')["error_code"]
+        == 4
+    )
+    with pytest.raises(ValueError, match="final JSON"):
+        launch.parse_mls_output("result_json {'script': 'echo test'}")
