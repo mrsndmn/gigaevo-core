@@ -109,31 +109,6 @@ def test_call_failure_is_saved(task, tmp_path):
     assert not record["accepted"]
 
 
-def test_replay_mismatch_aborts(task, tmp_path, monkeypatch):
-    real_run = fb.run_steps
-
-    def changed_run(preamble, steps, out, cfg, target):
-        result = real_run(preamble, steps, out, cfg, target)
-        if len(steps) == 2:
-            from pathlib import Path
-
-            Path(result.steps[0].image).write_bytes(b"changed")
-        return result
-
-    monkeypatch.setattr(fb, "run_steps", changed_run)
-    count = 0
-
-    def call(*args, **kwargs):
-        nonlocal count
-        result = STEPS[count]
-        count += 1
-        return result, "", {}
-
-    with pytest.raises(RuntimeError, match="replay changed"):
-        fb.rollout(task, config("status"), tmp_path / "mismatch", None, call=call)
-    assert count == 2
-
-
 def test_shared_first_step_is_executed_without_resampling(task, tmp_path):
     calls = []
 
@@ -153,3 +128,86 @@ def test_shared_first_step_is_executed_without_resampling(task, tmp_path):
     assert len(calls) == 2
     assert calls[0][-1]["content"][1]["type"] == "image_url"
     assert result["accepted"]
+
+
+def test_worker_preserves_unrendered_state_and_frames(task, tmp_path):
+    from experiments.noregeo_synth.feedback_execute import DrawingSession
+
+    cfg = config("status").generation
+    session = DrawingSession(fb.build_preamble(task.row, cfg), tmp_path, cfg, None)
+    try:
+        first = session.step(
+            {
+                "title": "one",
+                "code": 'state["answer"] = float(np.random.random()); mark("A", P["A"])',
+            }
+        )
+        value = first.state_answer
+        original = (tmp_path / "step_01.png").read_bytes()
+        second = session.step(
+            {"title": "two", "code": 'state["answer"] += 1; mark("B", P["B"])'}
+        )
+        assert second.state_answer == value + 1
+        assert len(second.steps) == 2
+        assert (tmp_path / "step_01.png").read_bytes() == original
+    finally:
+        session.close()
+    assert session.process.poll() is not None
+
+
+def test_worker_timeout_kills_process(task, tmp_path):
+    from experiments.noregeo_synth.feedback_execute import DrawingSession
+
+    cfg = config("status").generation
+    session = DrawingSession(fb.build_preamble(task.row, cfg), tmp_path, cfg, None)
+    session.cfg = replace(cfg, exec_timeout=0.1)
+    try:
+        with pytest.raises(TimeoutError):
+            session.step({"title": "loop", "code": "while True: pass"})
+        assert session.process.poll() is not None
+    finally:
+        session.close()
+
+
+def test_cli_continues_other_arms_and_tasks(task, tmp_path, monkeypatch):
+    second = replace(task, row={**task.row, "qid": 2})
+    monkeypatch.setattr(fb.ds, "load_tasks", lambda: [task, second])
+    monkeypatch.setattr(fb, "_client", lambda cfg: (None, None))
+    monkeypatch.setattr(fb, "check_model_is_served", lambda *args: None)
+    seen = []
+
+    def rollout(task, experiment, out, client, first_step):
+        seen.append((task.task_id, experiment.name, first_step))
+        out.mkdir(parents=True)
+        record = {
+            "task_id": task.task_id,
+            "arm": experiment.name,
+            "steps": [STEPS[0]],
+            "error": None,
+            "accepted": True,
+            "status": "completed",
+        }
+        if len(seen) == 1:
+            record.update(error="unusable completion", accepted=False, status="error")
+        fb.write_json(out / "record.json", record)
+        if len(seen) == 1:
+            raise RuntimeError("unusable completion")
+        return record
+
+    monkeypatch.setattr(fb, "rollout", rollout)
+    assert (
+        fb.main(
+            [
+                "--task",
+                task.task_id,
+                "--task",
+                second.task_id,
+                "--out",
+                str(tmp_path / "run"),
+            ]
+        )
+        == 1
+    )
+    assert len(seen) == 4
+    assert seen[1][2] == STEPS[0]
+    assert seen[2][2] is None

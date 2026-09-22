@@ -11,7 +11,6 @@ import argparse
 import base64
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-import hashlib
 import json
 from pathlib import Path
 import time
@@ -19,8 +18,15 @@ import time
 from . import dataset as ds
 from .canvas import build_preamble
 from .configs import EXCLUDED_STEMS, REPO_ROOT, GenConfig
-from .execute import run_steps
-from .generate import _call, _client, check_model_is_served, golden_point, run_checks
+from .feedback_execute import DrawingSession
+from .generate import (
+    _call,
+    _client,
+    batch_stopper,
+    check_model_is_served,
+    golden_point,
+    run_checks,
+)
 from .prompts import _answer_schema, build_messages
 from .verify import contact_sheet
 
@@ -134,7 +140,7 @@ def render_report(record, out):
             "```",
             "",
         ]
-        frame = out / f"turn_{i:02d}" / f"step_{i:02d}.png"
+        frame = out / "frames" / f"step_{i:02d}.png"
         if frame.exists():
             lines += [f"![Step {i}]({frame.relative_to(out)})", ""]
     lines += [
@@ -160,8 +166,7 @@ def render_report(record, out):
     ]
     (out / "trace.md").write_text("\n".join(lines))
     frames = [
-        out / f"turn_{i:02d}" / f"step_{i:02d}.png"
-        for i in range(1, len(record["steps"]) + 1)
+        out / "frames" / f"step_{i:02d}.png" for i in range(1, len(record["steps"]) + 1)
     ]
     frames = [str(p) for p in frames if p.exists()]
     if frames:
@@ -174,12 +179,7 @@ def render_report(record, out):
 
 
 def rollout(task, experiment, out, client, call=_call, first_step=None):
-    """Replay immutable prefixes; verify that already observed frames stay identical.
-
-    Fresh subprocesses retain the existing guard/timeout isolation. Replay costs
-    O(steps²), acceptable for this pilot. A mismatch aborts instead of silently
-    changing the state the policy previously observed.
-    """
+    """Keep one drawing process alive across all policy calls in this rollout."""
     cfg = experiment.generation
     if cfg.min_steps != cfg.max_steps or cfg.max_steps < 1:
         raise ValueError("feedback rollouts require a fixed positive step budget")
@@ -202,7 +202,7 @@ def rollout(task, experiment, out, client, call=_call, first_step=None):
         "shared_first_step": first_step is not None,
     }
     started = time.monotonic()
-    hashes = []
+    session = None
 
     def checkpoint():
         record["wall_time_s"] = round(time.monotonic() - started, 2)
@@ -223,6 +223,7 @@ def rollout(task, experiment, out, client, call=_call, first_step=None):
 
     checkpoint()
     try:
+        session = DrawingSession(preamble, out / "frames", cfg, golden_point(task.row))
         for i in range(1, cfg.max_steps + 1):
             if i == 1 and first_step is not None:
                 step = dict(first_step)
@@ -235,14 +236,7 @@ def rollout(task, experiment, out, client, call=_call, first_step=None):
                 raise ValueError("invalid step object")
             record["steps"].append(step)
             messages.append({"role": "assistant", "content": json.dumps(step)})
-            # Gold coordinates are used ONLY for the offline drawn-answer check.
-            result = run_steps(
-                preamble,
-                record["steps"],
-                out / f"turn_{i:02d}",
-                cfg,
-                golden_point(task.row),
-            )
+            result = session.step(step)
             write_json(out / f"execution_{i:02d}.json", asdict(result))
             if not result.ok:
                 record["status"] = "execution_failed"
@@ -251,13 +245,6 @@ def rollout(task, experiment, out, client, call=_call, first_step=None):
                     failed.error if failed else "execution failed"
                 )
                 return record
-            current = [
-                hashlib.sha256(Path(s.image).read_bytes()).hexdigest()
-                for s in result.steps
-            ]
-            if current[:-1] != hashes:
-                raise RuntimeError("prefix replay changed a previously observed frame")
-            hashes = current
             instruction = (
                 "All construction steps are complete. Return only final_answer now."
                 if i == cfg.max_steps
@@ -286,6 +273,8 @@ def rollout(task, experiment, out, client, call=_call, first_step=None):
         record["error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        if session is not None:
+            session.close()
         checkpoint()
         render_report(record, out)
 
@@ -341,13 +330,22 @@ def main(argv=None):
     for task in tasks:
         shared = None
         for experiment in experiment_configs:
-            record = rollout(
-                task,
-                experiment,
-                root / task.task_id.replace(":", "_") / experiment.name,
-                client,
-                first_step=shared,
-            )
+            destination = root / task.task_id.replace(":", "_") / experiment.name
+            try:
+                record = rollout(
+                    task, experiment, destination, client, first_step=shared
+                )
+            except Exception as exc:
+                if batch_stopper(exc):
+                    raise
+                failed = True
+                record_path = destination / "record.json"
+                if not record_path.exists():
+                    raise
+                record = json.loads(record_path.read_text())
+                print(
+                    f"{task.task_id} {experiment.name}: {record['error']}", flush=True
+                )
             # Both arms branch from exactly the same first proposed action.
             if shared is None and record["steps"]:
                 shared = record["steps"][0]

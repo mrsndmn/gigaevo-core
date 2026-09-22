@@ -15,8 +15,10 @@ Read saved results with `--summary --out <run directory>`.
 
 Both arms branch from the same first action and retain the full action history.
 Generated snippets execute locally through the existing guarded subprocess;
-inference uses the configured remote endpoint. Prefix replay is checked against
-previously observed frame hashes. Execution failures terminate the rollout.
+inference uses the configured remote endpoint. Each rollout retains one live
+Python process across policy calls, preserving all intermediate variables.
+Execution failures terminate that rollout; recoverable request failures do not
+prevent the remaining arms and tasks from running.
 Gold answers and final verification are offline only, never repair feedback.
 Records retain unsuccessful rollouts as well as successful ones.
 
@@ -28,12 +30,23 @@ errors separately, and report both answer correctness and full trace acceptance.
 
 ## Results
 
-Pending local pilot.
+The initial pilot on `outer_circle_center:6200` completed both arms with the
+correct final answer, computed answer and marked center. The canvas arm had an
+incorrect radius in one prose step despite drawing it correctly; the verifier
+does not validate every prose statement. This initial pilot used prefix replay;
+review subsequently required persistent execution. Re-executing the captured
+responses through the persistent worker produced byte-identical model requests
+(including all image payloads) and identical verification results. No additional
+inference was used for this replay; both live and replay artifacts are under
+`run/noregeo_feedback/pilot-20260923*`.
 
 ## Conclusions
 
-Pending pilot. No claim of a benefit from image feedback yet.
+The protocol produces inspectable stepwise traces. One successful paired task
+does not establish a benefit from image feedback.
 
 ## Changelog
 
 - 2026-09-23 — Added paired stepwise rollouts and local feedback-isolation tests.
+
+- 2026-09-23 — Review: preserve a live drawing process; continue other measurements after recoverable rollout failures.
