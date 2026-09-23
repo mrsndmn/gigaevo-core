@@ -30,7 +30,9 @@ runs, not a concurrent control for endpoint model/version drift.
 
 ## Results
 
-Pending.
+Submitted MLS job `lm-mpi-job-630c93f6-bde6-4495-879a-8d665a2996ac`
+from reviewed commit `a15638cbc62bed4ab19797374e966b34bf644afa`.
+All149 NoReGeo tests passed. Live results pending.
 
 ## Conclusions
 
