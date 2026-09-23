@@ -95,3 +95,96 @@ at 72,304 of Qwen3-1.7B's 151,936 on this ru+en corpus. Load-bearing because
 inactive ids leak into every result through the softmax normalizer unless every
 arm — including the untouched reference — masks the same set.
 _Avoid_: used vocab, effective vocab, corpus vocab.
+
+## Geometry / GeoState terms
+
+### Construction problem
+A straightedge-and-compass task: an initial geometric state, a goal predicate
+that is invariant under the task's symmetry group, and a move budget. Success
+is exact satisfaction of the predicate; cost is the number of moves. This — not
+a NoReGeo row, which asks for a number or a point — is what GeoState is trained
+and scored on.
+_Avoid_: task (unqualified), question, NoReGeo row, problem instance.
+
+### Geometric state
+The set of objects a construction has produced so far — for each, a handle, a
+type (point, line, circle, intersection pair), its exact geometric value and an
+optional label. It is the environment's state and the thing state tokens
+encode; it grows by moves and is never re-read from pixels.
+_Avoid_: canvas (the matplotlib canvas of noregeo_synth), figure, scene, world
+state.
+
+### Move
+One application of a primitive tool to existing objects — a line through two
+points, a circle by centre and a point, or the meet of two objects — that
+appends objects to the geometric state. The unit in which construction length
+and cost are counted. In RL framing a move is the action; in noregeo_synth a
+"step" is a block of model-written code, which is not a move.
+_Avoid_: step, op, tool call, action (outside the RL sense).
+
+### Goal predicate
+An exact, symmetry-invariant relation between objects of the geometric state —
+incidence, tangency, coincidence — whose truth ends a construction problem
+successfully. Verifiable without a model, which is what makes an RLVR reward
+exact.
+_Avoid_: golden answer (that is NoReGeo's coordinate answer), target, condition.
+
+### State token
+The context-window representation of one object of the geometric state: one
+token per object, carrying only invariant quantities into the language model.
+Computed exactly from the state, not predicted — which distinguishes it from a
+DETR slot in the latent-canvas notes, where the state is inferred.
+_Avoid_: object token, slot, latent, canvas token.
+
+### Auxiliary construction set
+The NoReGeo stems whose golden answer is a point that a construction can
+produce (midpoint, intersection, bisector, incentre, circumcentre, reflection,
+rotation), recast as construction problems whose goal is coincidence with the
+golden point. Used for consistency measurement only, never as the primary train
+or eval set.
+_Avoid_: NoReGeo (unqualified), benchmark, transfer set.
+
+### Consistency (under a symmetry group)
+The measured rate at which a model gives the same answer — mapped back through
+the transform — to copies of one construction problem that differ only by a
+group element or a relabelling. Invariance is the mathematical property;
+consistency is its empirical estimate, and it is what E0 reports.
+_Avoid_: robustness, invariance (for the measured rate), agreement (unqualified).
+
+### Matched-training baseline
+A baseline arm that receives the same base model, the same training
+trajectories and the same decoding constraints as the arm under test, and
+differs from it only in how the geometric state is represented. Any claim that
+state tokens help is made against this arm, never against an untrained
+protocol.
+_Avoid_: baseline (unqualified), B1, zero-shot baseline.
+
+### Orientation-preserving similarity
+A transform of the plane composed of translation, rotation and uniform scaling
+— the symmetry group of the GeoState decisive probe. Reflections are excluded
+so that the two points of an intersection have a canonical order that every
+group element preserves.
+_Avoid_: Sim(2) (which includes reflections), rigid motion (no scaling),
+isometry, pose.
+
+### Intersection pair
+The two points produced by the meet of two circles, or of a circle and a
+line, ordered by orientation relative to the objects that meet, so that the
+order is preserved by every orientation-preserving similarity.
+_Avoid_: point pair (unordered), meet result, first/second intersection
+(without the ordering rule).
+
+### Invariant-feature encoder
+An encoder for state tokens whose inputs are exact invariants of the geometric
+state — distances, angles, incidence and tangency indicators between objects —
+so that invariance holds by construction and nothing equivariant is learned.
+The decisive probe's encoder; a learned equivariant network is an ablation
+against it, not a prerequisite.
+_Avoid_: CGENN (the learned alternative), MLP encoder, projector (one part
+of it).
+
+### Handle
+The stable identifier of one object in the geometric state, assigned when the
+object is appended and referenced by later moves. Distinct from a label (A, B),
+which is optional, human-facing and may be permuted.
+_Avoid_: name, id, label (for the identifier).
