@@ -75,12 +75,19 @@ def normalized(description):
     return " ".join(re.sub(r"[#@]\S+", "", description).split())
 
 
-def payload(commit, out, credential_file):
+def payload(
+    commit,
+    out,
+    credential_file,
+    spec=SPEC,
+    module="experiments.noregeo_synth.recovery_eval",
+):
+    description = f"[gigaevo/noregeo_recovery] {spec.name}"
     workdir = f"{STAGING_ROOT}/{commit}"
     command = [
         f"{ENV_PREFIX}/python",
         "-m",
-        "experiments.noregeo_synth.recovery_eval",
+        module,
         "--run",
         "--out",
         to_job_path(out),
@@ -88,7 +95,7 @@ def payload(commit, out, credential_file):
     script = f"cd {shlex.quote(workdir)} && " + shlex.join(command)
     return {
         "job": {
-            "description": DESCRIPTION,
+            "description": description,
             "type": "binary_exp",
             "shm_size_class": "medium",
             "environment": {
@@ -101,7 +108,7 @@ def payload(commit, out, credential_file):
                 },
             },
             "resource": {
-                "instance_type": SPEC.instance_type,
+                "instance_type": spec.instance_type,
                 "workers": 1,
                 "processes": 1,
             },
@@ -113,18 +120,35 @@ def payload(commit, out, credential_file):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry", action="store_true")
+    parser.add_argument(
+        "--experiment", choices=("original", "extra15"), default="original"
+    )
     args = parser.parse_args(argv)
+    spec, prepare_run, report_run = SPEC, prepare, report
+    module = "experiments.noregeo_synth.recovery_eval"
+    if args.experiment == "extra15":
+        from . import recovery_extra
+
+        spec, prepare_run, report_run = (
+            recovery_extra.SPEC,
+            recovery_extra.prepare,
+            recovery_extra.report,
+        )
+        module = "experiments.noregeo_synth.recovery_extra"
+    description = f"[gigaevo/noregeo_recovery] {spec.name}"
     commit = git("rev-parse", "HEAD")
-    out = Path(SPEC.artifact_root) / SPEC.name
+    out = Path(spec.artifact_root) / spec.name
     creds = resolve()
     if creds.source == "environment":
         raise RuntimeError(
             "worker needs a persistent AIRI_ENV_FILE; environment-only credentials cannot be staged"
         )
-    plan = payload(commit, out, creds.source)
+    plan = payload(commit, out, creds.source, spec, module)
     if args.dry:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
-        print(f"Frozen cohort: 75 tasks; endpoint concurrency: {SPEC.workers}")
+        print(
+            f"Frozen cohort: {getattr(spec, 'count', 75)} tasks; endpoint concurrency: {spec.workers}"
+        )
         return 0
     if git("status", "--porcelain"):
         raise RuntimeError("commit changes before staging the evaluation")
@@ -133,13 +157,13 @@ def main(argv=None):
     # the API query is unavailable; never submit blindly.
     with (out / "submission.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        prepare(out)
+        prepare_run(out)
         if (out / "complete.json").exists() or (out / "stopped.json").exists():
             print(f"Already complete: {out}")
             return 0
         active = mls("list", "-s", "Pending", "-s", "Running", "-l", "6000")
         for job in active["jobs"]:
-            if normalized(job.get("job_desc", "")) == DESCRIPTION:
+            if normalized(job.get("job_desc", "")) == description:
                 name = job["job_name"]
                 if not JOB_ID.fullmatch(name):
                     raise RuntimeError("MLS returned an invalid full job ID")
@@ -149,7 +173,7 @@ def main(argv=None):
         # JSON is a YAML subset accepted by the mls manifest reader.
         manifest = out / "job-manifest.json"
         write(manifest, plan)
-        report(out)
+        report_run(out)
         result = mls("submit", "--config", str(manifest))
         name = result.get("job_name")
         if not isinstance(name, str) or not JOB_ID.fullmatch(name):
