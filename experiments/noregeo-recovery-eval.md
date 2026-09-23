@@ -43,7 +43,10 @@ Artifacts use a new run under the existing external NFS results root.
 
 ## Results
 
-Implementation and validation in progress; no new scores yet.
+Submitted MLS job `lm-mpi-job-b43f8546-b47c-401b-9e59-665b42300742`
+from commit `58a6af4301b19b5539e395d7dfc65ef0f2cfc85e`; MLS reports running.
+The full NoReGeo test suite passes (135 tests); independent review approved
+all fixes before submission. New experiment scores are pending.
 
 ## Conclusions
 
@@ -59,3 +62,5 @@ Pending. Do not infer visual usefulness from completion-filtered subsets.
   non-null computed answer, independently of whether that answer is correct.
   Historical diagnostic prompts intentionally remain exact saved contexts and
   may retain the old answer-derived view bounds; they measure formatting only.
+
+- 2026-09-23 — Submitted reviewed code and verified MLS running status.
