@@ -25,7 +25,9 @@ shared-first costs from overall spend. Full planned denominators remain visible.
 
 ## Results
 
-Pending launch and evaluation.
+Submitted MLS job `lm-mpi-job-aad6051c-07e6-4836-8f42-3f24b0984a1e`
+from reviewed commit `eefb5c031a93fb73ef3d7cf4305867a791e71be8`.
+All 139 NoReGeo tests passed before submission. Evaluation is pending.
 
 ## Conclusions
 
