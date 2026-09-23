@@ -50,3 +50,17 @@ def test_launcher_payload_selects_correct_module_and_description():
     assert "recovery_extra" in new["job"]["script"]
     assert new["job"]["description"].endswith(ev.SPEC.name)
     assert old["job"]["description"] != new["job"]["description"]
+
+
+def test_shared_first_counted_once_before_event_checkpoint():
+    h = record("history")
+    c = record("canvas")
+    for r in [h, c]:
+        r["status"] = "running"
+        r["correct"] = False
+        r.pop("final_raw")
+    c["events"] = []
+    assert ev.group_metrics([h, c], 1)["actual_tokens"] == 15
+    h["events"] = []
+    assert ev.group_metrics([h, c], 1)["actual_tokens"] == 15
+    assert ev.group_metrics([h], 1)["actual_tokens"] == 15

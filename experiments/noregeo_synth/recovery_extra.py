@@ -100,6 +100,9 @@ def prepare(out, spec=SPEC):
 
 
 def group_metrics(rows, planned):
+    # first is persisted before events: count its known paid usage even when an
+    # arm is interrupted before its first event checkpoint. Never mutate traces.
+    rows = [{**r, "events": [{"raw": r["first"]}] + r["events"][1:]} for r in rows]
     arms = {
         arm: base.arm_metrics([r for r in rows if r["arm"] == arm]) for arm in base.ARMS
     }
@@ -139,19 +142,18 @@ def group_metrics(rows, planned):
             pairs.append(
                 tuple({"checks": {"answer_ok": pair[a]["correct"]}} for a in base.ARMS)
             )
-    # Subtract only duplicated shared responses, including incomplete pairs correctly.
-    duplicated = sum(
-        pair["history"]["first"].get("usage", {}).get("total_tokens", 0)
-        for pair in by_id.values()
-        if all(a in pair for a in base.ARMS)
-    )
+    continuation_tokens = 0
+    for row in rows:
+        raws = [e["raw"] for e in row["events"][1:]]
+        if "final_raw" in row:
+            raws.append(row["final_raw"])
+        continuation_tokens += sum(
+            raw.get("usage", {}).get("total_tokens", 0) for raw in raws
+        )
     return {
         "arms": arms,
         "shared_first_tokens": shared,
-        "actual_tokens": sum(
-            a["total_tokens_including_shared_first"] for a in arms.values()
-        )
-        - duplicated,
+        "actual_tokens": shared + continuation_tokens,
         "paired": base.paired_counts(pairs),
     }
 
