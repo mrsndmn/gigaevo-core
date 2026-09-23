@@ -48,6 +48,7 @@ ARMS = ("history", "canvas", "canvas_last")
 TERMINAL = {"completed", "execution_failed", "construction_failed", "format_error"}
 TRANSIENT = (
     "APIConnectionError:",
+    "APITimeoutError:",
     "RateLimitError:",
     "InternalServerError:",
     "JSONDecodeError:",
@@ -138,6 +139,7 @@ def full_request(client, messages, schema, fmt, directory, salt):
     for attempt in range(SPEC.transport_rounds):
         recover_raw(directory)
         cached = directory / "result.json"
+        result = None
         if cached.exists():
             saved = read(directory / "request.json")
             if saved["messages"] != messages:
@@ -145,7 +147,12 @@ def full_request(client, messages, schema, fmt, directory, salt):
             result = read(cached)
             if not result.get("error"):
                 return result
-        else:
+            if result["error"].startswith("AuthenticationError:"):
+                # A prior run may have stopped on an expired key. Retry only
+                # the saved rejection; a fresh authentication error stops again.
+                archive_request(directory)
+                result = None
+        if result is None:
             # Refresh credentials at each request; source env file can be renewed
             # while this independent MLS job is running.
             fresh, _ = base._client(base.CFG)
@@ -158,11 +165,29 @@ def full_request(client, messages, schema, fmt, directory, salt):
             return result
         if attempt + 1 == SPEC.transport_rounds:
             return result
-        archive = directory.parent / "transport_attempts" / directory.name / stamp()
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        directory.rename(archive)
+        archive_request(directory)
         time.sleep(SPEC.transport_backoff_seconds * (attempt + 1))
     raise AssertionError("unreachable")
+
+
+def archive_request(directory):
+    if list(directory.glob("raw_*.json")):
+        raise RuntimeError("refusing to invalidate a received completion")
+    archive = directory.parent / "transport_attempts" / directory.name / stamp()
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    directory.rename(archive)
+
+
+def read_available(paths):
+    # A resumed worker archives nonterminal checkpoints between glob and read.
+    # Missing records reappear at the next atomic checkpoint/report.
+    rows = []
+    for path in paths:
+        try:
+            rows.append(read(path))
+        except FileNotFoundError:
+            continue
+    return rows
 
 
 def resume_arm(directory):
@@ -241,11 +266,7 @@ def evaluate_task(value, out, stop):
 def trace(root):
     """Small independent HTML for any task with a terminal non-success."""
     root = Path(root)
-    rows = [
-        read(root / a / "record.json")
-        for a in ARMS
-        if (root / a / "record.json").exists()
-    ]
+    rows = read_available(root / a / "record.json" for a in ARMS)
     if not any(r["status"] in TERMINAL and not r["correct"] for r in rows):
         return
     parts = [
@@ -276,6 +297,18 @@ def trace(root):
                     + '">'
                 )
             parts.append("</details>")
+        if "final_raw" in r:
+            parts.append(
+                "<h3>Сырой финальный ответ</h3><pre>"
+                + escape(json.dumps(r["final_raw"], ensure_ascii=False, indent=2))
+                + "</pre>"
+            )
+        if r.get("error"):
+            parts.append(
+                "<p>Ошибка разбора/выполнения:</p><pre>"
+                + escape(str(r["error"]))
+                + "</pre>"
+            )
         parts.append(
             "<p>Финальный ответ: " + escape(str(r.get("final_answer"))) + "</p>"
         )
@@ -287,7 +320,7 @@ def report(out):
     out = Path(out)
     snapshot = read(out / "inputs.json")
     tasks = {extra.task_id(t): t for t in snapshot["tasks"]}
-    rows = [read(p) for p in out.glob("tasks/*/*/record.json")]
+    rows = read_available(out.glob("tasks/*/*/record.json"))
     lookup = {(r["task_id"], r["arm"]): r for r in rows}
     if len(lookup) != len(rows):
         raise ValueError("duplicate task/arm records")

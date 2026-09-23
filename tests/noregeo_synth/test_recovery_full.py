@@ -134,3 +134,68 @@ def test_report_primary_all_shared_tokens_and_mismatched_first(tmp_path):
     write(path, record)
     with pytest.raises(ValueError, match="canonical"):
         ev.report(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "error", ["AuthenticationError: expired", "APITimeoutError: timeout"]
+)
+def test_resume_retries_saved_infrastructure_rejections(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(ev, "SPEC", replace(ev.SPEC, transport_backoff_seconds=0))
+    directory = tmp_path / "call"
+    write(directory / "request.json", {"messages": []})
+    write(directory / "result.json", {"error": error})
+
+    class Client:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ev.base, "_client", lambda cfg: (Client(), None))
+    calls = []
+
+    def request(*args):
+        calls.append(1)
+        return {"error": None, "content": "renewed"}
+
+    monkeypatch.setattr(ev.base, "request", request)
+    assert (
+        ev.full_request(None, [], {}, "block", directory, "s")["content"] == "renewed"
+    )
+    assert len(calls) == 1
+
+
+def test_report_tolerates_archived_checkpoint(tmp_path, monkeypatch):
+    path = tmp_path / "record.json"
+    write(path, {"status": "running"})
+    original = ev.read
+
+    def racing_read(p):
+        p.unlink()
+        return original(p)
+
+    monkeypatch.setattr(ev, "read", racing_read)
+    assert ev.read_available([path]) == []
+
+
+def test_format_failure_trace_contains_raw_final_and_parser_error(tmp_path):
+    write(
+        tmp_path / "history/record.json",
+        {
+            "task_id": "a:1",
+            "question": "question",
+            "gold": 1,
+            "arm": "history",
+            "status": "format_error",
+            "correct": False,
+            "events": [],
+            "final_raw": {
+                "content": "malformed final <evidence>",
+                "finish_reason": "length",
+            },
+            "error": "missing final_answer",
+        },
+    )
+    ev.trace(tmp_path)
+    html = (tmp_path / "analysis.html").read_text()
+    assert "malformed final &lt;evidence&gt;" in html
+    assert "missing final_answer" in html
+    assert "length" in html
