@@ -49,6 +49,10 @@ class Skipped:
     reason: str
 
 
+class GoldenMismatch(ValueError):
+    """The kernel's target disagrees with the benchmark's golden point."""
+
+
 def _points(row: dict[str, Any]) -> Given:
     pts = row["points"]
     if isinstance(pts, dict):
@@ -112,7 +116,7 @@ def problem_from_task(task: _dataset.Task, tol: ToleranceSpec = TOL) -> Problem:
         problem.target_params[0] - float(gx), problem.target_params[1] - float(gy)
     )
     if dist > POINT_ATOL:
-        raise ValueError(
+        raise GoldenMismatch(
             f"kernel target {problem.target_params} vs golden ({gx}, {gy}): |d|={dist:.4g}"
         )
     return problem
@@ -122,16 +126,26 @@ def aux_tasks() -> list[_dataset.Task]:
     return [t for t in _dataset.load_tasks() if t.stem in AUX_STEMS]
 
 
-def check_all(tol: ToleranceSpec = TOL) -> tuple[list[Problem], list[Skipped]]:
-    """Recast every row of the seven stems; return the problems and the skips."""
+def check_all(
+    tol: ToleranceSpec = TOL,
+) -> tuple[list[Problem], list[Skipped], list[Skipped]]:
+    """Recast every row of the seven stems.
+
+    Returns the valid problems, the rows skipped as degenerate under the
+    environment's tolerances, and the rows where the kernel *disagrees* with
+    the golden point — the last list must be empty (AC-8).
+    """
     ok: list[Problem] = []
     skipped: list[Skipped] = []
+    mismatched: list[Skipped] = []
     for task in aux_tasks():
         try:
             ok.append(problem_from_task(task, tol))
+        except GoldenMismatch as exc:
+            mismatched.append(Skipped(task.task_id, str(exc)))
         except (MoveError, ValueError) as exc:
             skipped.append(Skipped(task.task_id, str(exc)))
-    return ok, skipped
+    return ok, skipped, mismatched
 
 
 def load_aux_problems(
@@ -154,6 +168,8 @@ def load_aux_problems(
             try:
                 problems.append(problem_from_task(task, tol))
                 taken += 1
+            except GoldenMismatch as exc:
+                skipped.append(Skipped(task.task_id, f"GOLDEN MISMATCH: {exc}"))
             except (MoveError, ValueError) as exc:
                 skipped.append(Skipped(task.task_id, str(exc)))
     return problems, skipped
@@ -166,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
     if args.check:
-        ok, skipped = check_all()
+        ok, skipped, mismatched = check_all()
         per_stem: dict[str, int] = {}
         for p in ok:
             per_stem[p.meta["stem"]] = per_stem.get(p.meta["stem"], 0) + 1
@@ -176,9 +192,13 @@ def main(argv: list[str] | None = None) -> int:
             moves.setdefault(p.meta["stem"], []).append(p.n_moves)
         for stem, ns in moves.items():
             print(f"  {stem}: moves {min(ns)}-{max(ns)}")
-        print(f"skipped: {len(skipped)}")
+        print(f"skipped as degenerate: {len(skipped)}")
         for s in skipped[:50]:
             print(f"  {s.task_id}: {s.reason}")
+        print(f"golden mismatches: {len(mismatched)}")
+        for s in mismatched[:50]:
+            print(f"  {s.task_id}: {s.reason}")
+        return 1 if mismatched else 0
     return 0
 
 

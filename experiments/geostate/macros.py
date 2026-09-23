@@ -14,8 +14,9 @@ phrase templates are written so that nesting reads naturally ("the midpoint of
 A and the circumcentre of the triangle with vertices A, B and C").
 
 `Builder` wraps a state and reuses an object that already exists with the same
-geometry instead of constructing it twice, so trajectories carry no redundant
-moves.
+geometry instead of constructing it twice; `generator.prune_trajectory` then
+drops every move the target does not depend on, so a recorded trajectory
+carries no dead moves.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from .state import (
     Move,
     MoveError,
     Obj,
+    incident,
 )
 
 Expr = str | list
@@ -102,12 +104,12 @@ class Builder:
                 return h
         raise MoveError(ERR_DEGENERATE, "no candidate with the requested orientation")
 
-    def is_incident(self, p: str, line_handle: str) -> bool:
-        from .state import incident
-
+    def point_on_line(self, p: str, a: str, q: str) -> bool:
+        """Is p on the line through a and q? Computed, not constructed."""
+        kind, mv = self.state.compute(Move(OP_LINE, (a, q)))[0]
         return incident(
             self.state.get(p),
-            self.state.get(line_handle),
+            Obj("?", kind, mv),
             self.state.scale,
             self.state.tol.incidence,
         )
@@ -152,8 +154,8 @@ def foot(b: Builder, p: str, a: str, q: str) -> str:
 
 def perp_through(b: Builder, p: str, a: str, q: str) -> str:
     """Line through p perpendicular to the line through a and q."""
-    base = b.line(a, q)
-    if b.is_incident(p, base):
+    if b.point_on_line(p, a, q):
+        base = b.line(a, q)
         anchor = q if b.state.coincides(p, a) else a
         x, y = b.meet(b.circle(p, anchor), base)
         return perp_bisector(b, x, y)
@@ -162,11 +164,11 @@ def perp_through(b: Builder, p: str, a: str, q: str) -> str:
 
 def parallel_through(b: Builder, p: str, a: str, q: str) -> str:
     """Line through p parallel to the line through a and q (rhombus construction)."""
-    base = b.line(a, q)
-    if b.is_incident(p, base):
+    if b.point_on_line(p, a, q):
         raise MoveError(
             ERR_DEGENERATE, "point lies on the line: parallel is the line itself"
         )
+    base = b.line(a, q)
     x, _ = b.meet(b.circle(a, p), base)
     u, v = b.meet(b.circle(p, a), b.circle(x, a))
     r = b.other([u, v], a)
@@ -376,11 +378,13 @@ def expand(builder: Builder, expr: Expr) -> str:
     return macro.fn(builder, *handles)
 
 
-def describe(expr: Expr) -> str:
+def describe(expr: Expr, nested: bool = False) -> str:
+    """English description; nested constructions are parenthesised."""
     if isinstance(expr, str):
         return expr
     macro = MACROS[expr[0]]
-    return macro.template.format(*(describe(a) for a in expr[1:]))
+    text = macro.template.format(*(describe(a, True) for a in expr[1:]))
+    return f"({text})" if nested else text
 
 
 def result_kind(expr: Expr) -> str:
@@ -452,13 +456,21 @@ def inverse_params(
     return cga.line_params(cga.line_through(cga.point(*p), cga.point(*q)))
 
 
-def distance_between(kind: str, a: Sequence[float], b: Sequence[float]) -> float:
-    """A scale-comparable distance between two objects' parameters."""
+def distance_between(
+    kind: str, a: Sequence[float], b: Sequence[float], scale: float = 1.0
+) -> float:
+    """A length-valued distance between two objects' parameters.
+
+    For lines the angle between the normals (its sine) is multiplied by
+    `scale` so that it is commensurable with the offset difference; a caller
+    comparing against `rel_tol * scale` therefore bounds both the angle (in
+    radians, by rel_tol) and the offset (by rel_tol * scale).
+    """
     if kind == POINT:
         return math.hypot(a[0] - b[0], a[1] - b[1])
     if kind == CIRCLE:
         return max(math.hypot(a[0] - b[0], a[1] - b[1]), abs(a[2] - b[2]))
-    dot = a[0] * b[0] + a[1] * b[1]
-    if dot >= 0:
-        return max(abs(1.0 - dot), abs(a[2] - b[2]))
-    return max(abs(1.0 + dot), abs(a[2] + b[2]))
+    nx, ny, d = b
+    if a[0] * nx + a[1] * ny < 0:
+        nx, ny, d = -nx, -ny, -d
+    return max(abs(a[0] * ny - a[1] * nx) * scale, abs(a[2] - d))

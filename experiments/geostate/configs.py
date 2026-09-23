@@ -59,6 +59,13 @@ TRANSFORM_KINDS: tuple[str, ...] = (
     "similarity+relabel",
 )
 
+# Out-of-distribution condition (ADR 0005): a reflection composed with a
+# rotation, never part of the training group. Copies whose target is not the
+# reflection of the original target (orientation-dependent constructions such
+# as a quarter turn) are rejected at preparation time, so the OOD set only
+# contains problems where the question is well posed.
+OOD_KINDS: tuple[str, ...] = ("identity", "reflect", "reflect+relabel")
+
 # ---------------------------------------------------------------------------
 # Kernel tolerances — all relative to the state's characteristic length (the
 # diameter of the given points), so every predicate is invariant under scaling.
@@ -148,6 +155,13 @@ AUX_STEMS: dict[str, str] = {
 class E0Gate:
     min_moves: int = 5  # the bucket the gate is read on: problems with >= this
     consistency_kill: float = 0.95  # best open model at/above this => H0 dead
+    # The verdict is withheld unless the data can carry it: every copy must
+    # have been evaluated (no request errors), most copies must have produced
+    # a parseable answer, and the model must solve a fair share of the
+    # untransformed problems — a model that cannot use the language, or a run
+    # with an expired token, is "consistent" for the wrong reason.
+    min_answered_rate: float = 0.9
+    min_success_identity: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -202,6 +216,9 @@ class E0Config:
     retry_backoff_cap: float = 60.0
     workers: int = 2
     bootstrap: int = 1000
+    # Only a gated config's summary prints the H0 verdict (AC-14): the figure
+    # arm and the auxiliary set are reported, not judged.
+    gated: bool = False
 
 
 experiment_configs: list[E0Config] = [
@@ -210,12 +227,23 @@ experiment_configs: list[E0Config] = [
         models=(MODEL_QWEN38, MODEL_QWEN35, MODEL_QWEN3_NEXT),
         arm=ARM_TEXT,
         problem_set=SET_SYNTHETIC,
+        gated=True,
     ),
     E0Config(
         name="e0-aux-text",
         models=(MODEL_QWEN38, MODEL_QWEN35, MODEL_QWEN3_NEXT),
         arm=ARM_TEXT,
         problem_set=SET_AUX,
+        per_stem=100,  # every valid row of the seven stems
+    ),
+    E0Config(
+        name="e0-synthetic-text-reflect",
+        models=(MODEL_QWEN38,),
+        arm=ARM_TEXT,
+        problem_set=SET_SYNTHETIC,
+        copies=4,
+        kinds=OOD_KINDS,
+        group=GROUP_OOD_REFLECTION,
     ),
     E0Config(
         name="e0-aux-figure",

@@ -116,10 +116,11 @@ def same_geometry(a: Obj, b: Obj, scale: float, rel_tol: float) -> bool:
             math.hypot(pa[0] - pb[0], pa[1] - pb[1]) <= eps
             and abs(pa[2] - pb[2]) <= eps
         )
-    dot = pa[0] * pb[0] + pa[1] * pb[1]
-    if dot >= 0:
-        return abs(1.0 - dot) <= rel_tol and abs(pa[2] - pb[2]) <= eps
-    return abs(1.0 + dot) <= rel_tol and abs(pa[2] + pb[2]) <= eps
+    nx, ny, d = pb
+    if pa[0] * nx + pa[1] * ny < 0:  # same line, opposite direction
+        nx, ny, d = -nx, -ny, -d
+    angle = abs(pa[0] * ny - pa[1] * nx)  # sin of the angle between normals
+    return angle <= rel_tol and abs(pa[2] - d) <= eps
 
 
 def incident(p: Obj, o: Obj, scale: float, rel_tol: float) -> bool:

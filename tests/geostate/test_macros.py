@@ -120,7 +120,7 @@ def test_nested_expressions_describe_and_relabel():
     macros.validate_expr(expr)
     assert (
         macros.describe(expr)
-        == "the midpoint of A and the circumcentre of the triangle with vertices A, B and C"
+        == "the midpoint of A and (the circumcentre of the triangle with vertices A, B and C)"
     )
     assert macros.relabel_expr(expr, {"A": "B", "B": "A"}) == [
         "midpoint",

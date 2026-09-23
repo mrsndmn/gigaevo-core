@@ -47,7 +47,8 @@ def test_recipes_parse_the_question_parameters():
     not _data_present(), reason="NoReGeo task files not cached in data/noregeo"
 )
 def test_kernel_reproduces_golden_points_on_the_seven_stems():
-    ok, skipped = aux.check_all()
+    ok, skipped, mismatched = aux.check_all()
+    assert mismatched == [], [s.reason for s in mismatched]
     assert len(ok) + len(skipped) == 100 * len(AUX_STEMS)
     assert len(ok) >= 680, [s.reason for s in skipped]
     allowed = (
@@ -56,7 +57,7 @@ def test_kernel_reproduces_golden_points_on_the_seven_stems():
         "zero radius",
         "too close",
         "target existed",
-        "coincides",
+        "given point",
     )
     for s in skipped:
         assert any(a in s.reason for a in allowed), s

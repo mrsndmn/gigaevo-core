@@ -7,11 +7,13 @@ from experiments.geostate.generator import (
     Problem,
     count_macros,
     generate,
+    generate_with_stats,
     load_problems,
+    prune_trajectory,
     save_problems,
 )
 from experiments.geostate.macros import object_from_params
-from experiments.geostate.state import same_geometry
+from experiments.geostate.state import GeometricState, Move, same_geometry
 
 
 def test_generation_is_deterministic():
@@ -63,3 +65,50 @@ def test_problems_round_trip_through_jsonl(tmp_path):
     assert [p.to_dict() for p in loaded] == [p.to_dict() for p in problems]
     assert isinstance(loaded[0], Problem)
     assert loaded[0].state().handles() == list(problems[0].given)
+
+
+def test_trajectories_have_no_dead_moves():
+    """Every move's output is consumed later, or it is the last move."""
+    for p in generate(seed=9, per_bucket=5):
+        st = p.state()
+        used: set[str] = set()
+        produced: list[list[str]] = []
+        for m in p.trajectory:
+            used.update(m.args)
+            produced.append([o.handle for o in st.apply(m)])
+        for i, outs in enumerate(produced[:-1]):
+            assert any(h in used for h in outs), (p.id, i, p.trajectory)
+        assert p.answer in produced[-1]
+
+
+def test_prune_drops_unused_moves_and_renumbers():
+    given = {"A": (0.0, 0.0), "B": (8.0, 0.0), "C": (2.0, 6.0)}
+    moves = [
+        Move("line", ("A", "B")),  # h1: unused
+        Move("circle", ("A", "B")),  # h2
+        Move("circle", ("B", "A")),  # h3
+        Move("meet", ("h2", "h3")),  # h4, h5
+        Move("line", ("h4", "h5")),  # h6
+    ]
+    pruned, answer = prune_trajectory(given, moves, "h6")
+    assert [m.text() for m in pruned] == [
+        "circle(A, B)",
+        "circle(B, A)",
+        "meet(h1, h2)",
+        "line(h3, h4)",
+    ]
+    assert answer == "h5"
+    st = GeometricState.from_given(given)
+    st.replay(pruned)
+    full = GeometricState.from_given(given)
+    full.replay(moves)
+    assert st.get("h5").params() == full.get("h6").params()
+
+
+def test_generation_stats_are_reported():
+    problems, stats = generate_with_stats(seed=1, per_bucket=2)
+    assert stats.accepted == len(problems) == 6
+    assert stats.attempts >= stats.accepted
+    assert not stats.underfilled
+    assert sum(stats.rejected.values()) == stats.attempts - stats.accepted
+    assert "Sample larger" not in " ".join(stats.rejected)

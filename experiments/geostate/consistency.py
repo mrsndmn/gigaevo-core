@@ -6,7 +6,9 @@ copies that differ from it by a random orientation-preserving similarity
 given points, or both. Each copy is a construction problem in its own right —
 the target is re-derived by the kernel from the transformed given points, so
 success is judged in the copy's own frame. Consistency is the rate at which a
-model's answers to the copies agree once mapped back to the original frame.
+model's *answers* to the copies agree once mapped back to the original frame;
+copies without a parseable answer, and copies whose request failed, are
+reported as coverage and never counted as agreement.
 
 Arms: `text` puts the coordinates in the prompt; `figure` renders the labelled
 points on a grid (the benchmark's own dots style) and the prompt carries no
@@ -14,8 +16,14 @@ coordinates. The model's program is executed by the kernel; nothing the model
 writes is evaluated as code.
 
     python -m experiments.geostate.consistency --config e0-synthetic-text --dry
-    python -m experiments.geostate.consistency --config e0-synthetic-text --run --limit 10
+    python -m experiments.geostate.consistency --config e0-synthetic-text --run --limit 12
     python -m experiments.geostate.consistency --config e0-synthetic-text --summary
+    python -m experiments.geostate.consistency --config e0-synthetic-text --recover-errors
+
+`--recover-errors` archives the request directories whose result is a
+transport/auth error (for example after a token renewal) so that the next
+`--run` re-issues exactly those requests; it refuses to touch a run that holds
+the lock.
 """
 
 from __future__ import annotations
@@ -23,14 +31,16 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import itertools
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -46,6 +56,7 @@ from .configs import (
     DEFAULT_CONFIG,
     E0_GATE,
     GENERATOR,
+    LENGTH_BUCKETS,
     OUT_DIR,
     SET_AUX,
     SET_SYNTHETIC,
@@ -56,9 +67,23 @@ from .configs import (
     config_named,
     experiment_configs,
 )
-from .generator import Problem, build_problem, generate, load_problems, save_problems
-from .macros import distance_between, inverse_params, object_from_params, relabel_expr
-from .state import MoveError, same_geometry
+from .generator import (
+    Problem,
+    build_problem,
+    generate_with_stats,
+    load_problems,
+    save_problems,
+)
+from .macros import (
+    distance_between,
+    inverse_params,
+    object_from_params,
+    relabel_expr,
+)
+from .state import ERR_DEGENERATE, MoveError, same_geometry
+
+REQUEST_ERROR = "request_error"
+LOCK_NAME = ".lock"
 
 # ---------------------------------------------------------------------------
 # Copies
@@ -101,21 +126,31 @@ def sample_similarity(rng: random.Random, group: GroupSpec, kind: str) -> Simila
     tx = ty = 0.0
     theta = 0.0
     scale = 1.0
+    reflect = False
     if kind in ("translate", "similarity", "similarity+relabel"):
         tx = rng.uniform(-group.translation_max, group.translation_max)
         ty = rng.uniform(-group.translation_max, group.translation_max)
-    if kind in ("rotate", "similarity", "similarity+relabel"):
+    if kind in (
+        "rotate",
+        "similarity",
+        "similarity+relabel",
+        "reflect",
+        "reflect+relabel",
+    ):
         theta = rng.uniform(0.0, 2.0 * math.pi)
     if kind in ("scale", "similarity", "similarity+relabel"):
         scale = math.exp(
             rng.uniform(math.log(group.scale_min), math.log(group.scale_max))
         )
-    reflect = kind == "reflect" and group.reflection
+    if kind in ("reflect", "reflect+relabel"):
+        if not group.reflection:
+            raise ValueError(f"kind {kind!r} needs a group with reflection=True")
+        reflect = True
     return Similarity(tx=tx, ty=ty, theta=theta, scale=scale, reflect=reflect)
 
 
 def sample_perm(rng: random.Random, labels: list[str], kind: str) -> dict[str, str]:
-    if kind not in ("relabel", "similarity+relabel") or len(labels) < 2:
+    if "relabel" not in kind or len(labels) < 2:
         return {label: label for label in labels}
     shuffled = list(labels)
     while shuffled == labels:
@@ -137,7 +172,10 @@ def transformed_problem(
     """The same construction problem in another frame and with other labels.
 
     Given coordinates are rounded to two decimals — they are what the model
-    reads — and the target is re-derived from them, so the copy is exact.
+    reads — and the target is re-derived from them, so the copy is exact. A
+    copy whose target, mapped back to the original frame, has drifted by more
+    than the agreement tolerance (an ill-conditioned construction, or an
+    orientation-dependent one under a reflection) is rejected.
     """
     given = {
         perm[label]: tuple(_round2(c) for c in g.xy(x, y))
@@ -146,7 +184,7 @@ def transformed_problem(
     # keep the label order of the original alphabet so prompts read naturally
     given = dict(sorted(given.items()))
     expr = relabel_expr(problem.expr, perm)
-    return build_problem(
+    copy = build_problem(
         f"{problem.id}/c{index}",
         problem.seed,
         given,  # type: ignore[arg-type]
@@ -155,27 +193,53 @@ def transformed_problem(
         source=problem.source,
         meta={**problem.meta, "copy_of": problem.id},
     )
+    scale = problem.state(tol).scale
+    back = inverse_params(copy.target_kind, copy.target_params, g)
+    drift = distance_between(problem.target_kind, back, problem.target_params, scale)
+    if drift > tol.agreement * scale:
+        raise MoveError(ERR_DEGENERATE, "copy target drifts from the original")
+    return copy
 
 
 def make_copies(
     problem: Problem, cfg: E0Config, rng: random.Random, tol: ToleranceSpec = TOL
 ) -> list[Copy]:
+    """The identity copy at index 0, then the other kinds in rotation.
+
+    Two copies of one problem never coincide (a two-point problem has only one
+    relabelling); when a kind cannot produce a fresh copy it falls back to the
+    full similarity of the same relabelling class.
+    """
     kinds = [k for k in cfg.kinds if k != "identity"]
     copies = [
         Copy(
             0, "identity", IDENTITY, {label: label for label in problem.given}, problem
         )
     ]
+    seen = {
+        json.dumps(problem.to_dict()["given"], sort_keys=True) + problem.description
+    }
     for index in range(1, cfg.copies):
         kind = kinds[(index - 1) % len(kinds)]
-        for _attempt in range(20):
-            g = sample_similarity(rng, cfg.group, kind)
-            perm = sample_perm(rng, list(problem.given), kind)
+        fallback = "similarity+relabel" if "relabel" in kind else "similarity"
+        if "reflect" in kind:
+            fallback = kind
+        for attempt in range(40):
+            use = kind if attempt < 20 else fallback
+            g = sample_similarity(rng, cfg.group, use)
+            perm = sample_perm(rng, list(problem.given), use)
             try:
                 copy_problem = transformed_problem(problem, g, perm, tol, index)
             except (MoveError, ValueError):
                 continue
-            copies.append(Copy(index, kind, g, perm, copy_problem))
+            key = (
+                json.dumps(copy_problem.to_dict()["given"], sort_keys=True)
+                + copy_problem.description
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            copies.append(Copy(index, use, g, perm, copy_problem))
             break
     return copies
 
@@ -187,14 +251,32 @@ def make_copies(
 
 def problems_for(
     cfg: E0Config, tol: ToleranceSpec = TOL
-) -> tuple[list[Problem], list[Any]]:
+) -> tuple[list[Problem], dict[str, Any]]:
     if cfg.problem_set == SET_SYNTHETIC:
-        return generate(GENERATOR, tol, cfg.seed, cfg.per_bucket), []
+        problems, stats = generate_with_stats(GENERATOR, tol, cfg.seed, cfg.per_bucket)
+        if stats.underfilled:
+            raise RuntimeError(f"generator underfilled buckets: {stats.underfilled}")
+        return problems, {"generator": stats.to_dict()}
     if cfg.problem_set == SET_AUX:
         from .aux import load_aux_problems
 
-        return load_aux_problems(cfg.per_stem, cfg.seed, tol)
+        problems, skipped = load_aux_problems(cfg.per_stem, cfg.seed, tol)
+        return problems, {"skipped": [asdict(s) for s in skipped]}
     raise ValueError(f"unknown problem set {cfg.problem_set!r}")
+
+
+def fingerprint(cfg: E0Config) -> dict[str, Any]:
+    """What the frozen inputs depend on; checked when a run directory is reused."""
+    return {
+        "name": cfg.name,
+        "problem_set": cfg.problem_set,
+        "seed": cfg.seed,
+        "copies": cfg.copies,
+        "per_bucket": cfg.per_bucket,
+        "per_stem": cfg.per_stem,
+        "kinds": list(cfg.kinds),
+        "group": asdict(cfg.group),
+    }
 
 
 def prepare(
@@ -204,7 +286,14 @@ def prepare(
     out.mkdir(parents=True, exist_ok=True)
     problems_path = out / "problems.jsonl"
     copies_path = out / "copies.jsonl"
+    manifest_path = out / "prepare.json"
     if problems_path.exists() and copies_path.exists():
+        manifest = read_json(manifest_path) if manifest_path.exists() else {}
+        if manifest.get("fingerprint") != fingerprint(cfg):
+            raise RuntimeError(
+                f"frozen inputs at {out} were prepared for a different config; "
+                "use another --out"
+            )
         problems = load_problems(problems_path)
         by_problem: dict[str, list[Copy]] = defaultdict(list)
         for line in copies_path.read_text().splitlines():
@@ -212,7 +301,7 @@ def prepare(
                 d = json.loads(line)
                 by_problem[d["problem_id"]].append(Copy.from_dict(d["copy"]))
         return [(p, by_problem[p.id]) for p in problems]
-    problems, skipped = problems_for(cfg, tol)
+    problems, extra = problems_for(cfg, tol)
     rng = random.Random(cfg.seed)
     prepared = [(p, make_copies(p, cfg, rng, tol)) for p in problems]
     save_problems(problems, problems_path)
@@ -223,15 +312,35 @@ def prepare(
                 fh.write(json.dumps({"problem_id": p.id, "copy": c.to_dict()}) + "\n")
     tmp.replace(copies_path)
     write_json(
-        out / "prepare.json",
+        manifest_path,
         {
             "config": cfg.name,
+            "fingerprint": fingerprint(cfg),
             "n_problems": len(problems),
             "n_copies": sum(len(c) for _, c in prepared),
-            "skipped": [s.__dict__ for s in skipped],
+            **extra,
         },
     )
     return prepared
+
+
+def stratified(
+    prepared: list[tuple[Problem, list[Copy]]], limit: int | None
+) -> list[tuple[Problem, list[Copy]]]:
+    """The first `limit` problems taken round-robin across buckets."""
+    if limit is None or limit >= len(prepared):
+        return prepared
+    queues: dict[str, list[tuple[Problem, list[Copy]]]] = defaultdict(list)
+    for item in prepared:
+        queues[item[0].bucket].append(item)
+    order = [name for name, _, _ in LENGTH_BUCKETS if name in queues]
+    order += [b for b in queues if b not in order]
+    out: list[tuple[Problem, list[Copy]]] = []
+    while len(out) < limit and any(queues.values()):
+        for bucket in order:
+            if queues[bucket] and len(out) < limit:
+                out.append(queues[bucket].pop(0))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +387,10 @@ def evaluate(
     if content is None:
         return {
             "success": False,
+            "answered": False,
             "answer_kind": None,
             "answer_original_frame": None,
-            "error_kind": "request_error",
+            "error_kind": REQUEST_ERROR,
             "n_moves": 0,
         }
     ex = dsl.run_text(content, problem.state(tol))
@@ -293,8 +403,9 @@ def evaluate(
     lenient = any(
         same_geometry(o, target, scale, tol.coincidence) for o in ex.state.objects
     )
-    record: dict[str, Any] = {
+    return {
         "success": success,
+        "answered": ex.answer is not None,
         "target_reached": lenient,
         "answer_kind": ex.answer.kind if ex.answer is not None else None,
         "answer_original_frame": (
@@ -307,30 +418,36 @@ def evaluate(
         "n_moves": ex.n_moves,
         "n_objects": len(ex.state.objects),
     }
-    return record
 
 
-def agree(a: dict[str, Any], b: dict[str, Any], scale: float, rel_tol: float) -> bool:
-    """Do two copies' outcomes agree, in the original frame?"""
+def agree(
+    a: dict[str, Any], b: dict[str, Any], scale: float, rel_tol: float
+) -> bool | None:
+    """Do two answered copies agree in the original frame? None if not both answered."""
+    if not (a.get("answered") and b.get("answered")):
+        return None
     if a["success"] and b["success"]:
         return True
     if a["success"] != b["success"]:
         return False
-    pa, pb = a.get("answer_original_frame"), b.get("answer_original_frame")
-    if pa is None or pb is None:
-        return pa is None and pb is None and a.get("error_kind") == b.get("error_kind")
     if a["answer_kind"] != b["answer_kind"]:
         return False
-    return distance_between(a["answer_kind"], pa, pb) <= rel_tol * scale
+    pa, pb = a["answer_original_frame"], b["answer_original_frame"]
+    return distance_between(a["answer_kind"], pa, pb, scale) <= rel_tol * scale
 
 
 def pairwise_agreement(
     records: list[dict[str, Any]], scale: float, rel_tol: float
-) -> float | None:
-    pairs = list(itertools.combinations(records, 2))
-    if not pairs:
-        return None
-    return sum(agree(a, b, scale, rel_tol) for a, b in pairs) / len(pairs)
+) -> tuple[float | None, int]:
+    """Mean agreement over answered pairs, and how many pairs that was."""
+    verdicts = [
+        v
+        for a, b in itertools.combinations(records, 2)
+        if (v := agree(a, b, scale, rel_tol)) is not None
+    ]
+    if not verdicts:
+        return None, 0
+    return sum(verdicts) / len(verdicts), len(verdicts)
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +455,31 @@ def pairwise_agreement(
 # ---------------------------------------------------------------------------
 
 
+class Clients:
+    """One client per run, rebuilt when the token is about to expire."""
+
+    def __init__(self, cfg: E0Config, margin_s: float = 120.0):
+        self.cfg = cfg
+        self.margin_s = margin_s
+        self._client = None
+        self._creds = None
+
+    def get(self):
+        expires = getattr(self._creds, "expires_at", None)
+        if self._client is None or (
+            expires is not None and expires - time.time() < self.margin_s
+        ):
+            self._client, self._creds = make_client(self.cfg)
+        return self._client
+
+    @property
+    def source(self) -> str:
+        self.get()
+        return getattr(self._creds, "source", "?")
+
+
 def run_one(
-    client,
+    clients: Clients,
     cfg: E0Config,
     model: str,
     problem: Problem,
@@ -353,23 +493,34 @@ def run_one(
         return read_json(eval_path)
     messages = messages_for(copy, cfg.arm, directory)
     result = request(
-        client, cfg, model, messages, directory, salt=f"{problem.id}/{copy.id}"
+        clients.get(), cfg, model, messages, directory, salt=f"{problem.id}/{copy.id}"
     )
-    record = evaluate(copy, result.get("content"), tol)
-    record.update(
-        {
-            "model": model,
-            "problem_id": problem.id,
-            "copy": copy.id,
-            "kind": copy.kind,
-            "bucket": problem.bucket,
-            "n_moves_reference": problem.n_moves,
-            "request_error": result.get("error"),
-            "usage": result.get("usage", {}),
-        }
-    )
+    meta = {
+        "model": model,
+        "problem_id": problem.id,
+        "copy": copy.id,
+        "kind": copy.kind,
+        "bucket": problem.bucket,
+        "n_moves_reference": problem.n_moves,
+        "usage": result.get("usage", {}),
+    }
+    if result.get("error"):
+        # Not persisted as an evaluation: the summary reports it as missing and
+        # `--recover-errors` lets the next run re-issue it.
+        return {**evaluate(copy, None, tol), **meta, REQUEST_ERROR: result["error"]}
+    record = {**evaluate(copy, result.get("content"), tol), **meta}
     write_json(eval_path, record)
     return record
+
+
+def _acquire_lock(out: Path) -> Path:
+    lock = out / LOCK_NAME
+    if lock.exists():
+        raise RuntimeError(
+            f"{lock} exists: another run owns {out} (remove it if stale)"
+        )
+    lock.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+    return lock
 
 
 def run(
@@ -379,37 +530,61 @@ def run(
     workers: int | None = None,
     tol: ToleranceSpec = TOL,
 ) -> int:
-    prepared = prepare(cfg, out, tol)
-    if limit is not None:
-        prepared = prepared[:limit]
-    client, creds = make_client(cfg)
-    print(
-        f"[{cfg.name}] credentials from {creds.source}; {len(prepared)} problems x {cfg.copies} copies x {len(cfg.models)} models",
-        flush=True,
-    )
-    jobs = [
-        (model, p, c) for model in cfg.models for p, copies in prepared for c in copies
-    ]
-    failures = 0
-    with ThreadPoolExecutor(max_workers=workers or cfg.workers) as pool:
-        futures = {
-            pool.submit(run_one, client, cfg, m, p, c, out, tol): (m, p, c)
-            for m, p, c in jobs
-        }
-        for i, fut in enumerate(as_completed(futures), start=1):
-            m, p, c = futures[fut]
-            try:
-                record = fut.result()
-            except Exception as exc:  # noqa: BLE001
-                failures += 1
-                print(f"  ! {m} {p.id}/{c.id}: {type(exc).__name__}: {exc}", flush=True)
+    prepared = stratified(prepare(cfg, out, tol), limit)
+    lock = _acquire_lock(out)
+    try:
+        clients = Clients(cfg)
+        print(
+            f"[{cfg.name}] credentials from {clients.source}; {len(prepared)} problems "
+            f"x {cfg.copies} copies x {len(cfg.models)} models",
+            flush=True,
+        )
+        jobs = [(m, p, c) for m in cfg.models for p, copies in prepared for c in copies]
+        failures = 0
+        with ThreadPoolExecutor(max_workers=workers or cfg.workers) as pool:
+            futures = {
+                pool.submit(run_one, clients, cfg, m, p, c, out, tol): (m, p, c)
+                for m, p, c in jobs
+            }
+            for i, fut in enumerate(as_completed(futures), start=1):
+                m, p, c = futures[fut]
+                try:
+                    record = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    failures += 1
+                    print(
+                        f"  ! {m} {p.id}/{c.id}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    continue
+                if record.get(REQUEST_ERROR):
+                    failures += 1
+                if i % 25 == 0 or i == len(jobs):
+                    print(f"  {i}/{len(jobs)} done", flush=True)
+        print(f"[{cfg.name}] finished; {failures} failed requests", flush=True)
+        return 0 if failures == 0 else 3
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def recover_errors(out: Path) -> list[Path]:
+    """Archive request directories whose cached result is an error."""
+    if (out / LOCK_NAME).exists():
+        raise RuntimeError(f"{out / LOCK_NAME} exists: refusing to recover a live run")
+    archived: list[Path] = []
+    for result in sorted(out.glob("*/*/c*/result.json")):
+        try:
+            if not read_json(result).get("error"):
                 continue
-            if record.get("request_error"):
-                failures += 1
-            if i % 25 == 0 or i == len(jobs):
-                print(f"  {i}/{len(jobs)} done", flush=True)
-    print(f"[{cfg.name}] finished; {failures} failed requests", flush=True)
-    return 0 if failures == 0 else 3
+        except (OSError, ValueError):
+            continue
+        directory = result.parent
+        n = 1
+        while (target := directory.with_name(f"{directory.name}.failed{n}")).exists():
+            n += 1
+        directory.rename(target)
+        archived.append(target)
+    return archived
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +607,7 @@ def _bootstrap_ci(
 
 
 def collect(cfg: E0Config, out: Path, tol: ToleranceSpec = TOL) -> dict[str, Any]:
+    """One row per (model, problem) from the evaluations on disk."""
     prepared = prepare(cfg, out, tol)
     rows: list[dict[str, Any]] = []
     for model in cfg.models:
@@ -440,117 +616,209 @@ def collect(cfg: E0Config, out: Path, tol: ToleranceSpec = TOL) -> dict[str, Any
             for copy in copies:
                 path = job_dir(out, model, problem, copy) / "eval.json"
                 if path.exists():
-                    rec = read_json(path)
-                    records.append(rec)
+                    records.append(read_json(path))
             if not records:
                 continue
             scale = problem.state(tol).scale
             identity = next((r for r in records if r["copy"] == "c0"), None)
+            transformed = [r for r in records if r["copy"] != "c0"]
+            consistency, n_pairs = pairwise_agreement(records, scale, tol.agreement)
+            by_kind: dict[str, list[float]] = defaultdict(list)
+            for r in records:
+                by_kind[r["kind"]].append(float(r["success"]))
+            vs_identity = None
+            if identity is not None and identity.get("answered"):
+                verdicts = [
+                    v
+                    for r in transformed
+                    if (v := agree(identity, r, scale, tol.agreement)) is not None
+                ]
+                vs_identity = sum(verdicts) / len(verdicts) if verdicts else None
+            success_identity = float(identity["success"]) if identity else None
+            success_transformed = (
+                sum(r["success"] for r in transformed) / len(transformed)
+                if transformed
+                else None
+            )
             rows.append(
                 {
                     "model": model,
                     "problem_id": problem.id,
                     "bucket": problem.bucket,
                     "n_moves": problem.n_moves,
-                    "n_copies": len(records),
-                    "consistency": pairwise_agreement(records, scale, tol.agreement),
-                    "success_identity": identity["success"] if identity else None,
-                    "success_mean": sum(r["success"] for r in records) / len(records),
-                    "vs_identity": (
-                        sum(
-                            agree(identity, r, scale, tol.agreement)
-                            for r in records
-                            if r is not identity
-                        )
-                        / max(1, len(records) - 1)
-                        if identity
+                    "n_expected": len(copies),
+                    "n_evaluated": len(records),
+                    "answered_rate": sum(bool(r.get("answered")) for r in records)
+                    / len(records),
+                    "consistency": consistency,
+                    "n_pairs": n_pairs,
+                    "success_identity": success_identity,
+                    "success_transformed": success_transformed,
+                    "delta_success": (
+                        success_identity - success_transformed
+                        if success_identity is not None
+                        and success_transformed is not None
                         else None
                     ),
-                    "by_kind": {r["kind"]: r["success"] for r in records},
+                    "vs_identity": vs_identity,
+                    "by_kind": dict(by_kind),
                     "error_kinds": [r.get("error_kind") for r in records],
                 }
             )
     return {"config": cfg.name, "rows": rows}
 
 
+def _mean(values: list[float]) -> float:
+    return float(np.mean(values)) if values else math.nan
+
+
 def summarize(
     cfg: E0Config, out: Path, tol: ToleranceSpec = TOL
 ) -> tuple[dict[str, Any], str]:
     data = collect(cfg, out, tol)
+    prepared = prepare(cfg, out, tol)
+    expected_per_model = sum(len(c) for _, c in prepared)
     rng = np.random.default_rng(cfg.seed)
+    gate_bucket = f">={E0_GATE.min_moves} moves"
     lines = [f"# E0 {cfg.name} — arm {cfg.arm}, set {cfg.problem_set}", ""]
     lines.append(
-        "| model | bucket | n | success (identity) | success (all copies) | consistency | CI95 | vs identity |"
+        "| model | bucket | problems | coverage | answered | success (identity) | "
+        "success (transformed) | Δsuccess [CI95] | consistency [CI95] | vs identity |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|")
-    gate: dict[str, Any] = {}
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     summary: list[dict[str, Any]] = []
+    gate_rows: dict[str, dict[str, Any]] = {}
     for model in cfg.models:
         rows = [r for r in data["rows"] if r["model"] == model]
-        buckets = sorted({r["bucket"] for r in rows}) + [
-            "all",
-            f">={E0_GATE.min_moves} moves",
+        buckets = [
+            n for n, _, _ in LENGTH_BUCKETS if any(r["bucket"] == n for r in rows)
         ]
-        for bucket in buckets:
+        for bucket in buckets + ["all", gate_bucket]:
             if bucket == "all":
                 sel = rows
-            elif bucket.startswith(">="):
+                expected = expected_per_model
+            elif bucket == gate_bucket:
                 sel = [r for r in rows if r["n_moves"] >= E0_GATE.min_moves]
+                expected = sum(
+                    len(c) for p, c in prepared if p.n_moves >= E0_GATE.min_moves
+                )
             else:
                 sel = [r for r in rows if r["bucket"] == bucket]
-            cons = [r["consistency"] for r in sel if r["consistency"] is not None]
+                expected = sum(len(c) for p, c in prepared if p.bucket == bucket)
             if not sel:
                 continue
-            succ_id = [
-                float(r["success_identity"])
-                for r in sel
-                if r["success_identity"] is not None
-            ]
-            succ_all = [r["success_mean"] for r in sel]
+            cons = [r["consistency"] for r in sel if r["consistency"] is not None]
+            deltas = [r["delta_success"] for r in sel if r["delta_success"] is not None]
             vs_id = [r["vs_identity"] for r in sel if r["vs_identity"] is not None]
-            lo, hi = _bootstrap_ci(cons, rng, cfg.bootstrap)
+            evaluated = sum(r["n_evaluated"] for r in sel)
             entry = {
                 "model": model,
                 "bucket": bucket,
-                "n": len(sel),
-                "success_identity": float(np.mean(succ_id)) if succ_id else math.nan,
-                "success_all": float(np.mean(succ_all)),
-                "consistency": float(np.mean(cons)) if cons else math.nan,
-                "consistency_ci": [lo, hi],
-                "vs_identity": float(np.mean(vs_id)) if vs_id else math.nan,
+                "n_problems": len(sel),
+                "coverage": evaluated / expected if expected else math.nan,
+                "n_missing": expected - evaluated,
+                "answered": _mean([r["answered_rate"] for r in sel]),
+                "success_identity": _mean(
+                    [
+                        r["success_identity"]
+                        for r in sel
+                        if r["success_identity"] is not None
+                    ]
+                ),
+                "success_transformed": _mean(
+                    [
+                        r["success_transformed"]
+                        for r in sel
+                        if r["success_transformed"] is not None
+                    ]
+                ),
+                "delta_success": _mean(deltas),
+                "delta_success_ci": list(_bootstrap_ci(deltas, rng, cfg.bootstrap)),
+                "consistency": _mean(cons),
+                "consistency_ci": list(_bootstrap_ci(cons, rng, cfg.bootstrap)),
+                "n_consistency": len(cons),
+                "vs_identity": _mean(vs_id),
             }
             summary.append(entry)
+            if bucket == gate_bucket:
+                gate_rows[model] = entry
+            dlo, dhi = entry["delta_success_ci"]
+            clo, chi = entry["consistency_ci"]
             lines.append(
-                f"| {model} | {bucket} | {entry['n']} | {entry['success_identity']:.3f} | "
-                f"{entry['success_all']:.3f} | {entry['consistency']:.3f} | "
-                f"[{lo:.3f}, {hi:.3f}] | {entry['vs_identity']:.3f} |"
+                f"| {model} | {bucket} | {entry['n_problems']} | {entry['coverage']:.3f} | "
+                f"{entry['answered']:.3f} | {entry['success_identity']:.3f} | "
+                f"{entry['success_transformed']:.3f} | {entry['delta_success']:+.3f} "
+                f"[{dlo:+.3f}, {dhi:+.3f}] | {entry['consistency']:.3f} "
+                f"[{clo:.3f}, {chi:.3f}] (n={entry['n_consistency']}) | "
+                f"{entry['vs_identity']:.3f} |"
             )
-            if bucket.startswith(">="):
-                gate[model] = entry["consistency"]
     # success by transform kind
     lines.append("")
-    lines.append("| model | kind | n | success |")
+    lines.append("| model | kind | copies | success |")
     lines.append("|---|---|---|---|")
     by_kind: dict[tuple[str, str], list[float]] = defaultdict(list)
     for r in data["rows"]:
-        for kind, s in r["by_kind"].items():
-            by_kind[(r["model"], kind)].append(float(s))
+        for kind, values in r["by_kind"].items():
+            by_kind[(r["model"], kind)].extend(values)
     for (model, kind), vals in sorted(by_kind.items()):
-        lines.append(f"| {model} | {kind} | {len(vals)} | {np.mean(vals):.3f} |")
-    # kill gate
+        lines.append(f"| {model} | {kind} | {len(vals)} | {_mean(vals):.3f} |")
+    # kill gate (AC-13 / AC-14)
     lines.append("")
-    if gate:
-        best_model = max(gate, key=lambda m: gate[m] if not math.isnan(gate[m]) else -1)
-        best = gate[best_model]
-        verdict = (
-            "H0 FALSIFIED (consistency at/above the kill gate)"
-            if best >= E0_GATE.consistency_kill
-            else "H0 stands (inconsistency below the kill gate)"
-        )
-        lines.append(
-            f"Kill gate (problems with >= {E0_GATE.min_moves} moves, best open model "
-            f"{best_model}): consistency {best:.3f} vs {E0_GATE.consistency_kill:.2f} -> {verdict}"
-        )
+    gate: dict[str, Any] = {"gated": cfg.gated, "verdict": None, "models": {}}
+    if not cfg.gated:
+        gated = ", ".join(c.name for c in experiment_configs if c.gated)
+        lines.append(f"Not a gated config: the H0 verdict is read from {gated}.")
+    else:
+        falsified = False
+        for model, entry in gate_rows.items():
+            reasons = []
+            if entry["n_missing"] > 0:
+                reasons.append(f"{entry['n_missing']} copies not evaluated")
+            if entry["answered"] < E0_GATE.min_answered_rate:
+                reasons.append(
+                    f"answered {entry['answered']:.2f} < {E0_GATE.min_answered_rate:.2f}"
+                )
+            if entry["success_identity"] < E0_GATE.min_success_identity:
+                reasons.append(
+                    f"success(identity) {entry['success_identity']:.2f} < "
+                    f"{E0_GATE.min_success_identity:.2f}"
+                )
+            status = {
+                "consistency": entry["consistency"],
+                "applicable": not reasons,
+                "withheld": reasons,
+            }
+            gate["models"][model] = status
+            if reasons:
+                lines.append(
+                    f"Gate ({gate_bucket}) {model}: verdict withheld — "
+                    + "; ".join(reasons)
+                )
+            else:
+                hit = entry["consistency"] >= E0_GATE.consistency_kill
+                falsified = falsified or hit
+                lines.append(
+                    f"Gate ({gate_bucket}) {model}: consistency {entry['consistency']:.3f} "
+                    f"vs kill {E0_GATE.consistency_kill:.2f} -> "
+                    + ("at/above the gate" if hit else "below the gate")
+                )
+        applicable = [m for m, s in gate["models"].items() if s["applicable"]]
+        if not gate_rows:
+            gate["verdict"] = "no data"
+            lines.append("Gate: no evaluations in the gate bucket yet.")
+        elif not applicable:
+            gate["verdict"] = "withheld"
+            lines.append("Gate: verdict withheld for every model (see reasons above).")
+        elif falsified:
+            gate["verdict"] = "H0 FALSIFIED"
+            lines.append(
+                "Gate verdict: H0 FALSIFIED — an open model is consistent at/above the kill gate."
+            )
+        else:
+            gate["verdict"] = "H0 stands"
+            lines.append(
+                "Gate verdict: H0 stands — every applicable model is below the gate."
+            )
     text = "\n".join(lines) + "\n"
     payload = {
         "config": cfg.name,
@@ -579,7 +847,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--summary", action="store_true")
-    ap.add_argument("--limit", type=int, default=None, help="only the first N problems")
+    ap.add_argument(
+        "--recover-errors",
+        action="store_true",
+        help="archive request directories whose result is an error",
+    )
+    ap.add_argument(
+        "--limit", type=int, default=None, help="only N problems, taken across buckets"
+    )
     ap.add_argument("--workers", type=int, default=None)
     args = ap.parse_args(argv)
     cfg = config_named(args.config)
@@ -595,9 +870,13 @@ def main(argv: list[str] | None = None) -> int:
             for c in copies:
                 kinds[c.kind] += 1
         print(
-            f"[{cfg.name}] {len(prepared)} problems ({dict(buckets)}), {n_copies} copies ({dict(kinds)}), "
-            f"{n_copies * len(cfg.models)} requests over {len(cfg.models)} model(s); out={out}"
+            f"[{cfg.name}] {len(prepared)} problems ({dict(buckets)}), {n_copies} copies "
+            f"({dict(kinds)}), {n_copies * len(cfg.models)} requests over "
+            f"{len(cfg.models)} model(s); out={out}"
         )
+    if args.recover_errors:
+        archived = recover_errors(out)
+        print(f"[{cfg.name}] archived {len(archived)} failed request directories")
     if args.run:
         code = run(cfg, out, limit=args.limit, workers=args.workers)
     if args.summary:
@@ -605,7 +884,7 @@ def main(argv: list[str] | None = None) -> int:
         write_json(out / "summary.json", payload)
         (out / "summary.md").write_text(text)
         sys.stdout.write(text)
-    if not (args.dry or args.run or args.summary):
+    if not (args.dry or args.run or args.summary or args.recover_errors):
         ap.print_help()
     return code
 
