@@ -93,6 +93,9 @@ def payload(
         to_job_path(out),
     ]
     script = f"cd {shlex.quote(workdir)} && " + shlex.join(command)
+    tls_env = {}
+    if module == "experiments.noregeo_synth.recovery_extra":
+        tls_env["SSL_CERT_FILE"] = to_job_path(Path(out) / "tls-ca-bundle.pem")
     return {
         "job": {
             "description": description,
@@ -105,6 +108,7 @@ def payload(
                     "PYTHONUNBUFFERED": "1",
                     "MPLBACKEND": "Agg",
                     "AIRI_ENV_FILE": to_job_path(credential_file),
+                    **tls_env,
                 },
             },
             "resource": {

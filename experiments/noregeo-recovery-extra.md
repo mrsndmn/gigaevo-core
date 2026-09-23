@@ -36,3 +36,9 @@ Pending; report new-cohort outcomes separately before pooling.
 ## Changelog
 
 - 2026-09-23 — Added disjoint outcome-blind cohort and combined HTML/token report.
+- 2026-09-23 — Initial worker encountered TLS connection failures after first
+  successful calls. AIRI served its leaf without the GlobalSign intermediate.
+  The public intermediate was fetched from its CA's certificate URL and verified
+  against the system root store (`openssl verify: OK`). A per-job CA bundle keeps
+  certificate/hostname verification enabled. Explicit connection recovery archives
+  the old attempt and preserves successful request caches and completed arms.

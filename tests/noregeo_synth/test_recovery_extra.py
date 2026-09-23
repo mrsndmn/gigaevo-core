@@ -64,3 +64,62 @@ def test_shared_first_counted_once_before_event_checkpoint():
     h["events"] = []
     assert ev.group_metrics([h, c], 1)["actual_tokens"] == 15
     assert ev.group_metrics([h], 1)["actual_tokens"] == 15
+
+
+def test_connection_recovery_preserves_successful_calls(tmp_path, monkeypatch):
+    from experiments.noregeo_synth.feedback_eval import read, write
+
+    monkeypatch.setattr(launcher, "mls", lambda *a: {"status": "completed"})
+    monkeypatch.setattr(ev, "report", lambda out: None)
+    write(
+        tmp_path / "submission.json",
+        {"job_name": "lm-mpi-job-00000000-0000-0000-0000-000000000000"},
+    )
+    write(tmp_path / "complete.json", {"status": "attempted"})
+    base = tmp_path / "tasks" / "a_1"
+    good = base / "history" / "record.json"
+    write(good, {"status": "completed"})
+    bad = base / "canvas" / "record.json"
+    write(bad, {"status": "request_error"})
+    cached = base / "canvas" / "call_02" / "result.json"
+    write(cached, {"error": None, "content": "successful response"})
+    failed = base / "canvas" / "call_03"
+    write(failed / "result.json", {"error": "APIConnectionError: Connection error."})
+    before = good.read_bytes(), cached.read_bytes()
+    archive = ev.recover_connections(tmp_path)
+    assert not failed.exists() and not bad.exists()
+    assert not (tmp_path / "complete.json").exists()
+    assert (good.read_bytes(), cached.read_bytes()) == before
+    assert (
+        read(archive / "tasks" / "a_1" / "canvas" / "record.json")["status"]
+        == "request_error"
+    )
+
+
+def test_connection_recovery_refuses_live_job(tmp_path, monkeypatch):
+    import pytest
+    from experiments.noregeo_synth.feedback_eval import write
+
+    monkeypatch.setattr(launcher, "mls", lambda *a: {"status": "running"})
+    write(tmp_path / "submission.json", {"job_name": "job"})
+    with pytest.raises(RuntimeError, match="active"):
+        ev.recover_connections(tmp_path)
+
+
+def test_tls_bundle_keeps_verification(tmp_path):
+    import ssl
+
+    ev.write_tls_bundle(tmp_path)
+    context = ssl.create_default_context(cafile=str(tmp_path / "tls-ca-bundle.pem"))
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
+    payload = launcher.payload(
+        "commit",
+        tmp_path,
+        "/tmp/env",
+        ev.SPEC,
+        "experiments.noregeo_synth.recovery_extra",
+    )
+    assert payload["job"]["environment"]["variables"]["SSL_CERT_FILE"].endswith(
+        "tls-ca-bundle.pem"
+    )

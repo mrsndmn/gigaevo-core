@@ -6,9 +6,12 @@ import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+import fcntl
 from html import escape
 import json
 from pathlib import Path
+import shutil
 import time
 
 from . import recovery_eval as base
@@ -55,6 +58,20 @@ def select_tasks(tasks, previous, count):
     return selected
 
 
+def write_tls_bundle(out):
+    # The AIRI server omits its intermediate certificate. Keep normal root and
+    # hostname validation; append the public, CA-issued intermediate only.
+    import certifi
+
+    certificate = (
+        Path(__file__).with_name("certs") / "globalsign-gcc-r3-dv-tls-ca-2020.pem"
+    )
+    atomic_text(
+        Path(out) / "tls-ca-bundle.pem",
+        Path(certifi.where()).read_text() + "\n" + certificate.read_text(),
+    )
+
+
 def prepare(out, spec=SPEC):
     source = Path(spec.source)
     frozen = read(source / "inputs.json")
@@ -96,6 +113,7 @@ def prepare(out, spec=SPEC):
     if path.exists() and read(path) != snapshot:
         raise ValueError("frozen additional cohort changed")
     write(path, snapshot)
+    write_tls_bundle(out)
     return snapshot
 
 
@@ -240,14 +258,72 @@ def run(out):
     report(out)
 
 
+def recover_connections(out):
+    """Explicit recovery of exhausted connection errors; never reroll completions."""
+    from .run_recovery_eval import mls
+
+    out = Path(out)
+    with (out / "submission.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        submission = read(out / "submission.json")
+        status = mls("status", submission["job_name"])["status"].lower()
+        if status not in {"completed", "failed", "stopped", "killed", "cancelled"}:
+            raise RuntimeError("cannot recover an active or unknown job status")
+        records = list(out.glob("tasks/*/*/record.json"))
+        if any(read(p)["status"] == "running" for p in records):
+            raise RuntimeError("interrupted rollout requires separate audit")
+        failed = [p for p in records if read(p)["status"] == "request_error"]
+        requests = []
+        for p in out.glob("tasks/**/result.json"):
+            r = read(p)
+            if not r.get("error"):
+                continue
+            if not r["error"].startswith("APIConnectionError:"):
+                raise RuntimeError(
+                    "non-connection request failure: refusing broad retry"
+                )
+            if list(p.parent.glob("raw_*.json")):
+                raise RuntimeError("response exists: refusing completion reroll")
+            requests.append(p.parent)
+        if not failed or not requests:
+            raise RuntimeError("no exhausted connection errors to recover")
+        # Archive before touching any live record; all successful request caches
+        # and completed arms stay byte-identical and are reused by the worker.
+        archive = (
+            out / "connection_recovery" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        )
+        shutil.copytree(out / "tasks", archive / "tasks")
+        for name in ("complete.json", "comparison.json", "submission.json"):
+            if (out / name).exists():
+                shutil.copy2(out / name, archive / name)
+        write(
+            archive / "recovery.json",
+            {
+                "reason": "verified missing TLS intermediate",
+                "source_job": submission["job_name"],
+                "records": [str(p.relative_to(out)) for p in failed],
+                "requests": [str(p.relative_to(out)) for p in requests],
+            },
+        )
+        for p in requests:
+            shutil.rmtree(p)
+        for p in failed:
+            p.unlink()
+        (out / "complete.json").unlink(missing_ok=True)
+        report(out)
+        return archive
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    for name in ("prepare", "run", "report"):
+    for name in ("prepare", "run", "report", "recover-connections"):
         mode.add_argument("--" + name, action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.prepare:
+    if args.recover_connections:
+        print(recover_connections(args.out))
+    elif args.prepare:
         prepare(args.out)
     elif args.report:
         report(args.out)
