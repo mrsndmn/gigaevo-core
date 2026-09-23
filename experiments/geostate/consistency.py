@@ -265,7 +265,7 @@ def problems_for(
     raise ValueError(f"unknown problem set {cfg.problem_set!r}")
 
 
-def fingerprint(cfg: E0Config) -> dict[str, Any]:
+def fingerprint(cfg: E0Config, tol: ToleranceSpec = TOL) -> dict[str, Any]:
     """What the frozen inputs depend on; checked when a run directory is reused."""
     return {
         "name": cfg.name,
@@ -276,6 +276,8 @@ def fingerprint(cfg: E0Config) -> dict[str, Any]:
         "per_stem": cfg.per_stem,
         "kinds": list(cfg.kinds),
         "group": asdict(cfg.group),
+        "generator": asdict(GENERATOR),
+        "tolerances": asdict(tol),
     }
 
 
@@ -289,7 +291,7 @@ def prepare(
     manifest_path = out / "prepare.json"
     if problems_path.exists() and copies_path.exists():
         manifest = read_json(manifest_path) if manifest_path.exists() else {}
-        if manifest.get("fingerprint") != fingerprint(cfg):
+        if manifest.get("fingerprint") != fingerprint(cfg, tol):
             raise RuntimeError(
                 f"frozen inputs at {out} were prepared for a different config; "
                 "use another --out"
@@ -315,7 +317,7 @@ def prepare(
         manifest_path,
         {
             "config": cfg.name,
-            "fingerprint": fingerprint(cfg),
+            "fingerprint": fingerprint(cfg, tol),
             "n_problems": len(problems),
             "n_copies": sum(len(c) for _, c in prepared),
             **extra,
@@ -515,11 +517,14 @@ def run_one(
 
 def _acquire_lock(out: Path) -> Path:
     lock = out / LOCK_NAME
-    if lock.exists():
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
         raise RuntimeError(
             f"{lock} exists: another run owns {out} (remove it if stale)"
-        )
-    lock.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+        ) from None
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"pid": os.getpid(), "started": time.time()}))
     return lock
 
 
@@ -567,18 +572,31 @@ def run(
         lock.unlink(missing_ok=True)
 
 
+COPY_DIR_RE = re.compile(r"c\d+")
+
+
 def recover_errors(out: Path) -> list[Path]:
-    """Archive request directories whose cached result is an error."""
+    """Archive request directories that must be re-issued.
+
+    Two shapes qualify: a cached result that is an error, and an interrupted
+    request (manifest written, no result) left behind by a run that no longer
+    holds the lock. Earlier archives (`cN.failedK`) are never touched.
+    """
     if (out / LOCK_NAME).exists():
         raise RuntimeError(f"{out / LOCK_NAME} exists: refusing to recover a live run")
     archived: list[Path] = []
-    for result in sorted(out.glob("*/*/c*/result.json")):
-        try:
-            if not read_json(result).get("error"):
-                continue
-        except (OSError, ValueError):
+    for directory in sorted(out.glob("*/*/*")):
+        if not directory.is_dir() or not COPY_DIR_RE.fullmatch(directory.name):
             continue
-        directory = result.parent
+        result = directory / "result.json"
+        if result.exists():
+            try:
+                if not read_json(result).get("error"):
+                    continue
+            except (OSError, ValueError):
+                continue
+        elif not (directory / "request.json").exists():
+            continue  # never requested: nothing to recover
         n = 1
         while (target := directory.with_name(f"{directory.name}.failed{n}")).exists():
             n += 1
@@ -683,7 +701,8 @@ def summarize(
     lines = [f"# E0 {cfg.name} — arm {cfg.arm}, set {cfg.problem_set}", ""]
     lines.append(
         "| model | bucket | problems | coverage | answered | success (identity) | "
-        "success (transformed) | Δsuccess [CI95] | consistency [CI95] | vs identity |"
+        "success (transformed) | Δsuccess = identity − transformed [CI95] | "
+        "consistency [CI95] | vs identity |"
     )
     lines.append("|---|---|---|---|---|---|---|---|---|---|")
     summary: list[dict[str, Any]] = []
@@ -770,22 +789,32 @@ def summarize(
         lines.append(f"Not a gated config: the H0 verdict is read from {gated}.")
     else:
         falsified = False
-        for model, entry in gate_rows.items():
-            reasons = []
-            if entry["n_missing"] > 0:
-                reasons.append(f"{entry['n_missing']} copies not evaluated")
-            if entry["answered"] < E0_GATE.min_answered_rate:
-                reasons.append(
-                    f"answered {entry['answered']:.2f} < {E0_GATE.min_answered_rate:.2f}"
-                )
-            if entry["success_identity"] < E0_GATE.min_success_identity:
-                reasons.append(
-                    f"success(identity) {entry['success_identity']:.2f} < "
-                    f"{E0_GATE.min_success_identity:.2f}"
-                )
+        for model in cfg.models:
+            entry = gate_rows.get(model)
+            coverage_reasons: list[str] = []
+            quality_reasons: list[str] = []
+            if entry is None:
+                coverage_reasons.append("no evaluations in the gate bucket")
+            else:
+                if entry["n_missing"] > 0:
+                    coverage_reasons.append(
+                        f"{entry['n_missing']} copies not evaluated"
+                    )
+                if entry["answered"] < E0_GATE.min_answered_rate:
+                    quality_reasons.append(
+                        f"answered {entry['answered']:.2f} < "
+                        f"{E0_GATE.min_answered_rate:.2f}"
+                    )
+                if entry["success_identity"] < E0_GATE.min_success_identity:
+                    quality_reasons.append(
+                        f"success(identity) {entry['success_identity']:.2f} < "
+                        f"{E0_GATE.min_success_identity:.2f}"
+                    )
+            reasons = coverage_reasons + quality_reasons
             status = {
-                "consistency": entry["consistency"],
+                "consistency": entry["consistency"] if entry else None,
                 "applicable": not reasons,
+                "incomplete": bool(coverage_reasons),
                 "withheld": reasons,
             }
             gate["models"][model] = status
@@ -802,22 +831,48 @@ def summarize(
                     f"vs kill {E0_GATE.consistency_kill:.2f} -> "
                     + ("at/above the gate" if hit else "below the gate")
                 )
-        applicable = [m for m, s in gate["models"].items() if s["applicable"]]
-        if not gate_rows:
-            gate["verdict"] = "no data"
-            lines.append("Gate: no evaluations in the gate bucket yet.")
-        elif not applicable:
-            gate["verdict"] = "withheld"
-            lines.append("Gate: verdict withheld for every model (see reasons above).")
-        elif falsified:
+        applicable = [m for m, st in gate["models"].items() if st["applicable"]]
+        incomplete = [m for m, st in gate["models"].items() if st["incomplete"]]
+        excluded = [
+            m
+            for m, st in gate["models"].items()
+            if not st["applicable"] and not st["incomplete"]
+        ]
+        if falsified:
+            # One consistent model is decisive regardless of the others.
             gate["verdict"] = "H0 FALSIFIED"
             lines.append(
-                "Gate verdict: H0 FALSIFIED — an open model is consistent at/above the kill gate."
+                "Gate verdict: H0 FALSIFIED — an open model is consistent at/above "
+                "the kill gate."
+            )
+        elif incomplete:
+            # The best model may be among the incomplete ones: no verdict yet.
+            gate["verdict"] = "withheld"
+            lines.append(
+                "Gate verdict: withheld — incomplete data for "
+                + ", ".join(incomplete)
+                + "."
+            )
+        elif not applicable:
+            gate["verdict"] = "withheld"
+            lines.append(
+                "Gate verdict: withheld — no model meets the answered/success "
+                "conditions (" + ", ".join(excluded) + ")."
             )
         else:
             gate["verdict"] = "H0 stands"
+            note = (
+                " Excluded for answered/success conditions: "
+                + ", ".join(excluded)
+                + "."
+                if excluded
+                else ""
+            )
             lines.append(
-                "Gate verdict: H0 stands — every applicable model is below the gate."
+                "Gate verdict: H0 stands — every applicable model ("
+                + ", ".join(applicable)
+                + ") is below the gate."
+                + note
             )
     text = "\n".join(lines) + "\n"
     payload = {

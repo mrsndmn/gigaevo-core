@@ -171,7 +171,7 @@ def build_problem(
     validate_expr(expr)
     scratch = GeometricState.from_given(given, tol)
     builder = Builder(scratch)
-    handle = expand(builder, expr)
+    handle = expand(builder, expr, strict=True)
     if not builder.moves:
         raise MoveError(ERR_DEGENERATE, "target is a given point")
     if handle in given:

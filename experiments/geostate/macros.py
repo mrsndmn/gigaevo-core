@@ -368,14 +368,23 @@ def validate_expr(expr: Expr) -> None:
             raise ValueError("only point-valued macros may be nested")
 
 
-def expand(builder: Builder, expr: Expr) -> str:
-    """Expand an expression on the builder's state; returns the result handle."""
+def expand(builder: Builder, expr: Expr, strict: bool = False) -> str:
+    """Expand an expression on the builder's state; returns the result handle.
+
+    With `strict`, every macro node must add at least one move: a node whose
+    result already existed (a construction that restates a sub-result) is
+    rejected as degenerate, so descriptions never describe nothing.
+    """
     if isinstance(expr, str):
         builder.state.get(expr)
         return expr
     macro = MACROS[expr[0]]
-    handles = [expand(builder, a) for a in expr[1:]]
-    return macro.fn(builder, *handles)
+    handles = [expand(builder, a, strict) for a in expr[1:]]
+    before = len(builder.moves)
+    handle = macro.fn(builder, *handles)
+    if strict and len(builder.moves) == before:
+        raise MoveError(ERR_DEGENERATE, f"{macro.name} adds no move")
+    return handle
 
 
 def describe(expr: Expr, nested: bool = False) -> str:

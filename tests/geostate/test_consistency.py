@@ -340,3 +340,128 @@ def test_figure_arm_renders_the_given_points(tmp_path):
     assert not any(ch.isdigit() for ch in content[0]["text"].replace("90-degree", ""))
     text_messages = C.messages_for(copy, "text", tmp_path)
     assert "Given points:" in text_messages[1]["content"]
+
+
+def test_gate_is_withheld_when_any_model_lacks_data(tmp_path):
+    """A model with no evaluations, or a missing copy, blocks 'H0 stands'."""
+    cfg = _cfg(models=("fake/a", "fake/b"))
+    out = tmp_path / "e0"
+    prepared = C.prepare(cfg, out)
+    long_problem = next(p for p, _ in prepared if p.n_moves >= E0_GATE.min_moves)
+    # model a: answers everything, solves everything, but inconsistent-ish is
+    # irrelevant here — it is below the gate only if we make it disagree, so
+    # give it one wrong copy per problem to sit below 0.95
+    for problem, copies in prepared:
+        for i, copy in enumerate(copies):
+            content = _wrong(copy, 0, 1) if i == 1 else _golden(copy)
+            record = C.evaluate(copy, content)
+            record.update(
+                {
+                    "model": "fake/a",
+                    "problem_id": problem.id,
+                    "copy": copy.id,
+                    "kind": copy.kind,
+                    "bucket": problem.bucket,
+                }
+            )
+            C.write_json(C.job_dir(out, "fake/a", problem, copy) / "eval.json", record)
+    payload, text = C.summarize(cfg, out)
+    assert payload["gate"]["models"]["fake/a"]["applicable"]
+    assert payload["gate"]["models"]["fake/a"]["consistency"] < E0_GATE.consistency_kill
+    assert payload["gate"]["models"]["fake/b"]["incomplete"]
+    assert (
+        payload["gate"]["verdict"] == "withheld"
+        and "incomplete data for fake/b" in text
+    )
+    # model b evaluated except one copy of a long problem: still withheld
+    for problem, copies in prepared:
+        for copy in copies:
+            if problem is long_problem and copy.id == "c1":
+                continue
+            record = C.evaluate(copy, _golden(copy))
+            record.update(
+                {
+                    "model": "fake/b",
+                    "problem_id": problem.id,
+                    "copy": copy.id,
+                    "kind": copy.kind,
+                    "bucket": problem.bucket,
+                }
+            )
+            C.write_json(C.job_dir(out, "fake/b", problem, copy) / "eval.json", record)
+    payload, text = C.summarize(cfg, out)
+    assert payload["gate"]["verdict"] == "withheld" and "1 copies not evaluated" in text
+    # the last copy arrives and model b is perfectly consistent: falsified,
+    # regardless of model a
+    copy = next(
+        c for p, cs in prepared if p is long_problem for c in cs if c.id == "c1"
+    )
+    record = C.evaluate(copy, _golden(copy))
+    record.update(
+        {
+            "model": "fake/b",
+            "problem_id": long_problem.id,
+            "copy": copy.id,
+            "kind": copy.kind,
+            "bucket": long_problem.bucket,
+        }
+    )
+    C.write_json(C.job_dir(out, "fake/b", long_problem, copy) / "eval.json", record)
+    payload, text = C.summarize(cfg, out)
+    assert payload["gate"]["verdict"] == "H0 FALSIFIED"
+
+
+def test_gate_names_models_excluded_for_quality(tmp_path):
+    cfg = _cfg(models=("fake/a", "fake/b"))
+    out = tmp_path / "e0"
+    prepared = C.prepare(cfg, out)
+    for problem, copies in prepared:
+        for i, copy in enumerate(copies):
+            a = _wrong(copy, 0, 1) if i == 1 else _golden(copy)  # below the gate
+            b = "no idea"  # answers nothing
+            for model, content in (("fake/a", a), ("fake/b", b)):
+                record = C.evaluate(copy, content)
+                record.update(
+                    {
+                        "model": model,
+                        "problem_id": problem.id,
+                        "copy": copy.id,
+                        "kind": copy.kind,
+                        "bucket": problem.bucket,
+                    }
+                )
+                C.write_json(C.job_dir(out, model, problem, copy) / "eval.json", record)
+    payload, text = C.summarize(cfg, out)
+    assert payload["gate"]["verdict"] == "H0 stands"
+    assert "Excluded for answered/success conditions: fake/b" in text
+
+
+def test_recover_errors_is_idempotent_and_handles_interrupted_requests(tmp_path):
+    cfg = _cfg()
+    out = tmp_path / "e0"
+    prepared = C.prepare(cfg, out)
+    problem, copies = prepared[0]
+    failed = C.job_dir(out, cfg.models[0], problem, copies[0])
+    C.write_json(failed / "result.json", {"error": "boom", "content": None})
+    interrupted = C.job_dir(out, cfg.models[0], problem, copies[1])
+    C.write_json(interrupted / "request.json", {"model": "x"})
+    fine = C.job_dir(out, cfg.models[0], problem, copies[2])
+    C.write_json(fine / "result.json", {"error": None, "content": "answer A"})
+    untouched = C.job_dir(out, cfg.models[0], problem, copies[3])
+    untouched.mkdir(parents=True)
+    first = C.recover_errors(out)
+    assert sorted(p.name for p in first) == ["c0.failed1", "c1.failed1"]
+    assert fine.exists() and untouched.exists()
+    assert C.recover_errors(out) == []  # archives are never re-archived
+    C.write_json(failed / "result.json", {"error": "again", "content": None})
+    assert [p.name for p in C.recover_errors(out)] == ["c0.failed2"]
+
+
+def test_fingerprint_covers_tolerances(tmp_path):
+    from experiments.geostate.configs import ToleranceSpec
+
+    cfg = _cfg()
+    out = tmp_path / "e0"
+    C.prepare(cfg, out)
+    with pytest.raises(RuntimeError, match="different config"):
+        C.prepare(cfg, out, tol=ToleranceSpec(agreement=0.05))

@@ -119,7 +119,7 @@ and ADR 0006 so that they cannot drift once the numbers exist.
   the original fails on a relabelled copy, so relabelling is a real test.
 - Dry runs: `e0-synthetic-text` = 300 problems × 8 copies × 3 models = 7200
   requests; `e0-aux-text` = 684 × 8 × 3 = 16416; the figure arms one model
-  each; `e0-synthetic-text-reflect` keeps 1005 of 1200 copies.
+  each; `e0-synthetic-text-reflect` keeps 1011 of 1200 copies.
 - Adversarial review of the first build found the harness scoring failed and
   unanswered copies as agreement (which could trip the gate with no data),
   an unrecoverable error cache, a unitless line comparison, lost copies in the
@@ -162,3 +162,9 @@ package into its own repository as the first post-go task (ADR 0004).
   breakdown keeps every copy, Δsuccess with CI, trajectory pruning, drift and
   duplicate rejection for copies, reflection OOD config, fingerprinted run
   directories, stratified `--limit`. 91 tests.
+- 2026-09-24 — second review pass: a model with no data or missing copies
+  now withholds the verdict (a single consistent model still falsifies);
+  models excluded for the answered/success conditions are named; recovery
+  also archives interrupted requests and never re-archives; the run
+  fingerprint covers generator and tolerance settings; a macro node that adds
+  no move is rejected so no description restates a sub-result. 96 tests.

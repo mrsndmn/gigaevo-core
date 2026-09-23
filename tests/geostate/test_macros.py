@@ -153,3 +153,15 @@ def test_param_transforms_round_trip():
         there = macros.transform_params(kind, params, g)
         back = macros.inverse_params(kind, there, g)
         assert macros.distance_between(kind, back, params) < 1e-9
+
+
+def test_strict_expand_rejects_a_macro_that_adds_no_move():
+    # the outer intersection restates the inner one: same lines, same point
+    given = {"A": (0.0, 0.0), "B": (8.0, 0.0), "C": (2.0, 6.0), "E": (4.0, 5.0)}
+    expr = ["line_meet", ["line_meet", "C", "E", "A", "B"], "E", "A", "B"]
+    st = GeometricState.from_given(given)
+    assert macros.expand(macros.Builder(st), expr) == "h3"  # lenient: fine
+    with pytest.raises(MoveError, match="adds no move"):
+        macros.expand(
+            macros.Builder(GeometricState.from_given(given)), expr, strict=True
+        )
