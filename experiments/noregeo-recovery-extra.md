@@ -42,3 +42,7 @@ Pending; report new-cohort outcomes separately before pooling.
   against the system root store (`openssl verify: OK`). A per-job CA bundle keeps
   certificate/hostname verification enabled. Explicit connection recovery archives
   the old attempt and preserves successful request caches and completed arms.
+
+- 2026-09-23 — Archived connection failures and resumed as MLS job
+  `lm-mpi-job-1c1954e2-1f76-4589-b75d-b512987715fc`, commit
+  `1da3459079d9e86b2f1228d8f005676a229b3bb8`; successful replies reused.

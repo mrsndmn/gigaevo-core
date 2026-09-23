@@ -98,6 +98,7 @@ def test_connection_recovery_preserves_successful_calls(tmp_path, monkeypatch):
 
 def test_connection_recovery_refuses_live_job(tmp_path, monkeypatch):
     import pytest
+
     from experiments.noregeo_synth.feedback_eval import write
 
     monkeypatch.setattr(launcher, "mls", lambda *a: {"status": "running"})
