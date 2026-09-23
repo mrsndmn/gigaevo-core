@@ -94,7 +94,10 @@ def payload(
     ]
     script = f"cd {shlex.quote(workdir)} && " + shlex.join(command)
     tls_env = {}
-    if module == "experiments.noregeo_synth.recovery_extra":
+    if module in {
+        "experiments.noregeo_synth.recovery_extra",
+        "experiments.noregeo_synth.recovery_last",
+    }:
         tls_env["SSL_CERT_FILE"] = to_job_path(Path(out) / "tls-ca-bundle.pem")
     return {
         "job": {
@@ -125,7 +128,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry", action="store_true")
     parser.add_argument(
-        "--experiment", choices=("original", "extra15"), default="original"
+        "--experiment", choices=("original", "extra15", "last30"), default="original"
     )
     args = parser.parse_args(argv)
     spec, prepare_run, report_run = SPEC, prepare, report
@@ -139,6 +142,15 @@ def main(argv=None):
             recovery_extra.report,
         )
         module = "experiments.noregeo_synth.recovery_extra"
+    if args.experiment == "last30":
+        from . import recovery_last
+
+        spec, prepare_run, report_run = (
+            recovery_last.SPEC,
+            recovery_last.prepare,
+            recovery_last.report,
+        )
+        module = "experiments.noregeo_synth.recovery_last"
     description = f"[gigaevo/noregeo_recovery] {spec.name}"
     commit = git("rev-parse", "HEAD")
     out = Path(spec.artifact_root) / spec.name

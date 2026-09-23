@@ -349,7 +349,7 @@ def feedback(result, arm, instruction):
     # Gold and scoring fields never enter this message.
     text = {k: result[k] for k in ("ok", "error", "stdout", "state") if k in result}
     content = [{"type": "text", "text": json.dumps(text) + "\n" + instruction}]
-    if arm == "canvas" and result.get("ok") and result.get("image"):
+    if arm in {"canvas", "canvas_last"} and result.get("ok") and result.get("image"):
         content.append(
             {
                 "type": "image_url",
@@ -360,6 +360,37 @@ def feedback(result, arm, instruction):
             }
         )
     return {"role": "user", "content": content}
+
+
+def context_for(messages, arm):
+    """Keep all text; canvas_last transmits only the newest successful frame.
+
+    Apply at every request boundary, including repair and final-answer calls.
+    Do not mutate the canonical trace or already saved request snapshots.
+    """
+    if arm not in {"history", "canvas", "canvas_last"}:
+        raise ValueError(f"unknown observation arm: {arm}")
+    if arm != "canvas_last":
+        return messages
+    latest = None
+    for i, message in enumerate(messages):
+        if isinstance(message.get("content"), list):
+            for j, item in enumerate(message["content"]):
+                if item.get("type") == "image_url":
+                    latest = (i, j)
+    result = []
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if isinstance(content, list):
+            content = [
+                item
+                for j, item in enumerate(content)
+                if item.get("type") != "image_url" or (i, j) == latest
+            ]
+            result.append({**message, "content": content})
+        else:
+            result.append(dict(message))
+    return result
 
 
 def rollout(task, fmt, arm, directory, first, injected=None):
@@ -398,7 +429,7 @@ def rollout(task, fmt, arm, directory, first, injected=None):
             else:
                 raw = request(
                     client,
-                    messages,
+                    context_for(messages, arm),
                     interactive_schema(),
                     fmt,
                     directory / f"call_{calls:02d}",
@@ -491,7 +522,7 @@ def rollout(task, fmt, arm, directory, first, injected=None):
         )
         final = request(
             client,
-            messages,
+            context_for(messages, arm),
             answer_schema(task.row),
             "json",
             directory / "answer",
