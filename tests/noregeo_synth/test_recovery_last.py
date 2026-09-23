@@ -71,11 +71,12 @@ def raw(code, action="append"):
     }
 
 
+@pytest.mark.parametrize("callback", [False, True])
 @pytest.mark.parametrize(
     "arm,expected", [("canvas_last", [1, 1, 1]), ("canvas", [1, 2, 2])]
 )
 def test_action_and_final_requests_apply_retention(
-    tmp_path, monkeypatch, arm, expected
+    tmp_path, monkeypatch, arm, expected, callback
 ):
     task = Task(
         "center_coordinates",
@@ -103,7 +104,14 @@ def test_action_and_final_requests_apply_retention(
 
     monkeypatch.setattr(base, "_client", lambda cfg: (None, None))
     monkeypatch.setattr(base, "request", request)
-    result = base.rollout(task, "block", arm, tmp_path, raw('mark("A",P["A"])'))
+    result = base.rollout(
+        task,
+        "block",
+        arm,
+        tmp_path,
+        raw('mark("A",P["A"])'),
+        request_fn=request if callback else None,
+    )
     assert result["correct"]
     assert [count_images(m) for m in captured] == expected
     assert all('mark("A"' in str(m) for m in captured)

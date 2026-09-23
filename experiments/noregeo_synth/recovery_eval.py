@@ -393,7 +393,8 @@ def context_for(messages, arm):
     return result
 
 
-def rollout(task, fmt, arm, directory, first, injected=None):
+def rollout(task, fmt, arm, directory, first, injected=None, request_fn=None):
+    request_call = request_fn or request
     directory = Path(directory)
     record_path = directory / "record.json"
     if record_path.exists():
@@ -401,7 +402,7 @@ def rollout(task, fmt, arm, directory, first, injected=None):
         if saved["status"] == "running":
             raise RuntimeError("interrupted rollout; refusing automatic reroll")
         return saved
-    client, _ = _client(CFG)
+    client = _client(CFG)[0] if request_fn is None else None
     messages = messages_for(task, fmt)
     accepted = []
     record = {
@@ -427,7 +428,7 @@ def rollout(task, fmt, arm, directory, first, injected=None):
             if calls == 1:
                 raw = first
             else:
-                raw = request(
+                raw = request_call(
                     client,
                     context_for(messages, arm),
                     interactive_schema(),
@@ -520,7 +521,7 @@ def rollout(task, fmt, arm, directory, first, injected=None):
                 "content": "Action phase is over. Return only final_answer in the requested JSON schema.",
             }
         )
-        final = request(
+        final = request_call(
             client,
             context_for(messages, arm),
             answer_schema(task.row),
