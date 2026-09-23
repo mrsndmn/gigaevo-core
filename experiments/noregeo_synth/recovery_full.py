@@ -388,17 +388,16 @@ def report(out):
                 "p": counts["mcnemar_exact_p"],
             }
         metrics[group] = {"arms": arms, "paired": paired}
-    firsts = {}
-    for p in out.glob("tasks/*/first/result.json"):
-        r = read(p)
-        firsts[p.parent.parent.name] = r.get("usage", {}).get("total_tokens", 0)
+    firsts = read_available(out.glob("tasks/*/first/result.json"))
     continuations = 0
     for r in rows:
         raw = [e["raw"] for e in r["events"][1:]]
         if "final_raw" in r:
             raw.append(r["final_raw"])
         continuations += sum(x.get("usage", {}).get("total_tokens", 0) for x in raw)
-    metrics["accounted_tokens"] = sum(firsts.values()) + continuations
+    metrics["accounted_tokens"] = (
+        sum(r.get("usage", {}).get("total_tokens", 0) for r in firsts) + continuations
+    )
     metrics["note"] = (
         "Live record-based usage; responses not yet checkpointed may lag. Transport errors without usage have unknown spend."
     )
@@ -422,10 +421,11 @@ def report(out):
                 f"<tr><td>{arm}</td><td>{m['correct']}/{m['planned']}</td><td>{terminal}</td><td>{m['wrong_answer']}</td><td>{m['execution_failure']}</td><td>{m['prompt_tokens']}</td><td>{m['completion_tokens']}</td></tr>"
             )
         parts.append("</table>")
-    if (out / "blocked.json").exists():
+    blocked = read_available([out / "blocked.json"])
+    if blocked:
         parts.append(
             '<p class="bad">Остановлено с сохранением прогресса: '
-            + escape(str(read(out / "blocked.json")))
+            + escape(str(blocked[0]))
             + "</p>"
         )
     parts.append(

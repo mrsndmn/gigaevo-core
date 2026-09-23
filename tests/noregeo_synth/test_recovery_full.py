@@ -199,3 +199,31 @@ def test_format_failure_trace_contains_raw_final_and_parser_error(tmp_path):
     assert "malformed final &lt;evidence&gt;" in html
     assert "missing final_answer" in html
     assert "length" in html
+
+
+@pytest.mark.parametrize(
+    "racing_path", ["tasks/valid_1/first/result.json", "blocked.json"]
+)
+def test_report_tolerates_archived_first_and_removed_stop_marker(
+    tmp_path, monkeypatch, racing_path
+):
+    write(
+        tmp_path / "inputs.json",
+        {
+            "tasks": [{"stem": "valid", "row": {"qid": 1, "question": "test"}}],
+            "issues": {},
+        },
+    )
+    path = tmp_path / racing_path
+    write(path, {"error": "transient"})
+    original = ev.read
+
+    def racing_read(p):
+        if p == path:
+            p.unlink()
+        return original(p)
+
+    monkeypatch.setattr(ev, "read", racing_read)
+    result = ev.report(tmp_path)
+    assert result["accounted_tokens"] == 0
+    assert (tmp_path / "analysis.html").exists()
