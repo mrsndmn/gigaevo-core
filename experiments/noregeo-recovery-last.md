@@ -32,12 +32,34 @@ runs, not a concurrent control for endpoint model/version drift.
 
 Submitted MLS job `lm-mpi-job-630c93f6-bde6-4495-879a-8d665a2996ac`
 from reviewed commit `a15638cbc62bed4ab19797374e966b34bf644afa`.
-All149 NoReGeo tests passed. Live results pending.
+All149 NoReGeo tests passed. The worker completed all30 new-arm measurements
+in 645.29 seconds. All30 final answers are correct, matching both frozen baselines.
+
+History: 423,774 input + 67,738 output = 491,512 tokens; 9 failed actions.
+Canvas: 580,448 input + 64,618 output = 645,066 tokens; 15 failed actions.
+Canvas_last: 492,235 input + 66,074 output = 558,309 tokens; 11 failed actions.
+All failed actions were recovered. New-arm failures: 6 premature finish requests,
+2 malformed block envelopes, and 3 Python syntax errors.
+
+Latest-frame total usage is 13.4% below full-canvas usage and 13.6% above history.
+Per-arm totals include 90,491 reused first-response tokens for comparability;
+new physical API usage is 467,818 tokens across127 requests. Independently
+reconciled physical usage plus shared-first usage equals the reported total.
+All127 request payloads were verified to contain exactly the PNG of the most
+recent committed successful action, including repairs and final requests.
+All60 baseline record hashes and the source snapshot remain unchanged.
+Standalone report: `run/noregeo_feedback/last30/analysis.html`.
 
 ## Conclusions
 
-Pending; equal accuracy on an easy cohort does not demonstrate visual benefit.
+Retaining only the latest image saved tokens without loss of final-answer
+accuracy on this cohort. Trajectories also differed, so the full cost difference
+includes their changed repair behavior. All three arms are at the observed
+accuracy ceiling; this result does not establish visual benefit on harder tasks.
 
 ## Changelog
 
 - 2026-09-23 — Added latest-frame arm, frozen three-arm comparison and HTML audit.
+
+- 2026-09-23 — Completed30 latest-frame rollouts; reconciled usage and verified
+  all request images against exact last committed frames and baseline hashes.
