@@ -25,9 +25,10 @@ from .dataset import Task
 from .feedback import _BASE, answer_schema, initial_messages, step_schema
 from .feedback_eval import SPEC as OLD_SPEC
 from .feedback_eval import atomic_text, digest, paired_counts, read, write
-from .generate import _client, _seed_for, check_model_is_served
+from .generate import _client as _base_client
+from .generate import _seed_for, check_model_is_served
 from .guard import check
-from .verify import answer_matches
+from .verify import answer_matches, compare_frames
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,17 @@ ENV_HELP = """
 def cross2d(a, b):
     return float(a[0] * b[1] - a[1] * b[0])
 """
+
+
+def _client(cfg):
+    client, credentials = _base_client(cfg)
+    return client.with_options(max_retries=0), credentials
+
+
+def policy_task(task):
+    # Allowlist input fields: never let answer-derived view bounds enter prompts.
+    fields = ("question", "points", "schema_type", "choices", "qid")
+    return replace(task, row={key: task.row[key] for key in fields if key in task.row})
 
 
 def prepare(out, spec=SPEC):
@@ -117,7 +129,11 @@ def request(client, messages, schema, fmt, directory, salt, spec=SPEC):
     if cached.exists():
         return read(cached)
     directory.mkdir(parents=True, exist_ok=True)
-    if list(directory.glob("raw_*.json")) or list(directory.glob("error_*.json")):
+    if (
+        (directory / "request.json").exists()
+        or list(directory.glob("raw_*.json"))
+        or list(directory.glob("error_*.json"))
+    ):
         raise RuntimeError(f"incomplete request at {directory}; refusing silent reroll")
     kwargs = dict(
         model=CFG.model,
@@ -255,11 +271,11 @@ def interactive_schema():
 
 
 def preamble(task):
-    return build_preamble(task.row, CFG) + ENV_HELP
+    return build_preamble(policy_task(task).row, CFG) + ENV_HELP
 
 
 def messages_for(task, fmt):
-    messages = initial_messages(task, CFG, preamble(task))
+    messages = initial_messages(policy_task(task), CFG, preamble(task))
     # Replace old fixed-step protocol, retain geometry/code environment contract.
     messages[-1] = {
         "role": "user",
@@ -316,6 +332,15 @@ def execute(task, steps, directory):
         result = {"ok": False, "error": "execution timeout", "stage": "execution"}
     except (ValueError, OSError) as exc:
         result = {"ok": False, "error": str(exc), "stage": "runner"}
+    if result.get("ok"):
+        delta = compare_frames([result["frame"]], baseline=result["baseline"])[0][
+            "delta"
+        ]
+        result["visible"] = bool(
+            result["added_artists"] > 0
+            and delta is not None
+            and delta >= CFG.min_pixel_delta
+        )
     write(directory / "execution.json", result)
     return result
 
@@ -391,8 +416,10 @@ def rollout(task, fmt, arm, directory, first, injected=None):
                     raise ValueError("first action must append")
                 event["action"] = action
                 if action["action"] == "finish":
-                    if not accepted:
-                        raise ValueError("must compute/draw before finish")
+                    if not accepted or not construction_ready(result):
+                        raise ValueError(
+                            "Before finish, draw a visible construction and assign non-null state['answer']."
+                        )
                     break
                 if action["action"] == "replace_last" and not accepted:
                     raise ValueError("nothing to replace")
@@ -451,6 +478,10 @@ def rollout(task, fmt, arm, directory, first, injected=None):
             return record
         if failures > SPEC.repair_budget:
             record["status"] = "execution_failed"
+            return record
+        record["construction_ready"] = construction_ready(result)
+        if not record["construction_ready"]:
+            record["status"] = "construction_failed"
             return record
         messages.append(
             {
@@ -520,10 +551,22 @@ def evaluate_pair(value, fmt, out, injection=False):
     return [rollout(task, fmt, arm, directory / arm, first, injected) for arm in ARMS]
 
 
+def construction_ready(result):
+    return bool(
+        result
+        and result.get("ok")
+        and result.get("visible")
+        and result.get("state", {}).get("answer") is not None
+    )
+
+
 def pilot_gate(records, spec=SPEC):
     events = [e for r in records for e in r["events"]]
     malformed = sum(e.get("execution", {}).get("stage") == "format" for e in events)
-    completed = sum(r["status"] == "completed" for r in records)
+    completed = sum(
+        r["status"] == "completed" and r.get("construction_ready", False)
+        for r in records
+    )
     rate = malformed / max(1, len(events))
     return {
         "pass": completed >= spec.pilot_min_completed

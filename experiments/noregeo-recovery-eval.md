@@ -53,3 +53,9 @@ Pending. Do not infer visual usefulness from completion-filtered subsets.
 
 - 2026-09-23 — Added staged format diagnostic, transactional recovery pilot,
   technically gated full cohort, separate midpoint intervention and offline HTML.
+- 2026-09-23 — Review fixes: policy task fields are allowlisted so gold cannot
+  alter canvas bounds; a started request without a result blocks silent resume;
+  SDK retries are disabled; finishing requires visible construction and a
+  non-null computed answer, independently of whether that answer is correct.
+  Historical diagnostic prompts intentionally remain exact saved contexts and
+  may retain the old answer-derived view bounds; they measure formatting only.

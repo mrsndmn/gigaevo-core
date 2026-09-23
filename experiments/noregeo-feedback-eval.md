@@ -103,3 +103,9 @@ arms. Preserve this run unchanged; no measurements were retried in this audit.
 
 - 2026-09-23 — Audited saved errors without retries; separated malformed JSON
   from HTTP failures and documented execution confounds and offline HTML report.
+- 2026-09-23 — Subsequent recovery-protocol review found an additional v1
+  confound: shared canvas view bounds included the golden point via
+  `dataset.coordinate_pairs`. Eight of the historical cohort's input views
+  change when gold is removed. V1 artifacts remain unchanged; v2 builds the
+  policy canvas from allowlisted input fields only. Interpret v1 visual results
+  with this information leak in mind; the plain-text baseline is separate.

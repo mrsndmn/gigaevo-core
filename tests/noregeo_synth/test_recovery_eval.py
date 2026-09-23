@@ -52,7 +52,13 @@ def test_observation_differs_only_by_image(tmp_path):
 
 def test_gate_does_not_use_answer_correctness():
     records = [
-        {"status": "completed", "events": [], "correct": False} for _ in range(30)
+        {
+            "status": "completed",
+            "events": [],
+            "correct": False,
+            "construction_ready": True,
+        }
+        for _ in range(30)
     ]
     assert ev.pilot_gate(records)["pass"]
     records[0]["events"] = [{"execution": {"stage": "format"}}]
@@ -85,7 +91,7 @@ def test_rollout_repairs_and_finishes_without_fixed_four_steps(tmp_path, monkeyp
     monkeypatch.setattr(ev, "_client", lambda cfg: (None, None))
     calls = iter(
         [
-            raw('state["answer"] = [1, 1]'),
+            raw('state["answer"] = [1, 1]\nmark("M", [1, 1])'),
             raw("pass", "finish"),
             {"error": None, "content": '{"final_answer":{"x":1,"y":1}}'},
         ]
@@ -118,3 +124,71 @@ def test_report_without_inference(tmp_path):
     ev.write(tmp_path / "inputs.json", {"cases": [], "tasks": [], "injection": []})
     ev.report(tmp_path)
     assert "NoReGeo" in (tmp_path / "analysis.html").read_text()
+
+
+def test_gold_never_affects_policy_environment():
+    from dataclasses import replace
+
+    original = task()
+    changed = replace(
+        original,
+        row={
+            **original.row,
+            "answer": {"point": [99999, -99999]},
+            "image_answer": {"point": [-1234, 4567]},
+        },
+    )
+    for fmt in ev.FORMATS:
+        assert ev.messages_for(original, fmt) == ev.messages_for(changed, fmt)
+    assert ev.preamble(original) == ev.preamble(changed)
+
+
+def test_interrupted_inflight_request_cannot_reroll(tmp_path):
+    from types import SimpleNamespace
+
+    count = []
+
+    def interrupted(**kwargs):
+        count.append(1)
+        raise KeyboardInterrupt()
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=interrupted))
+    )
+    with pytest.raises(KeyboardInterrupt):
+        ev.request(client, [], {}, "block", tmp_path, "same")
+    with pytest.raises(RuntimeError, match="incomplete request"):
+        ev.request(client, [], {}, "block", tmp_path, "same")
+    assert len(count) == 1
+
+
+def test_sdk_retries_disabled(monkeypatch):
+    from types import SimpleNamespace
+
+    options = []
+    client = SimpleNamespace(
+        with_options=lambda **kwargs: options.append(kwargs) or "client"
+    )
+    monkeypatch.setattr(ev, "_base_client", lambda cfg: (client, "credentials"))
+    assert ev._client(ev.CFG) == ("client", "credentials")
+    assert options == [{"max_retries": 0}]
+
+
+def test_empty_construction_cannot_finish_or_pass_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(ev, "_client", lambda cfg: (None, None))
+    monkeypatch.setattr(ev, "request", lambda *a, **kw: raw("pass", "finish"))
+    result = ev.rollout(task(), "block", "history", tmp_path, raw("pass"))
+    assert result["status"] == "execution_failed"
+    assert not ev.pilot_gate([result] * 30)["pass"]
+    assert not ev.pilot_gate(
+        [{"status": "completed", "events": [], "correct": True}] * 30
+    )["pass"]
+
+
+def test_incorrect_but_visible_construction_is_technically_ready(tmp_path):
+    result = ev.execute(
+        task(),
+        [{"title": "wrong", "code": 'state["answer"] = [2, 2]\nmark("M", [2, 2])'}],
+        tmp_path,
+    )
+    assert ev.construction_ready(result)
