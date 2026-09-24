@@ -450,6 +450,7 @@ def evaluate(
     )
     lenient = any(goal_holds(problem, ex.state, o, tol) for o in ex.state.objects)
     return {
+        "scorer": dsl.scorer_hash(),
         "success": success,
         "answered": ex.answer is not None,
         "target_reached": lenient,
@@ -764,6 +765,8 @@ def rescore(
                 result_path = directory / "result.json"
                 if not result_path.exists():
                     continue
+                if force and time.time() - result_path.stat().st_mtime < 120:
+                    continue  # the worker may still be writing this copy's files
                 result = read_json(result_path)
                 if result.get("error"):
                     continue
@@ -846,6 +849,7 @@ def collect(cfg: E0Config, out: Path, tol: ToleranceSpec = TOL) -> dict[str, Any
     """One row per (model, problem) from the evaluations on disk."""
     prepared = prepare(cfg, out, tol, strict=False)
     rows: list[dict[str, Any]] = []
+    scorers: dict[str, int] = defaultdict(int)
     for model in cfg.models:
         for problem, copies in prepared:
             records = []
@@ -853,6 +857,7 @@ def collect(cfg: E0Config, out: Path, tol: ToleranceSpec = TOL) -> dict[str, Any
                 path = job_dir(out, model, problem, copy) / "eval.json"
                 if path.exists():
                     records.append(read_json(path))
+                    scorers[records[-1].get("scorer", "")] += 1
             if not records:
                 continue
             scale = problem.state(tol).scale
@@ -901,7 +906,7 @@ def collect(cfg: E0Config, out: Path, tol: ToleranceSpec = TOL) -> dict[str, Any
                     "error_kinds": [r.get("error_kind") for r in records],
                 }
             )
-    return {"config": cfg.name, "rows": rows}
+    return {"config": cfg.name, "rows": rows, "scorers": dict(scorers)}
 
 
 def _mean(values: list[float]) -> float:
@@ -1111,6 +1116,16 @@ def summarize(
     if unevaluated:
         lines.append("")
         lines.append("No evaluations for: " + ", ".join(unevaluated) + ".")
+    scorers = data.get("scorers", {})
+    if len(scorers) > 1 or (scorers and dsl.scorer_hash() not in scorers):
+        lines.append("")
+        lines.append(
+            "WARNING: records were scored by different parser versions ("
+            + ", ".join(
+                f"{k or 'unversioned'}: {v}" for k, v in sorted(scorers.items())
+            )
+            + f"); current is {dsl.scorer_hash()}. Run --rescore before reading."
+        )
     text = "\n".join(lines) + "\n"
     payload = {
         "config": cfg.name,

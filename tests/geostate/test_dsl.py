@@ -124,3 +124,28 @@ def test_sugar_is_desugared_not_rejected():
     assert D.run_text("x = frob(A, B)\nanswer x", st).error_kind == D.ERR_SYNTAX
     assert D.run_text("x = meet(c, l)[2]\nanswer x", st).error_kind == D.ERR_SYNTAX
     assert D.run_text("x = line(A, B) extra\nanswer x", st).error_kind == D.ERR_SYNTAX
+
+
+def test_names_starting_with_answer_are_assignments():
+    from experiments.geostate import dsl as D
+
+    st = GeometricState.from_given(TRI)
+    ex = D.run_text(
+        "l1 = line(A, B)\nl2 = line(A, C)\nanswer_point = meet(l1, l2)\nanswer answer_point",
+        st,
+    )
+    assert ex.ok and ex.answer.xy() == pytest.approx((0.0, 0.0))
+    ex = D.run_text(
+        "c = circle(A, B)\nl = line(A, B)\nanswers, _ = meet(c, l)\nanswer answers", st
+    )
+    assert ex.ok
+    ex = D.run_text("answer = meet(line(A, B), line(A, C))\nanswer answer", st)
+    assert ex.ok  # `answer = <expr>` then `answer answer`
+    # temporaries never collide with model names, however they are spelled
+    ex = D.run_text("_t1 = line(A, B)\nm = meet(_t1, line(A, C))\nanswer m", st)
+    assert ex.ok and ex.answer.xy() == pytest.approx((0.0, 0.0))
+    # two names with a selection is a syntax error, not a silent unbound name
+    assert D.run_text("x, y = meet(c, l)[0]\nanswer x", st).error_kind == D.ERR_SYNTAX
+    deep = "answer " + "meet(" * 2000 + "A" + ", A)" * 2000
+    assert D.run_text(deep, st).error_kind == D.ERR_SYNTAX
+    assert len(D.scorer_hash()) == 12

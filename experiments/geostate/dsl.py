@@ -52,9 +52,14 @@ OPS = ("line", "circle", "meet")
 _NAME = r"[A-Za-z_][A-Za-z0-9_']*"
 NAME_RE = re.compile(rf"^{_NAME}$")
 FENCE_RE = re.compile(r"```[A-Za-z_-]*[ \t]*\n(.*?)```", re.DOTALL)
-ANSWER_RE = re.compile(r"^\s*answer\s*[:=]?\s*(.+?)\s*$", re.IGNORECASE)
+# `answer` must be the whole word: `answer_point = meet(...)` is an assignment
+ANSWER_RE = re.compile(
+    r"^\s*answer(?![A-Za-z0-9_'])\s*([:=])?\s*(.+?)\s*$", re.IGNORECASE
+)
 ASSIGN_RE = re.compile(rf"^\s*({_NAME})\s*(?:,\s*({_NAME}))?\s*=\s*(.+?)\s*$")
-TEMP_PREFIX = "_t"
+# a prefix no model-written name can match (names are [A-Za-z_][A-Za-z0-9_']*)
+TEMP_PREFIX = "$t"
+MAX_DEPTH = 32
 
 
 class ParseError(ValueError):
@@ -127,19 +132,25 @@ class _Expr:
             raise self._fail(f"expected {ch!r}")
         self.pos += 1
 
-    def parse(self, hoisted: list[tuple[str, str, tuple[str, str], int | None]]) -> str:
+    def parse(
+        self,
+        hoisted: list[tuple[str, str, tuple[str, str], int | None]],
+        depth: int = 0,
+    ) -> str:
         """Parse one expression; nested calls are appended to `hoisted` as
         (temp name, op, args, select) in evaluation order. Returns the name
         the expression's value is bound to."""
+        if depth > MAX_DEPTH:
+            raise self._fail("nesting too deep")
         name = self._name()
         self._skip()
         if self.pos < len(self.text) and self.text[self.pos] == "(":
             if name not in OPS:
                 raise self._fail(f"unknown primitive {name!r}")
             self.pos += 1
-            a = self.parse(hoisted)
+            a = self.parse(hoisted, depth + 1)
             self._expect(",")
-            b = self.parse(hoisted)
+            b = self.parse(hoisted, depth + 1)
             self._expect(")")
             select = None
             self._skip()
@@ -170,13 +181,19 @@ def parse(text: str) -> Program:
             continue
         m = ANSWER_RE.match(stripped)
         if m:
-            expr = _Expr(m.group(1), line_no)
+            expr = _Expr(m.group(2), line_no)
             hoisted: list = []
             name = expr.parse(hoisted)
             if not expr.done():
                 raise ParseError(f"line {line_no}: cannot parse {stripped!r}")
             for temp, op, args, select in hoisted:
                 statements.append(Statement((temp,), op, args, line_no, select))
+            if m.group(1) or hoisted:
+                # `answer = X` / `answer = meet(...)` also binds the name
+                # `answer`, so a later `answer answer` (models write it) resolves
+                statements.append(
+                    Statement(("answer",), "alias", (name, name), line_no)
+                )
             answer = name
             continue
         m = ASSIGN_RE.match(stripped)
@@ -188,6 +205,10 @@ def parse(text: str) -> Program:
         value = expr.parse(hoisted)
         if not expr.done():
             raise ParseError(f"line {line_no}: cannot parse {stripped!r}")
+        if len(names) == 2 and hoisted and hoisted[-1][3] is not None:
+            raise ParseError(
+                f"line {line_no}: two names but [{hoisted[-1][3]}] selects one point"
+            )
         if not hoisted:
             # `X = Y`: a plain alias
             statements.append(Statement(names, "alias", (value, value), line_no))
@@ -268,12 +289,27 @@ def run_text(text: str, state: GeometricState) -> Execution:
     """Parse + execute; a parse failure is an execution with a syntax error."""
     try:
         program = parse(text)
+    except RecursionError:
+        ex = Execution(state=state.copy())
+        ex.error = "nesting too deep"
+        ex.error_kind = ERR_SYNTAX
+        return ex
     except ParseError as exc:
         ex = Execution(state=state.copy())
         ex.error = str(exc)
         ex.error_kind = ERR_EMPTY if "empty" in str(exc) else ERR_SYNTAX
         return ex
     return execute(program, state)
+
+
+def scorer_hash() -> str:
+    """Identifies the parser/executor that scored a record."""
+    import hashlib
+    import inspect
+    import sys
+
+    module = sys.modules[__name__]
+    return hashlib.sha256(inspect.getsource(module).encode()).hexdigest()[:12]
 
 
 def trajectory_program(moves: list[Move], answer: str, state: GeometricState) -> str:

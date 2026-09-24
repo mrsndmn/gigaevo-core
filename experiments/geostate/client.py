@@ -33,7 +33,8 @@ def read_json(path: str | Path) -> Any:
 def write_json(path: str | Path, value: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    # unique per process so two writers of one file never share a temp name
+    temporary = path.with_suffix(f"{path.suffix}.tmp{os.getpid()}")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
     temporary.replace(path)
 
