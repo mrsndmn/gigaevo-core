@@ -273,7 +273,9 @@ def test_v1_launcher_payload():
 
     plan = L.payload("abc", L.run_dir(V1, ARM_TOKENS, 1), V1, ARM_TOKENS, 1)
     job = plan["job"]
-    assert job["description"] == "[gigaevo/geostate] v1 tokens s1"
+    assert job["description"].startswith("[gigaevo/geostate] v1/") and job[
+        "description"
+    ].endswith(" tokens s1")
     env = job["environment"]["variables"]
     assert (
         env["HF_HOME"].startswith("/workspace-SR004.nfs2/")

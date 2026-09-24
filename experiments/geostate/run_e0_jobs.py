@@ -94,8 +94,10 @@ def normalized(description: str) -> str:
 
 
 def description_for(cfg: E0Config, limit: int | None) -> str:
+    # Protocol hash in the description: dedup must not match an older
+    # protocol's job (the E0 jobs of 2026-09-24 predate this and carry none).
     suffix = f" limit{limit}" if limit is not None else ""
-    return f"[gigaevo/geostate] {cfg.name}{suffix}"
+    return f"[gigaevo/geostate] {cfg.name}/{protocol_hash(cfg)}{suffix}"
 
 
 def artifact_dir(cfg: E0Config, limit: int | None) -> Path:

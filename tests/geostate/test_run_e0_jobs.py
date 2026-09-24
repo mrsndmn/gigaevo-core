@@ -18,7 +18,7 @@ def test_payload_runs_the_config_from_the_staged_commit():
         "abc123", out, "/mnt/virtual_ai0001053-00054_SR004-nfs2/x/.env", cfg
     )
     job = plan["job"]
-    assert job["description"] == "[gigaevo/geostate] e0-synthetic-text"
+    assert job["description"].startswith("[gigaevo/geostate] e0-synthetic-text/")
     env = job["environment"]["variables"]
     assert env["PYTHONPATH"].endswith("/code/abc123")
     assert env["AIRI_ENV_FILE"].startswith("/workspace-SR004.nfs2/")

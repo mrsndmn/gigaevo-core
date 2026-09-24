@@ -84,7 +84,9 @@ def protocol_hash_v1(cfg: V1Config) -> str:
 
 
 def description_for(cfg: V1Config, arm: str, seed: int) -> str:
-    return f"[gigaevo/geostate] {cfg.name} {arm} s{seed}"
+    # The protocol hash is part of the description so that dedup on active
+    # jobs never mistakes an older protocol's run for this one.
+    return f"[gigaevo/geostate] {cfg.name}/{protocol_hash_v1(cfg)} {arm} s{seed}"
 
 
 def run_dir(cfg: V1Config, arm: str, seed: int) -> Path:
