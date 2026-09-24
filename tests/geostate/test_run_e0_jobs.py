@@ -12,7 +12,8 @@ from experiments.geostate.configs import ARTIFACT_ROOT, TLS_BUNDLE_NAME, config_
 def test_payload_runs_the_config_from_the_staged_commit():
     cfg = config_named("e0-synthetic-text")
     out = L.artifact_dir(cfg, None)
-    assert str(out).startswith(ARTIFACT_ROOT) and out.name == cfg.name
+    assert str(out).startswith(ARTIFACT_ROOT)
+    assert out.name.startswith(cfg.name + "-") and len(out.name) == len(cfg.name) + 13
     plan = L.payload(
         "abc123", out, "/mnt/virtual_ai0001053-00054_SR004-nfs2/x/.env", cfg
     )
@@ -33,7 +34,11 @@ def test_payload_runs_the_config_from_the_staged_commit():
     pilot = L.payload("abc123", L.artifact_dir(cfg, 12), "/tmp/.env", cfg, limit=12)
     assert "--limit 12" in pilot["job"]["script"]
     assert pilot["job"]["description"].endswith("limit12")
-    assert L.artifact_dir(cfg, 12).name == "e0-synthetic-text-limit12"
+    assert L.artifact_dir(cfg, 12).name.endswith("-limit12")
+    assert "--recover-errors" in pilot["job"]["script"]
+    assert pilot["job"]["script"].index("--summary") < pilot["job"]["script"].index(
+        "--recover-errors"
+    )
 
 
 def test_dry_run_prints_the_manifest_and_submits_nothing(monkeypatch, capsys):

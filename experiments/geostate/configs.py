@@ -200,7 +200,7 @@ ARMS: tuple[str, ...] = (ARM_TEXT, ARM_FIGURE)
 SET_SYNTHETIC = "synthetic"
 SET_AUX = "aux"
 
-# The roster the endpoint serves changes without notice: on 2026-09-25 the
+# The roster the endpoint serves changes without notice: on 2026-09-24 the
 # smoke run watched Qwen3.8-27B disappear mid-run, and Qwen3.5-27B / Qwen3-Next
 # were already gone; what remained was Qwen3-8B, Gpt-oss-120b (open-weight,
 # text-only) and the two Medgemmas. `consistency.run` lists the served models
@@ -209,8 +209,8 @@ SET_AUX = "aux"
 MODEL_QWEN38 = "Qwen/Qwen3.8-27B"  # the only figure-reading VLM; absent now
 MODEL_QWEN3_8B = "Qwen/Qwen3-8B"
 MODEL_GPTOSS = "Openai/Gpt-oss-120b"  # text-only: a blind control on the figure arm
-MODEL_QWEN35 = "Qwen/Qwen3.5-27B"  # absent since 2026-09-25
-MODEL_QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"  # absent since 2026-09-25
+MODEL_QWEN35 = "Qwen/Qwen3.5-27B"  # absent since 2026-09-24
+MODEL_QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"  # absent since 2026-09-24
 # Google/Medgemma-27b-it is excluded from the figure arm: `noregeo-vlm-eval.md`
 # established that it cannot read the rendered figure.
 TEXT_MODELS: tuple[str, ...] = (MODEL_QWEN3_8B, MODEL_GPTOSS, MODEL_QWEN38)
@@ -231,10 +231,13 @@ class E0Config:
     base_url: str = DEFAULT_BASE_URL
     temperature: float = 0.0
     top_p: float = 1.0
-    max_tokens: int = 6144
+    # Thinking models (Qwen3-8B) spend 2.5-5k tokens on a 3-move problem and
+    # blew a 6144 cap in the smoke; 16k leaves room without the 32k context.
+    max_tokens: int = 16384
     # vLLM reasoning control, passed through `extra_body`; None = omit.
     reasoning_effort: str | None = None
-    request_timeout: float = 300.0
+    # Qwen3-8B decodes at ~43 tok/s: a 16k completion needs ~380 s.
+    request_timeout: float = 900.0
     max_transport_retries: int = 6
     retry_backoff_cap: float = 60.0
     workers: int = 4  # the live smoke ran 4 in flight without a 429

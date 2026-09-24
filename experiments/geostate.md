@@ -132,6 +132,26 @@ and ADR 0006 so that they cannot drift once the numbers exist.
   per-transform breakdown, verdicts on ungated configs and dead moves in
   trajectories. All fixed and covered by tests.
 
+2026-09-25, first live requests (smoke, 2 synthetic problems, local run):
+
+- Every request failed with `APIConnectionError` until the client verified
+  TLS against a bundle with the endpoint's missing GlobalSign intermediate;
+  after that Qwen3.8-27B answered 12 of 12 requests with well-formed programs
+  in 26–57 s, then the endpoint **unloaded the model mid-run** (404 "model not
+  found"); Qwen3.5-27B and Qwen3-Next were already gone. Served since:
+  Qwen3-8B, Gpt-oss-120b, two Medgemmas — so the figure arm has no
+  figure-reading model today and the text arm runs on Qwen3-8B and
+  Gpt-oss-120b, with Qwen3.8-27B picked up automatically if it returns.
+- First inconsistency observed, on a 3-move problem ("the point symmetric to
+  B with respect to A"): Qwen3.8-27B solved the identity, relabel, translate,
+  rotate, scale and similarity copies and failed the similarity+relabel copy
+  by naming the second point of the pair instead of the first — a selection
+  error, the failure class H1 is about, not a syntax or reference error.
+- Gpt-oss-120b answers in ~10 s and picks the wrong point of the pair
+  consistently (1 of 8 copies right); Qwen3-8B thinks for 2.5–5k tokens and
+  exhausted a 6144-token cap once. The selection rule now carries a worked
+  example in the prompt and the cap is 16k (`configs.py`).
+
 ## Conclusions
 
 The environment and the E0 harness are ready to run against the endpoint; the
@@ -145,7 +165,11 @@ coincidence with a constructed target only — incidence and tangency exist as
 kernel predicates but not yet as goal statements (AC-10); no `geostate`
 extra was needed because the kernel is numpy-only and analytic geometry, not
 kingdon, is the test oracle (AC-4); the auxiliary text config covers every
-valid row while the auxiliary figure config samples per stem (AC-11).
+valid row while the auxiliary figure config samples per stem (AC-11); the
+gated models are no longer the spec's Qwen3.8-27B / Qwen3.5-27B / Qwen3-Next
+but whatever open text models the endpoint serves — today Qwen3-8B and
+Gpt-oss-120b — because the endpoint removed the others (E0 constraints).
+While Qwen3.8-27B is absent the figure arm cannot run at all.
 
 Next: (1) run E0 on the three open text models and the one figure model;
 (2) build the V1 arm and its matched baseline on Qwen3-1.7B with generator
@@ -174,3 +198,7 @@ package into its own repository as the first post-go task (ADR 0004).
   also archives interrupted requests and never re-archives; the run
   fingerprint covers generator and tolerance settings; a macro node that adds
   no move is rejected so no description restates a sub-result. 96 tests.
+- 2026-09-25 — first live smoke: TLS bundle with the GlobalSign intermediate,
+  MLS launcher `run_e0_jobs.py`, served-model check at run start, roster
+  switched to Qwen3-8B + Gpt-oss-120b (+ Qwen3.8-27B when present), prompt
+  example for pair selection, 16k token cap, concurrency 4. 100 tests.

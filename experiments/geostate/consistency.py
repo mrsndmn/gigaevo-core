@@ -32,6 +32,9 @@ import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+import fcntl
+import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -265,9 +268,33 @@ def problems_for(
     raise ValueError(f"unknown problem set {cfg.problem_set!r}")
 
 
+def protocol_hash(cfg: E0Config) -> str:
+    """Everything that shapes a model's answer besides the problem itself.
+
+    Prompt templates (the source of `prompts.py`) and the sampling parameters.
+    Answers produced under different protocols are never summarised together:
+    the hash is part of the run fingerprint and of the launcher's artifact
+    directory name. The model list is *not* part of it — models live in
+    separate directories and may come and go.
+    """
+    material = json.dumps(
+        {
+            "prompts": inspect.getsource(prompts),
+            "temperature": cfg.temperature,
+            "top_p": cfg.top_p,
+            "max_tokens": cfg.max_tokens,
+            "reasoning_effort": cfg.reasoning_effort,
+            "arm": cfg.arm,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
+
+
 def fingerprint(cfg: E0Config, tol: ToleranceSpec = TOL) -> dict[str, Any]:
     """What the frozen inputs depend on; checked when a run directory is reused."""
     return {
+        "protocol": protocol_hash(cfg),
         "name": cfg.name,
         "problem_set": cfg.problem_set,
         "seed": cfg.seed,
@@ -518,26 +545,82 @@ def run_one(
     return record
 
 
-def _acquire_lock(out: Path) -> Path:
-    lock = out / LOCK_NAME
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise RuntimeError(
-            f"{lock} exists: another run owns {out} (remove it if stale)"
-        ) from None
-    with os.fdopen(fd, "w") as fh:
-        fh.write(json.dumps({"pid": os.getpid(), "started": time.time()}))
-    return lock
+class RunLock:
+    """An advisory `flock` on `<out>/.lock`, released by the kernel on death.
+
+    A run stopped by SIGTERM (an MLS stop or preemption) therefore never
+    leaves a lock behind that would block the next submission; the file
+    itself is only a record of who last held it.
+    """
+
+    def __init__(self, out: Path):
+        self.path = out / LOCK_NAME
+        self._fh = None
+
+    def __enter__(self) -> RunLock:
+        self._fh = self.path.open("a+")
+        try:
+            fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._fh.close()
+            self._fh = None
+            raise RuntimeError(
+                f"{self.path}: another run owns {self.path.parent}"
+            ) from None
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(json.dumps({"pid": os.getpid(), "started": time.time()}))
+        self._fh.flush()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._fh is not None:
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
+            self._fh.close()
+            self._fh = None
 
 
-def served_models(client) -> set[str] | None:
-    """Model ids the endpoint serves right now; None if the listing failed."""
+def lock_is_held(out: Path) -> bool:
+    """Is a run alive on `out`? (Tries to take the flock and gives it back.)"""
+    path = out / LOCK_NAME
+    if not path.exists():
+        return False
+    with path.open("a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    return False
+
+
+class EndpointUnavailable(RuntimeError):
+    """The model listing failed: nothing is scheduled (exit 4)."""
+
+
+def served_models(client) -> set[str]:
+    """Model ids the endpoint serves right now; raises if the listing fails.
+
+    A listing that cannot be fetched means every request would fail the same
+    way, so the run aborts before scheduling anything rather than burning the
+    retry ladder on thousands of copies.
+    """
     try:
         return {m.id for m in client.models.list().data}
-    except Exception as exc:  # noqa: BLE001 - a listing failure is not fatal
-        print(f"  ! could not list models: {type(exc).__name__}: {exc}", flush=True)
-        return None
+    except Exception as exc:  # noqa: BLE001 - reported, then fatal
+        raise EndpointUnavailable(
+            f"could not list models: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+EXIT_FAILED_REQUESTS = 3
+EXIT_ENDPOINT_UNAVAILABLE = 4
+EXIT_MODELS_ABSENT = 5
+
+
+def _model_gone(record: dict[str, Any]) -> bool:
+    error = str(record.get(REQUEST_ERROR) or "")
+    return "NotFoundError" in error and "model" in error.lower()
 
 
 def run(
@@ -547,27 +630,37 @@ def run(
     workers: int | None = None,
     tol: ToleranceSpec = TOL,
 ) -> int:
+    """Issue every missing request; exit 0 only when every configured model ran clean.
+
+    Exit codes: 3 = some requests failed (recoverable), 4 = the endpoint could
+    not even list its models (nothing scheduled), 5 = a configured model was
+    not served (skipped) or went away mid-run.
+    """
     prepared = stratified(prepare(cfg, out, tol), limit)
-    lock = _acquire_lock(out)
-    try:
+    with RunLock(out):
         clients = Clients(cfg, out)
-        # The roster changes: a model can be unloaded between runs (or during
-        # one). Skip the absent ones instead of caching a 404 per copy; a later
+        # The roster changes: a model can be unloaded between runs or during
+        # one. Skip the absent ones instead of caching a 404 per copy; a later
         # run picks them up when they are back.
-        served = served_models(clients.get())
-        models = list(cfg.models)
-        if served is not None:
-            absent = [m for m in models if m not in served]
-            models = [m for m in models if m in served]
-            if absent:
-                print(
-                    f"[{cfg.name}] not served now, skipped: {', '.join(absent)}",
-                    flush=True,
-                )
+        try:
+            served = served_models(clients.get())
+        except EndpointUnavailable as exc:
             write_json(
                 out / "run.json",
-                {"served": sorted(served), "skipped": absent, "started": time.time()},
+                {"served": None, "error": str(exc), "started": time.time()},
             )
+            print(f"[{cfg.name}] {exc}; nothing scheduled", flush=True)
+            return EXIT_ENDPOINT_UNAVAILABLE
+        absent = [m for m in cfg.models if m not in served]
+        models = [m for m in cfg.models if m in served]
+        if absent:
+            print(
+                f"[{cfg.name}] not served now, skipped: {', '.join(absent)}", flush=True
+            )
+        write_json(
+            out / "run.json",
+            {"served": sorted(served), "skipped": absent, "started": time.time()},
+        )
         print(
             f"[{cfg.name}] credentials from {clients.source}; {len(prepared)} problems "
             f"x {cfg.copies} copies x {len(models)} models",
@@ -575,11 +668,18 @@ def run(
         )
         jobs = [(m, p, c) for m in models for p, copies in prepared for c in copies]
         failures = 0
+        gone: set[str] = set()
+
+        def work(m: str, p: Problem, c: Copy) -> dict[str, Any] | None:
+            if m in gone:
+                return None  # unloaded mid-run: leave the copy unrequested
+            record = run_one(clients, cfg, m, p, c, out, tol)
+            if _model_gone(record):
+                gone.add(m)
+            return record
+
         with ThreadPoolExecutor(max_workers=workers or cfg.workers) as pool:
-            futures = {
-                pool.submit(run_one, clients, cfg, m, p, c, out, tol): (m, p, c)
-                for m, p, c in jobs
-            }
+            futures = {pool.submit(work, m, p, c): (m, p, c) for m, p, c in jobs}
             for i, fut in enumerate(as_completed(futures), start=1):
                 m, p, c = futures[fut]
                 try:
@@ -591,14 +691,32 @@ def run(
                         flush=True,
                     )
                     continue
-                if record.get(REQUEST_ERROR):
+                if record is not None and record.get(REQUEST_ERROR):
                     failures += 1
                 if i % 25 == 0 or i == len(jobs):
                     print(f"  {i}/{len(jobs)} done", flush=True)
+        if gone:
+            print(
+                f"[{cfg.name}] unloaded mid-run, remaining copies left unrequested: {', '.join(sorted(gone))}",
+                flush=True,
+            )
+        write_json(
+            out / "run.json",
+            {
+                "served": sorted(served),
+                "skipped": absent,
+                "gone_mid_run": sorted(gone),
+                "failed_requests": failures,
+                "started": None,
+                "finished": time.time(),
+            },
+        )
         print(f"[{cfg.name}] finished; {failures} failed requests", flush=True)
-        return 0 if failures == 0 else 3
-    finally:
-        lock.unlink(missing_ok=True)
+        if failures:
+            return EXIT_FAILED_REQUESTS
+        if absent or gone:
+            return EXIT_MODELS_ABSENT
+        return 0
 
 
 COPY_DIR_RE = re.compile(r"c\d+")
@@ -611,8 +729,8 @@ def recover_errors(out: Path) -> list[Path]:
     request (manifest written, no result) left behind by a run that no longer
     holds the lock. Earlier archives (`cN.failedK`) are never touched.
     """
-    if (out / LOCK_NAME).exists():
-        raise RuntimeError(f"{out / LOCK_NAME} exists: refusing to recover a live run")
+    if lock_is_held(out):
+        raise RuntimeError(f"{out / LOCK_NAME} is held: refusing to recover a live run")
     archived: list[Path] = []
     for directory in sorted(out.glob("*/*/*")):
         if not directory.is_dir() or not COPY_DIR_RE.fullmatch(directory.name):
@@ -903,11 +1021,17 @@ def summarize(
                 + ") is below the gate."
                 + note
             )
+    evaluated_models = {r["model"] for r in data["rows"]}
+    unevaluated = [m for m in cfg.models if m not in evaluated_models]
+    if unevaluated:
+        lines.append("")
+        lines.append("No evaluations for: " + ", ".join(unevaluated) + ".")
     text = "\n".join(lines) + "\n"
     payload = {
         "config": cfg.name,
         "summary": summary,
         "gate": gate,
+        "unevaluated_models": unevaluated,
         "rows": data["rows"],
     }
     return payload, text

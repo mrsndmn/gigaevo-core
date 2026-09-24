@@ -46,7 +46,7 @@ from .configs import (
     config_named,
     experiment_configs,
 )
-from .consistency import prepare
+from .consistency import prepare, protocol_hash
 
 MLS = "/home/jovyan/.mlspace/envs/arkhip/bin/mls"
 JOB_ID = re.compile(
@@ -99,7 +99,10 @@ def description_for(cfg: E0Config, limit: int | None) -> str:
 
 
 def artifact_dir(cfg: E0Config, limit: int | None) -> Path:
-    name = cfg.name if limit is None else f"{cfg.name}-limit{limit}"
+    """One directory per config *and protocol*, so protocols never mix."""
+    name = f"{cfg.name}-{protocol_hash(cfg)}"
+    if limit is not None:
+        name += f"-limit{limit}"
     return Path(ARTIFACT_ROOT) / name
 
 
@@ -117,9 +120,12 @@ def payload(
     if limit is not None:
         run += ["--limit", str(limit)]
     summary = [*base, *common, "--summary"]
+    recover = [*base, *common, "--recover-errors"]
+    # After the run: summarise what was answered, then archive the failed
+    # requests so that a resubmission (new token, model back) re-issues them.
     script = (
         f"cd {shlex.quote(workdir)} && {shlex.join(run)}; "
-        f"status=$?; {shlex.join(summary)}; exit $status"
+        f"status=$?; {shlex.join(summary)}; {shlex.join(recover)}; exit $status"
     )
     return {
         "job": {

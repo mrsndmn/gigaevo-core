@@ -256,12 +256,16 @@ def test_summary_reports_missing_requests_and_never_counts_them(tmp_path):
     assert gate_row["n_missing"] == 1 and gate_row["coverage"] < 1.0
     assert payload["gate"]["verdict"] == "withheld"
     assert "not evaluated" in text
-    # recovery archives exactly the failed request; the lock blocks it
-    lock = out / C.LOCK_NAME
-    lock.write_text("{}")
-    with pytest.raises(RuntimeError, match="live run"):
-        C.recover_errors(out)
-    lock.unlink()
+    # recovery archives exactly the failed request; a *held* lock blocks it,
+    # a stale lock file left by a dead run does not
+    with C.RunLock(out):
+        assert C.lock_is_held(out)
+        with pytest.raises(RuntimeError, match="live run"):
+            C.recover_errors(out)
+        with pytest.raises(RuntimeError, match="another run"):
+            with C.RunLock(out):
+                pass
+    assert (out / C.LOCK_NAME).exists() and not C.lock_is_held(out)
     archived = C.recover_errors(out)
     assert len(archived) == 1 and archived[0].name == "c1.failed1"
     assert not (archived[0].parent / "c1").exists()
@@ -476,6 +480,8 @@ def test_client_verifies_tls_with_the_intermediate_bundle(tmp_path, monkeypatch)
     assert INTERMEDIATE_CERT.read_text().strip() in text
     assert text.count("BEGIN CERTIFICATE") > 10  # certifi roots are in front
     assert CL.ca_bundle(tmp_path) == bundle  # written once
+    bundle.write_text("stale")
+    assert CL.ca_bundle(tmp_path).read_text() == text  # refreshed when it differs
 
     captured = {}
 
@@ -494,7 +500,176 @@ def test_client_verifies_tls_with_the_intermediate_bundle(tmp_path, monkeypatch)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     CL.make_client(CFG, tmp_path)
     assert captured["max_retries"] == 0
-    assert captured["http_client"]._transport._pool._ssl_context is not None
+    context = captured["http_client"]._transport._pool._ssl_context
+    subjects = [
+        dict(x for rdn in cert["subject"] for x in rdn)
+        for cert in context.get_ca_certs()
+    ]
+    assert any("GlobalSign" in str(sub.get("organizationName", "")) for sub in subjects)
+    assert context.check_hostname and context.verify_mode.name == "CERT_REQUIRED"
     monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
     CL.make_client(CFG, tmp_path / "other")
     assert not (tmp_path / "other" / "tls-ca-bundle.pem").exists()
+
+
+class _Msg:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Choice:
+    def __init__(self, content):
+        self.message = _Msg(content)
+        self.finish_reason = "stop"
+
+
+class _Usage:
+    def model_dump(self):
+        return {"completion_tokens": 1}
+
+
+class _Response:
+    def __init__(self, content):
+        self.choices = [_Choice(content)]
+        self.usage = _Usage()
+
+    def model_dump(self):
+        return {"content": self.choices[0].message.content}
+
+
+class _Model:
+    def __init__(self, id):
+        self.id = id
+
+
+class FakeClient:
+    """Serves some models; answers with the reference program; can lose a model."""
+
+    def __init__(self, served, answer_for, gone_after=None, list_error=None):
+        self.served = served
+        self.answer_for = answer_for
+        self.gone_after = gone_after or {}
+        self.calls = {}
+        self.list_error = list_error
+        client = self
+
+        class _Models:
+            def list(self):
+                if client.list_error:
+                    raise client.list_error
+                return type("L", (), {"data": [_Model(m) for m in client.served]})()
+
+        class _Completions:
+            def create(self, **kw):
+                import openai
+
+                model = kw["model"]
+                client.calls[model] = client.calls.get(model, 0) + 1
+                limit = client.gone_after.get(model)
+                if limit is not None and client.calls[model] > limit:
+                    raise openai.NotFoundError(
+                        message="Model 'x' not found (cached)",
+                        response=type(
+                            "R",
+                            (),
+                            {"status_code": 404, "headers": {}, "request": None},
+                        )(),
+                        body={"type": "model_not_found"},
+                    )
+                return _Response(client.answer_for(kw))
+
+        self.models = _Models()
+        self.chat = type("Chat", (), {"completions": _Completions()})()
+
+
+def _answer_from_messages(prepared):
+    """Map a prompt back to its copy and answer with the reference program."""
+    index = {}
+    for problem, copies in prepared:
+        for copy in copies:
+            text = C.prompts.user_text(copy.problem.given, copy.problem.description)
+            index[text] = _golden(copy)
+
+    def answer(kw):
+        return index[kw["messages"][1]["content"]]
+
+    return answer
+
+
+def test_run_skips_unserved_models_and_reports_exit_codes(tmp_path, monkeypatch):
+    cfg = _cfg(models=("fake/served", "fake/absent"))
+    out = tmp_path / "e0"
+    prepared = C.prepare(cfg, out)
+    client = FakeClient({"fake/served", "other"}, _answer_from_messages(prepared))
+
+    class Creds:
+        source = "test"
+        expires_at = None
+
+    monkeypatch.setattr(C, "make_client", lambda cfg, ca_dir=None: (client, Creds()))
+    code = C.run(cfg, out, workers=2)
+    assert code == C.EXIT_MODELS_ABSENT
+    manifest = C.read_json(out / "run.json")
+    assert (
+        manifest["skipped"] == ["fake/absent"] and "fake/served" in manifest["served"]
+    )
+    assert client.calls == {"fake/served": 6 * 4}
+    assert not (out / "fake_absent").exists()
+    payload, text = C.summarize(cfg, out)
+    assert payload["unevaluated_models"] == ["fake/absent"]
+    assert "No evaluations for: fake/absent" in text
+    assert payload["gate"]["models"]["fake/absent"]["incomplete"]
+    # the served model is perfectly consistent, which is decisive on its own
+    assert payload["gate"]["verdict"] == "H0 FALSIFIED"
+    # a second run has nothing left to do for the served model and still exits 5
+    assert C.run(cfg, out, workers=2) == C.EXIT_MODELS_ABSENT
+    assert client.calls == {"fake/served": 6 * 4}
+
+
+def test_run_aborts_when_the_listing_fails(tmp_path, monkeypatch):
+    import openai
+
+    cfg = _cfg()
+    out = tmp_path / "e0"
+    C.prepare(cfg, out)
+    err = openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+    client = FakeClient({"fake/model"}, lambda kw: "", list_error=err)
+
+    class Creds:
+        source = "test"
+        expires_at = None
+
+    monkeypatch.setattr(C, "make_client", lambda cfg, ca_dir=None: (client, Creds()))
+    assert C.run(cfg, out) == C.EXIT_ENDPOINT_UNAVAILABLE
+    assert client.calls == {}
+    assert "could not list models" in C.read_json(out / "run.json")["error"]
+    assert not C.lock_is_held(out)
+
+
+def test_model_unloaded_mid_run_stops_its_remaining_copies(tmp_path, monkeypatch):
+    cfg = _cfg(models=("fake/flaky",), copies=4, per_bucket=2)
+    out = tmp_path / "e0"
+    prepared = C.prepare(cfg, out)
+    client = FakeClient(
+        {"fake/flaky"}, _answer_from_messages(prepared), gone_after={"fake/flaky": 5}
+    )
+
+    class Creds:
+        source = "test"
+        expires_at = None
+
+    monkeypatch.setattr(C, "make_client", lambda cfg, ca_dir=None: (client, Creds()))
+    code = C.run(cfg, out, workers=1)
+    assert code == C.EXIT_FAILED_REQUESTS  # the one cached 404
+    manifest = C.read_json(out / "run.json")
+    assert (
+        manifest["gone_mid_run"] == ["fake/flaky"] and manifest["failed_requests"] == 1
+    )
+    evals = list(out.glob("fake_flaky/*/c*/eval.json"))
+    results = list(out.glob("fake_flaky/*/c*/result.json"))
+    assert (
+        len(evals) == 5 and len(results) == 6
+    )  # 5 answers, 1 cached 404, 18 untouched
+    assert client.calls == {"fake/flaky": 6}
+    archived = C.recover_errors(out)
+    assert len(archived) == 1

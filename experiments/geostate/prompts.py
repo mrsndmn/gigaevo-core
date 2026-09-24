@@ -23,7 +23,9 @@ The only operations are:
       otherwise            -> exactly two points X and Y, always in this order:
         circle & circle    X is the point on the LEFT of the directed line from the centre of U to the centre of V; Y is on the right.
         circle & line      X is the point that comes FIRST along the line's direction (from its first defining point towards its second); Y comes second.
+                           Example: for L = line(A, B) and C = circle(A, B), meet(C, L) gives X on the far side of A from B (the point symmetric to B about A) and Y = B itself, because walking along L from A towards B you reach X before B.
       meet fails if the objects are parallel, identical, tangent, or do not intersect.
+      Decide which of X and Y you need from the coordinates; naming the wrong one is a wrong answer.
 
 Every name you use must have been defined earlier (or be a given point). Finish with the line
   answer NAME

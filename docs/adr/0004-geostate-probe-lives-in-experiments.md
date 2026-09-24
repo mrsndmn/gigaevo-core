@@ -38,7 +38,10 @@ from `gigaevo`. A test enforces the allowlist. The only change to GigaEvo's
 
 **Extraction into a standalone repository is the first task after a go
 decision**, not a first-day task. Because the package is self-contained, the
-extraction is a subtree split plus copying at most five helper modules.
+extraction is a subtree split plus copying a handful of helper modules: the
+five `noregeo_synth` modules above and, for the MLS launcher only
+(`run_e0_jobs.py`), the shared job plumbing of
+`experiments.vocab_factorization` (`jobs`, `run_train_jobs.stage_repo`).
 
 ## Considered options
 

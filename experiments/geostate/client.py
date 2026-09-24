@@ -70,12 +70,11 @@ def ca_bundle(directory: str | Path | None = None) -> Path:
     import certifi
 
     target = Path(directory or OUT_DIR) / TLS_BUNDLE_NAME
-    if not target.exists():
+    content = Path(certifi.where()).read_text() + "\n" + INTERMEDIATE_CERT.read_text()
+    if not target.exists() or target.read_text() != content:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(".tmp")
-        tmp.write_text(
-            Path(certifi.where()).read_text() + "\n" + INTERMEDIATE_CERT.read_text()
-        )
+        tmp.write_text(content)
         tmp.replace(target)
     return target
 
