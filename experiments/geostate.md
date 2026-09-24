@@ -265,14 +265,18 @@ measurement artefact: the DSL parser rejected unambiguous programs models
 write unprompted — `meet(l, line(A, B))`, `answer meet(l1, l2)`,
 `meet(c, l)[0]` — as syntax errors (35% of aux copies). The parser now
 desugars them and `consistency --rescore` re-evaluates cached outputs offline
-(the model side is untouched). After rescoring:
+(the model side is untouched). A review of that parser caught a second
+defect — `answer_point = ...` was read as an answer line — fixed and rescored
+again; records now carry a scorer hash and the summary warns when versions
+mix, and the job-written summaries are stale until `--rescore` then
+`--summary` are run after the jobs finish. After rescoring (16:50):
 
 | set | bucket | problems | answered | success identity | success transformed | consistency [CI95] |
 |---|---|---|---|---|---|---|
-| synthetic | 1-3 (complete) | 100 | 0.834 | 0.596 | 0.563 | 0.628 [0.571, 0.679] |
-| synthetic | ≥5 moves | 5 of 187 | — | — | — | (no data yet) |
+| synthetic | 1-3 (complete) | 100 | 0.837 | 0.596 | 0.565 | 0.627 [0.571, 0.678] |
+| synthetic | ≥5 moves | 6 of 187 | — | — | — | (no data yet) |
 | aux | 1-3 | 91 of 242 | 0.990 | 0.989 | 0.991 | 1.000 |
-| aux | 4-9 (all ≥5 moves) | 128 of 442 | 0.890 | 0.787 | 0.793 | 0.834 [0.772, 0.890] |
+| aux | 4-9 (all ≥5 moves) | 130 of 442 | 0.905 | 0.769 | 0.781 | 0.833 [0.776, 0.887] |
 
 What the partial data already says: Qwen3-8B is measurably inconsistent —
 37% of answered copy pairs disagree on 3-move synthetic problems, 17% on
