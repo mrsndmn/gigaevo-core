@@ -31,7 +31,8 @@ def test_every_bucket_is_filled_and_capped():
         counts[p.bucket] += 1
         assert p.n_moves == len(p.trajectory)
         assert p.n_moves <= GENERATOR.max_moves
-        assert count_macros(p.expr) <= GENERATOR.max_macros
+        wrapper = 0 if p.goal["kind"] == "coincide" else 3
+        assert count_macros(p.expr) <= GENERATOR.max_macros + wrapper
         assert p.description and not p.description.endswith(".")
     assert all(v == 4 for v in counts.values()), counts
 

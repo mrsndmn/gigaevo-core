@@ -57,11 +57,17 @@ and both kill gates live in `configs.py`; nothing is repeated here.
   expansion *is* the target and the reference trajectory.
 - `generator.py` — seeded construction problems per length bucket; moves the
   target does not depend on are pruned, and rejection counts are reported.
-  Goals are coincidence with a constructed target, or — for a configured
-  share of problems — a predicate with several valid answers: a point lying
-  on two named curves (either intersection) or a line through a named point
-  tangent to a named circle (either tangent); `goal_holds` is the single
-  success check for E0 and V1.
+  Goals are coincidence with a constructed target, or — for a share of each
+  bucket fixed in `configs.py` — a predicate with several valid answers: a
+  point lying on two named curves (either intersection) or a line through a
+  named point tangent to a named circle (either tangent). The points a curve
+  or a tangent refers to may themselves be constructions, which is what
+  spreads predicate goals over the length buckets; a tangent needs ten
+  primitive moves, so it only appears in the long bucket. Problems solvable
+  in one move over the given points, and descriptions naming constructions
+  the reference never needs, are rejected. `goal_holds` is the single
+  success check for E0 and V1, and a copy of a problem is accepted iff its
+  reference answer mapped back still solves the original.
 - `aux.py` — NoReGeo point stems as construction problems (`--check`
   validates every non-degenerate row against its golden point and exits
   non-zero on a mismatch).
@@ -279,7 +285,11 @@ package into its own repository as the first post-go task (ADR 0004).
 - 2026-09-24 — predicate goals (AC-10): incidence and tangency goals with
   several valid answers, one `goal_holds` for E0 and V1, protocol hashes
   cover the problem-generating code, launcher dedup keys on the protocol.
-  125 tests.
+  Review pass: per-bucket goal quotas with reserved slots and nested curve
+  points (incidence goals in every bucket), a one-move-shortcut guard, copies
+  validated through the goal (reflection keeps predicate goals), `--summary`
+  reads frozen inputs of any protocol. Generating 300 problems now takes
+  ~35 s instead of 8 s. 129 tests.
 - 2026-09-24 — V1 implemented (features, sequences, encoder, LoRA model,
   training, constrained rollouts, launcher, report), smoked on the local GPU
   and submitted as four MLS jobs; E0 auxiliary set submitted. 116 tests.

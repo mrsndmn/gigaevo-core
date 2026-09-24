@@ -140,10 +140,13 @@ class GeneratorSpec:
     max_moves: int = 20  # the 10+ bucket is 10..max_moves
     max_attempts_per_problem: int = 50
     labels: str = "ABCDEFGH"
-    # share of problems whose goal is a predicate with several valid answers
-    # (a point on two given curves, a tangent through a point) rather than
-    # coincidence with one constructed object (AC-10)
-    predicate_goal_prob: float = 0.3
+    # Goals with several valid answers (AC-10): drawn with this probability
+    # (60% incidence, 40% tangency), and capped per length bucket so that no
+    # bucket is dominated by one goal kind. A tangent through a point needs
+    # ten primitive moves (Thales), so it only ever lands in the long bucket.
+    predicate_goal_prob: float = 0.45  # draw rate; the per-bucket caps below bind
+    incident_share: float = 0.25  # of a bucket, at most
+    tangent_share: float = 0.15  # of a bucket, at most
 
 
 GENERATOR = GeneratorSpec()

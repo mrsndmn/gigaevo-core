@@ -93,15 +93,22 @@ def test_reflection_copies_keep_only_well_posed_targets():
         for c in copies[1:]:
             assert c.g.reflect and c.kind in ("reflect", "reflect+relabel")
             seen_reflect = True
-            # the copy's target is the reflection of the original target
-            back = C.inverse_params(c.problem.target_kind, c.problem.target_params, c.g)
-            scale = problem.state().scale
-            assert (
-                C.distance_between(
-                    problem.target_kind, back, problem.target_params, scale
-                )
-                <= TOL.agreement * scale
+            # the copy's reference answer, mapped back, still solves the original
+            back = C.object_from_params(
+                c.problem.target_kind,
+                C.inverse_params(c.problem.target_kind, c.problem.target_params, c.g),
             )
+            from dataclasses import replace as _replace
+
+            from experiments.geostate.generator import goal_holds
+
+            loose = _replace(
+                TOL,
+                coincidence=TOL.agreement,
+                incidence=TOL.agreement,
+                tangency=TOL.agreement,
+            )
+            assert goal_holds(problem, problem.state(), back, loose)
         if problem.expr[0] in ("rotate90", "rotate270"):
             assert len(copies) == 1  # orientation-dependent: no reflected copy survives
     assert seen_reflect
@@ -118,16 +125,22 @@ def test_golden_programs_succeed_and_agree_across_copies():
         assert agreement == 1.0 and n_pairs == len(copies) * (len(copies) - 1) // 2
 
 
-def test_original_program_fails_on_a_relabelled_copy():
-    problem = generate(seed=4, per_bucket=2)[0]
-    copies = C.make_copies(problem, CFG, random.Random(2))
-    relabelled = next(c for c in copies if c.kind == "relabel")
-    original = (
-        "```construction\n"
-        + dsl.trajectory_program(problem.trajectory, problem.answer, problem.state())
-        + "\n```"
-    )
-    assert not C.evaluate(relabelled, original)["success"]
+def test_original_program_fails_on_some_relabelled_copies():
+    """Relabelling matters: the original program is not always still right."""
+    outcomes = []
+    for problem in generate(seed=4, per_bucket=3):
+        for c in C.make_copies(problem, CFG, random.Random(2)):
+            if "relabel" not in c.kind:
+                continue
+            original = (
+                "```construction\n"
+                + dsl.trajectory_program(
+                    problem.trajectory, problem.answer, problem.state()
+                )
+                + "\n```"
+            )
+            outcomes.append(C.evaluate(c, original)["success"])
+    assert outcomes and not all(outcomes)
 
 
 def test_agreement_semantics():

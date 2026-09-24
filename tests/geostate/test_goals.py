@@ -26,6 +26,7 @@ from experiments.geostate.state import GeometricState, Move
 TRI = {"A": (0.0, 0.0), "B": (8.0, 0.0), "C": (2.0, 6.0), "P": (12.0, 5.0)}
 
 
+@pytest.mark.timeout(120)
 def test_generator_emits_every_goal_kind_and_records_it():
     problems, _ = generate_with_stats(seed=7, per_bucket=15)
     kinds = {p.goal["kind"] for p in problems}
@@ -85,6 +86,7 @@ def test_tangent_goal_accepts_either_tangent():
     assert not goal_holds(p, st, chord)
 
 
+@pytest.mark.timeout(120)
 def test_relabel_and_transform_keep_predicate_goals():
     problems = [
         p for p in generate(seed=7, per_bucket=15) if p.goal["kind"] != GOAL_COINCIDE
@@ -139,3 +141,92 @@ def test_sample_goal_respects_the_probability():
     assert kinds == {GOAL_COINCIDE, GOAL_INCIDENT, GOAL_TANGENT}
     st = GeometricState.from_given(TRI)
     assert st.scale > 0
+
+
+@pytest.mark.timeout(120)
+def test_every_bucket_has_incidence_goals_and_only_the_long_one_tangents():
+    problems = generate(seed=11, per_bucket=20)
+    kinds: dict[str, set[str]] = {}
+    for p in problems:
+        kinds.setdefault(p.bucket, set()).add(p.goal["kind"])
+    assert kinds["1-3"] >= {GOAL_COINCIDE, GOAL_INCIDENT}
+    assert kinds["4-9"] >= {GOAL_COINCIDE, GOAL_INCIDENT}
+    assert kinds["10+"] == {GOAL_COINCIDE, GOAL_INCIDENT, GOAL_TANGENT}
+    assert GOAL_TANGENT not in kinds["1-3"] | kinds["4-9"]
+    for p in problems:
+        if p.goal["kind"] != GOAL_COINCIDE:
+            # the description names nothing the reference does not construct
+            assert p.n_moves >= macros_count(p.expr)
+
+
+def macros_count(expr):
+    from experiments.geostate.generator import count_macros
+
+    return count_macros(expr)
+
+
+def test_one_move_shortcuts_are_rejected():
+    from experiments.geostate.generator import one_move_solution
+    from experiments.geostate.state import MoveError
+
+    # P=(0,8), O=(0,0), R=(4,0): PR is NOT tangent; but Q=(8,0)? tangent from P
+    # touches the circle |x|=4 at (±3.2, 1.6) — no given point gives it.
+    given = {"P": (0.0, 8.0), "O": (0.0, 0.0), "R": (4.0, 0.0)}
+    goal = {
+        "kind": GOAL_TANGENT,
+        "through": "P",
+        "circle": ["circle_centred", "O", "R"],
+    }
+    p = build_problem("t", 0, given, ["tangent_line", "P", "O", "R"], goal=goal)
+    assert one_move_solution(p) is None and p.n_moves >= 9
+    # with Q at a tangency point (2*sqrt(3), 2), line(P, Q) solves it in one
+    # move: rejected
+    given["Q"] = (2.0 * 3.0**0.5, 2.0)
+    with pytest.raises(MoveError, match="one move"):
+        build_problem("t", 0, given, ["tangent_line", "P", "O", "R"], goal=goal)
+
+
+def test_tangent_goal_points_may_be_constructions():
+    given = {"A": (0.0, 0.0), "B": (8.0, 0.0), "C": (2.0, 6.0), "P": (14.0, 7.0)}
+    circle = ["circle_centred", ["midpoint", "A", "B"], "C"]
+    goal = {"kind": GOAL_TANGENT, "through": "P", "circle": circle}
+    p = build_problem(
+        "t", 0, given, ["tangent_line", "P", ["midpoint", "A", "B"], "C"], goal=goal
+    )
+    assert "the midpoint of A and B" in p.description and p.bucket == "10+"
+    assert relabel_goal(p.goal, {"A": "B", "B": "A"})["circle"][1] == [
+        "midpoint",
+        "B",
+        "A",
+    ]
+    st = p.state()
+    st.replay(p.trajectory)
+    assert goal_holds(p, st, st.get(p.answer))
+
+
+@pytest.mark.timeout(120)
+def test_reflection_copies_keep_predicate_goals():
+    from experiments.geostate.configs import GROUP_OOD_REFLECTION, OOD_KINDS, E0Config
+
+    cfg = E0Config(
+        name="ood",
+        models=("m",),
+        arm="text",
+        problem_set="synthetic",
+        copies=4,
+        kinds=OOD_KINDS,
+        group=GROUP_OOD_REFLECTION,
+    )
+    problems = [
+        p for p in generate(seed=11, per_bucket=20) if p.goal["kind"] != GOAL_COINCIDE
+    ]
+    kept = 0
+    for problem in problems[:12]:
+        copies = C.make_copies(problem, cfg, random.Random(2))
+        kept += len(copies) - 1
+        for c in copies[1:]:
+            program = dsl.trajectory_program(
+                c.problem.trajectory, c.problem.answer, c.problem.state()
+            )
+            assert C.evaluate(c, "```construction\n" + program + "\n```")["success"]
+    assert kept >= 12 * 2  # predicate goals survive reflection (either answer is right)

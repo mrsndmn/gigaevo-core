@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import fcntl
 import hashlib
 import inspect
@@ -82,6 +82,7 @@ from .generator import (
 from .macros import (
     distance_between,
     inverse_params,
+    object_from_params,
     relabel_expr,
 )
 from .state import ERR_DEGENERATE, MoveError
@@ -198,10 +199,20 @@ def transformed_problem(
         meta={**problem.meta, "copy_of": problem.id},
         goal=relabel_goal(problem.goal, perm),
     )
-    scale = problem.state(tol).scale
-    back = inverse_params(copy.target_kind, copy.target_params, g)
-    drift = distance_between(problem.target_kind, back, problem.target_params, scale)
-    if drift > tol.agreement * scale:
+    # The copy is a faithful transform of the problem iff its reference
+    # answer, mapped back to the original frame, still solves the *original*
+    # problem — within the agreement tolerance, because the given coordinates
+    # were rounded. For coincidence goals this is the target drift check; for
+    # predicate goals it accepts any valid answer (the "first" intersection
+    # may legitimately be the other one after a reflection).
+    original = problem.state(tol)
+    back = object_from_params(
+        copy.target_kind, inverse_params(copy.target_kind, copy.target_params, g)
+    )
+    loose = replace(
+        tol, coincidence=tol.agreement, incidence=tol.agreement, tangency=tol.agreement
+    )
+    if not goal_holds(problem, original, back, loose):
         raise MoveError(ERR_DEGENERATE, "copy target drifts from the original")
     return copy
 
@@ -315,16 +326,21 @@ def fingerprint(cfg: E0Config, tol: ToleranceSpec = TOL) -> dict[str, Any]:
 
 
 def prepare(
-    cfg: E0Config, out: Path, tol: ToleranceSpec = TOL
+    cfg: E0Config, out: Path, tol: ToleranceSpec = TOL, strict: bool = True
 ) -> list[tuple[Problem, list[Copy]]]:
-    """Freeze problems and copies under `out` (idempotent: reloads if present)."""
+    """Freeze problems and copies under `out` (idempotent: reloads if present).
+
+    With `strict` (runs), frozen inputs prepared under another fingerprint are
+    refused; read-only consumers (the summary) pass `strict=False` and get the
+    frozen inputs as they are, whatever the current code says.
+    """
     out.mkdir(parents=True, exist_ok=True)
     problems_path = out / "problems.jsonl"
     copies_path = out / "copies.jsonl"
     manifest_path = out / "prepare.json"
     if problems_path.exists() and copies_path.exists():
         manifest = read_json(manifest_path) if manifest_path.exists() else {}
-        if manifest.get("fingerprint") != fingerprint(cfg, tol):
+        if strict and manifest.get("fingerprint") != fingerprint(cfg, tol):
             raise RuntimeError(
                 f"frozen inputs at {out} were prepared for a different config; "
                 "use another --out"
@@ -774,7 +790,7 @@ def _bootstrap_ci(
 
 def collect(cfg: E0Config, out: Path, tol: ToleranceSpec = TOL) -> dict[str, Any]:
     """One row per (model, problem) from the evaluations on disk."""
-    prepared = prepare(cfg, out, tol)
+    prepared = prepare(cfg, out, tol, strict=False)
     rows: list[dict[str, Any]] = []
     for model in cfg.models:
         for problem, copies in prepared:
@@ -842,11 +858,25 @@ def summarize(
     cfg: E0Config, out: Path, tol: ToleranceSpec = TOL
 ) -> tuple[dict[str, Any], str]:
     data = collect(cfg, out, tol)
-    prepared = prepare(cfg, out, tol)
+    prepared = prepare(cfg, out, tol, strict=False)
     expected_per_model = sum(len(c) for _, c in prepared)
     rng = np.random.default_rng(cfg.seed)
     gate_bucket = f">={E0_GATE.min_moves} moves"
+    manifest_path = out / "prepare.json"
+    stored = (
+        read_json(manifest_path).get("fingerprint", {})
+        if manifest_path.exists()
+        else {}
+    )
+    frozen_protocol = stored.get("protocol", "?")
+    note = (
+        ""
+        if frozen_protocol == protocol_hash(cfg)
+        else f" (current code: {protocol_hash(cfg)}; read-only)"
+    )
     lines = [f"# E0 {cfg.name} — arm {cfg.arm}, set {cfg.problem_set}", ""]
+    lines.append(f"Frozen inputs: protocol {frozen_protocol}{note}")
+    lines.append("")
     lines.append(
         "| model | bucket | problems | coverage | answered | success (identity) | "
         "success (transformed) | Δsuccess = identity − transformed [CI95] | "

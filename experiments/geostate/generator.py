@@ -18,6 +18,7 @@ it rejected and why.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass, field
 import json
 import math
@@ -48,6 +49,8 @@ from .macros import (
 from .state import (
     ERR_DEGENERATE,
     LINE,
+    OP_CIRCLE,
+    OP_LINE,
     POINT,
     GeometricState,
     Move,
@@ -82,7 +85,10 @@ def goal_description(goal: dict[str, Any], expr: Expr) -> str:
         c1, c2 = goal["curves"]
         return f"a point lying on both {describe(c1)} and {describe(c2)}"
     if goal["kind"] == GOAL_TANGENT:
-        return f"a line through {goal['through']} tangent to {describe(goal['circle'])}"
+        return (
+            f"a line through {describe(goal['through'])} tangent to "
+            f"{describe(goal['circle'])}"
+        )
     return describe(expr)
 
 
@@ -95,7 +101,7 @@ def relabel_goal(goal: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any
     if goal["kind"] == GOAL_TANGENT:
         return {
             "kind": GOAL_TANGENT,
-            "through": mapping.get(goal["through"], goal["through"]),
+            "through": relabel_expr(goal["through"], mapping),
             "circle": relabel_expr(goal["circle"], mapping),
         }
     return dict(goal)
@@ -110,7 +116,10 @@ def goal_references(
     if goal["kind"] == GOAL_INCIDENT:
         return [state.get(expand(builder, c)) for c in goal["curves"]]
     if goal["kind"] == GOAL_TANGENT:
-        return [state.get(goal["through"]), state.get(expand(builder, goal["circle"]))]
+        return [
+            state.get(expand(builder, goal["through"])),
+            state.get(expand(builder, goal["circle"])),
+        ]
     return []
 
 
@@ -122,12 +131,12 @@ def goal_holds(
     if goal["kind"] == GOAL_INCIDENT:
         if obj.kind != POINT:
             return False
-        curves = goal_references(goal, problem.given, tol)
+        curves = problem.references(tol)
         return all(incident(obj, c, state.scale, tol.incidence) for c in curves)
     if goal["kind"] == GOAL_TANGENT:
         if obj.kind != LINE:
             return False
-        through, circle = goal_references(goal, problem.given, tol)
+        through, circle = problem.references(tol)
         return incident(through, obj, state.scale, tol.incidence) and tangent(
             obj, circle, state.scale, tol.tangency
         )
@@ -151,6 +160,13 @@ class Problem:
     source: str = "synthetic"
     meta: dict[str, Any] = field(default_factory=dict)
     goal: dict[str, Any] = field(default_factory=lambda: dict(COINCIDE_GOAL))
+    # the objects the goal refers to, rebuilt once per problem (not serialised)
+    _references: list[Obj] | None = field(default=None, repr=False, compare=False)
+
+    def references(self, tol: ToleranceSpec = TOL) -> list[Obj]:
+        if self._references is None:
+            self._references = goal_references(self.goal, self.given, tol)
+        return self._references
 
     @property
     def labels(self) -> list[str]:
@@ -295,6 +311,17 @@ def build_problem(
         for o in state.objects:
             if o.kind == POINT and math.dist(o.xy(), (cx, cy)) > limit:
                 raise MoveError(ERR_DEGENERATE, "construction leaves the working area")
+    shortcut = one_move_solution(problem_view, tol)
+    if shortcut is not None:
+        raise MoveError(ERR_DEGENERATE, f"solvable in one move ({shortcut.text()})")
+    # Every construction the description names must contribute to the answer:
+    # pruning that dropped a whole macro means the answer did not depend on it
+    # (a given point happened to be the tangency point, say) and the text
+    # would describe work the reference never does.
+    if len(moves) < count_macros(expr):
+        raise MoveError(
+            ERR_DEGENERATE, "description names constructions the answer does not need"
+        )
     return Problem(
         id=problem_id,
         seed=seed,
@@ -365,8 +392,25 @@ def sample_expr(
     return [name, *args]
 
 
-def sample_curve(rng: random.Random, labels: list[str]) -> Expr:
-    a, b = rng.sample(labels, 2)
+def _points(
+    rng: random.Random,
+    spec: GeneratorSpec,
+    labels: list[str],
+    n: int,
+    budget: list[int],
+) -> list[Expr]:
+    """n distinct given labels, each possibly replaced by a nested point macro."""
+    args: list[Expr] = list(rng.sample(labels, n))
+    for i in range(n):
+        if budget[0] > 0 and rng.random() < spec.compose_prob:
+            args[i] = sample_expr(rng, spec, labels, 1, budget)
+    return args
+
+
+def sample_curve(
+    rng: random.Random, spec: GeneratorSpec, labels: list[str], budget: list[int]
+) -> Expr:
+    a, b = _points(rng, spec, labels, 2, budget)
     return [rng.choice(("line_through", "circle_centred")), a, b]
 
 
@@ -374,20 +418,51 @@ def sample_goal(
     rng: random.Random, spec: GeneratorSpec, labels: list[str]
 ) -> tuple[Expr, dict[str, Any]]:
     """A (reference expression, goal) pair: a predicate goal with the configured
-    probability, otherwise a coincidence target."""
+    probability, otherwise a coincidence target. The points a curve or a
+    tangent refers to may themselves be constructions, which is what spreads
+    predicate goals over the length buckets."""
     if rng.random() < spec.predicate_goal_prob:
+        # the goal's own wrapper nodes (first_meet + two curves, or
+        # tangent_line + circle) are not charged against the nesting budget
+        budget = [spec.max_macros + 3]
         if rng.random() < 0.6:
-            c1, c2 = sample_curve(rng, labels), sample_curve(rng, labels)
+            c1 = sample_curve(rng, spec, labels, budget)
+            c2 = sample_curve(rng, spec, labels, budget)
             if c1 == c2:
                 raise MoveError(ERR_DEGENERATE, "identical curves")
             return ["first_meet", c1, c2], {"kind": GOAL_INCIDENT, "curves": [c1, c2]}
-        p, o, r = rng.sample(labels, 3)
+        p, o, r = _points(rng, spec, labels, 3, budget)
         return ["tangent_line", p, o, r], {
             "kind": GOAL_TANGENT,
             "through": p,
             "circle": ["circle_centred", o, r],
         }
     return sample_expr(rng, spec, labels), dict(COINCIDE_GOAL)
+
+
+def one_move_solution(problem: Problem, tol: ToleranceSpec = TOL) -> Move | None:
+    """A single line/circle over given points that already solves the problem.
+
+    Such a problem sits in a long bucket by its reference trajectory while a
+    model can answer it in one move, so the generator rejects it (unless the
+    reference itself is that one move).
+    """
+    if problem.target_kind == POINT or problem.n_moves <= 1:
+        return None
+    state = problem.state(tol)
+    labels = list(problem.given)
+    for a in labels:
+        for b in labels:
+            if a == b:
+                continue
+            for op in (OP_LINE, OP_CIRCLE):
+                try:
+                    ((kind, mv),) = state.compute(Move(op, (a, b)))
+                except MoveError:
+                    continue
+                if goal_holds(problem, state, Obj("?", kind, mv), tol):
+                    return Move(op, (a, b))
+    return None
 
 
 @dataclass
@@ -425,7 +500,9 @@ def generate_with_stats(
     rng = random.Random(seed)
     stats = GenerationStats()
     buckets: dict[str, list[Problem]] = {name: [] for name, _, _ in LENGTH_BUCKETS}
-    budget = per_bucket * len(buckets) * spec.max_attempts_per_problem
+    # small requests (tests, smokes) still need room to fill the reserved
+    # predicate slots, hence the floor
+    budget = max(1500, per_bucket * len(buckets) * spec.max_attempts_per_problem)
     while stats.attempts < budget and any(
         len(b) < per_bucket for b in buckets.values()
     ):
@@ -452,6 +529,28 @@ def generate_with_stats(
         bucket = buckets[problem.bucket]
         if len(bucket) >= per_bucket:
             stats.reject(f"bucket {problem.bucket} full")
+            continue
+        kind = problem.goal["kind"]
+        quota = {
+            GOAL_INCIDENT: max(1, int(round(spec.incident_share * per_bucket))),
+            # a tangent needs ten moves: only the long bucket can hold one
+            GOAL_TANGENT: max(1, int(round(spec.tangent_share * per_bucket)))
+            if problem.bucket == LENGTH_BUCKETS[-1][0]
+            else 0,
+        }
+        have = Counter(p.goal["kind"] for p in bucket)
+        if kind in quota and have[kind] >= quota[kind]:
+            stats.reject(f"bucket {problem.bucket} full of {kind} goals")
+            continue
+        # Coincidence targets are plentiful; reserve the predicate quotas until
+        # most of the attempt budget is spent, then let anything fill the rest.
+        reserved = sum(max(0, q - have[k]) for k, q in quota.items())
+        if (
+            kind == GOAL_COINCIDE
+            and stats.attempts < 0.6 * budget
+            and len(bucket) + reserved >= per_bucket
+        ):
+            stats.reject(f"bucket {problem.bucket} reserved for predicate goals")
             continue
         bucket.append(problem)
         stats.accepted += 1
