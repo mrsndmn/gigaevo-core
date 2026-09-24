@@ -250,6 +250,71 @@ class E0Config:
     gated: bool = False
 
 
+# ---------------------------------------------------------------------------
+# V1: state tokens vs matched-training baseline (ADR 0006, AC-15..19)
+# ---------------------------------------------------------------------------
+
+ARM_TOKENS = "tokens"  # state blocks carry one <st> token per object (encoder)
+ARM_TABLE = "table"  # state blocks carry the object's parameters as text
+
+
+@dataclass(frozen=True)
+class V1Config:
+    name: str = "v1"
+    base_model: str = "Qwen/Qwen3-1.7B"  # in the shared HF cache (HF_HOME)
+    arms: tuple[str, ...] = (ARM_TOKENS, ARM_TABLE)
+    seeds: tuple[int, ...] = (1, 2)
+    # data: generator trajectories, held out by seed (AC-15)
+    train_seed: int = 1000
+    train_per_bucket: int = 16667  # ~50k trajectories over the three buckets
+    eval_seed: int = 2000
+    eval_per_bucket: int = 300
+    max_len: int = 1536  # longer teacher-forced sequences are dropped
+    # invariant-feature encoder
+    d_enc: int = 256
+    enc_layers: int = 2
+    # LoRA, identical in both arms (AC-16)
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_targets: tuple[str, ...] = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    # optimisation
+    lr_lora: float = 2e-4
+    lr_encoder: float = 1e-3
+    weight_decay: float = 0.0
+    epochs: int = 1
+    # Effective batch 16. Full-vocabulary logits over 1.5k-token sequences
+    # are the memory hog: 8 sequences per micro-batch left no room for a
+    # second process on an 80 GB card in the smoke, 4 do.
+    batch_size: int = 4
+    grad_accum: int = 4
+    gradient_checkpointing: bool = True
+    warmup_steps: int = 100
+    max_grad_norm: float = 1.0
+    log_every: int = 25
+    # rollout: move budget relative to the reference trajectory
+    move_budget_factor: float = 2.0
+    move_budget_extra: int = 4
+    move_budget_cap: int = 30
+    max_move_tokens: int = 24  # tokens per generated move line
+    # MLS
+    instance_type: str = "a100.1gpu"
+    # local smoke
+    smoke_train_per_bucket: int = 12
+    smoke_steps: int = 20
+    smoke_eval_per_bucket: int = 2
+
+
+V1 = V1Config()
+
 experiment_configs: list[E0Config] = [
     E0Config(
         name="e0-synthetic-text",
