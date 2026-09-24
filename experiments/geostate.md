@@ -214,6 +214,13 @@ python -m experiments.geostate.v1_report [--root DIR]
   token can say *which* existing object it lies on, not only that it lies on
   one. Protocol A's verdict, if any, is a verdict on the index-free pooled
   encoder; protocol B is the one the plan's H1 reads.
+- Protocol B jobs (commit `e24f16b6`, hash `89abc7561426`): tokens s1
+  `lm-mpi-job-e69adec0-8628-4b88-873c-a82db63877e3`, tokens s2
+  `lm-mpi-job-04c9416d-13bc-4e8f-bdfd-7c07815cfd66`, table s1
+  `lm-mpi-job-b326e6a7-89bd-4b0a-9f36-4fff962b4718`, table s2
+  `lm-mpi-job-53f4cf94-8d1a-4550-a091-6a646533dc02`. Read with
+  `python -m experiments.geostate.v1_report --protocol 89abc7561426` (or
+  `--protocol f6181a88e7c2` for protocol A).
 - E0 auxiliary set launched too: `lm-mpi-job-75c1ee3d-1ea2-4fd0-a9c8-731458205e7e`
   (`e0-aux-text-7db7de275f91`).
 
