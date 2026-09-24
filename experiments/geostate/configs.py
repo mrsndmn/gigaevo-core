@@ -140,6 +140,10 @@ class GeneratorSpec:
     max_moves: int = 20  # the 10+ bucket is 10..max_moves
     max_attempts_per_problem: int = 50
     labels: str = "ABCDEFGH"
+    # share of problems whose goal is a predicate with several valid answers
+    # (a point on two given curves, a tangent through a point) rather than
+    # coincidence with one constructed object (AC-10)
+    predicate_goal_prob: float = 0.3
 
 
 GENERATOR = GeneratorSpec()

@@ -74,16 +74,17 @@ from .generator import (
     Problem,
     build_problem,
     generate_with_stats,
+    goal_holds,
     load_problems,
+    relabel_goal,
     save_problems,
 )
 from .macros import (
     distance_between,
     inverse_params,
-    object_from_params,
     relabel_expr,
 )
-from .state import ERR_DEGENERATE, MoveError, same_geometry
+from .state import ERR_DEGENERATE, MoveError
 
 REQUEST_ERROR = "request_error"
 LOCK_NAME = ".lock"
@@ -195,6 +196,7 @@ def transformed_problem(
         tol,
         source=problem.source,
         meta={**problem.meta, "copy_of": problem.id},
+        goal=relabel_goal(problem.goal, perm),
     )
     scale = problem.state(tol).scale
     back = inverse_params(copy.target_kind, copy.target_params, g)
@@ -277,9 +279,13 @@ def protocol_hash(cfg: E0Config) -> str:
     directory name. The model list is *not* part of it — models live in
     separate directories and may come and go.
     """
+    from . import cga, generator, macros, state
+
     material = json.dumps(
         {
             "prompts": inspect.getsource(prompts),
+            "problems": [inspect.getsource(m) for m in (cga, state, macros, generator)],
+            "generator": asdict(GENERATOR),
             "temperature": cfg.temperature,
             "top_p": cfg.top_p,
             "max_tokens": cfg.max_tokens,
@@ -423,15 +429,10 @@ def evaluate(
             "n_moves": 0,
         }
     ex = dsl.run_text(content, problem.state(tol))
-    target = object_from_params(problem.target_kind, problem.target_params)
-    scale = ex.state.scale
     success = bool(
-        ex.answer is not None
-        and same_geometry(ex.answer, target, scale, tol.coincidence)
+        ex.answer is not None and goal_holds(problem, ex.state, ex.answer, tol)
     )
-    lenient = any(
-        same_geometry(o, target, scale, tol.coincidence) for o in ex.state.objects
-    )
+    lenient = any(goal_holds(problem, ex.state, o, tol) for o in ex.state.objects)
     return {
         "success": success,
         "answered": ex.answer is not None,

@@ -220,6 +220,35 @@ def centroid(b: Builder, p: str, q: str, r: str) -> str:
     return b.meet(b.line(r, m1), b.line(p, m2))[0]
 
 
+# Building blocks for predicate goals (AC-10): curves named in a goal, the
+# reference solution of "a point on both curves" and of "a tangent through a
+# point". They are not sampled as coincidence targets on their own.
+
+
+def line_through(b: Builder, p: str, q: str) -> str:
+    return b.line(p, q)
+
+
+def circle_centred(b: Builder, c: str, p: str) -> str:
+    return b.circle(c, p)
+
+
+def first_meet(b: Builder, u: str, v: str) -> str:
+    return b.meet(u, v)[0]
+
+
+def tangent_line(b: Builder, p: str, o: str, r: str) -> str:
+    """A line through p tangent to the circle centred at o through r (Thales)."""
+    m = midpoint(b, p, o)
+    thales = b.circle(m, o)
+    circle = b.circle(o, r)
+    t = b.meet(thales, circle)[0]
+    return b.line(p, t)
+
+
+CURVE = "curve"  # an argument slot that takes a line or a circle
+
+
 @dataclass(frozen=True)
 class Macro:
     name: str
@@ -227,6 +256,8 @@ class Macro:
     result: str
     template: str
     fn: Callable[..., str]
+    arg_kinds: tuple[str, ...] | None = None  # None: every slot is a point
+    samplable: bool = True  # may the generator draw it as a coincidence target?
 
 
 MACROS: dict[str, Macro] = {
@@ -340,10 +371,46 @@ MACROS: dict[str, Macro] = {
             "the point symmetric to {0} with respect to {1}",
             rotate180,
         ),
+        Macro(
+            "line_through",
+            2,
+            LINE,
+            "the line through {0} and {1}",
+            line_through,
+            samplable=False,
+        ),
+        Macro(
+            "circle_centred",
+            2,
+            CIRCLE,
+            "the circle centred at {0} through {1}",
+            circle_centred,
+            samplable=False,
+        ),
+        Macro(
+            "first_meet",
+            2,
+            POINT,
+            "the first intersection of {0} and {1}",
+            first_meet,
+            arg_kinds=(CURVE, CURVE),
+            samplable=False,
+        ),
+        Macro(
+            "tangent_line",
+            3,
+            LINE,
+            "a line through {0} tangent to the circle centred at {1} through {2}",
+            tangent_line,
+            samplable=False,
+        ),
     )
 }
 
-POINT_MACROS = tuple(m.name for m in MACROS.values() if m.result == POINT)
+POINT_MACROS = tuple(
+    m.name for m in MACROS.values() if m.result == POINT and m.samplable
+)
+TOP_MACROS = tuple(m.name for m in MACROS.values() if m.samplable)
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +429,14 @@ def validate_expr(expr: Expr) -> None:
     args = expr[1:]
     if len(args) != macro.arity:
         raise ValueError(f"{macro.name} takes {macro.arity} arguments, got {len(args)}")
-    for a in args:
+    kinds = macro.arg_kinds or (POINT,) * macro.arity
+    for a, expected in zip(args, kinds, strict=True):
         validate_expr(a)
-        if isinstance(a, list) and MACROS[a[0]].result != POINT:
-            raise ValueError("only point-valued macros may be nested")
+        if expected == CURVE:
+            if isinstance(a, str) or MACROS[a[0]].result not in (LINE, CIRCLE):
+                raise ValueError(f"{macro.name} needs a line or circle expression")
+        elif isinstance(a, list) and MACROS[a[0]].result != POINT:
+            raise ValueError("only point-valued macros may be nested in a point slot")
 
 
 def expand(builder: Builder, expr: Expr, strict: bool = False) -> str:

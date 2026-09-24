@@ -27,10 +27,9 @@ from .client import write_json
 from .configs import ARM_TOKENS, LENGTH_BUCKETS, TOL, V1_GATE, ToleranceSpec, V1Config
 from .encoder import pad_features
 from .features import object_features
-from .generator import Problem
-from .macros import object_from_params
+from .generator import Problem, goal_holds
 from .sequence import prompt_text, state_block
-from .state import CIRCLE, LINE, POINT, GeometricState, Move, MoveError, same_geometry
+from .state import CIRCLE, LINE, POINT, GeometricState, Move, MoveError
 
 END = -1
 
@@ -147,7 +146,6 @@ def rollout(
     started = time.monotonic()
     tok = model.tok
     state = problem.state(tol)
-    target = object_from_params(problem.target_kind, problem.target_params)
     ep = Episode(problem.id, problem.bucket, problem.n_moves)
     cache = DynamicCache()
     arm = model.arm
@@ -204,7 +202,7 @@ def rollout(
             except MoveError:
                 ep.error_kind = "undefined_reference"
                 break
-            ep.success = same_geometry(obj, target, state.scale, tol.coincidence)
+            ep.success = goal_holds(problem, state, obj, tol)
             break
         try:
             op, rest = text.split("(", 1)
@@ -229,9 +227,7 @@ def rollout(
             ep.error_kind = "budget"
         # the move's last token and the new state block enter the cache together
         logits = feed(pending + list(block), [o.handle for o in produced])
-    ep.target_reached = any(
-        same_geometry(o, target, state.scale, tol.coincidence) for o in state.objects
-    )
+    ep.target_reached = any(goal_holds(problem, state, o, tol) for o in state.objects)
     ep.selection_error = bool(ep.answered and ep.target_reached and not ep.success)
     ep.wall_s = time.monotonic() - started
     return ep

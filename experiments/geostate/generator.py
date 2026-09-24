@@ -36,22 +36,103 @@ from .configs import (
 from .macros import (
     MACROS,
     POINT_MACROS,
+    TOP_MACROS,
     Builder,
     Expr,
     describe,
     expand,
+    object_from_params,
+    relabel_expr,
     validate_expr,
 )
 from .state import (
     ERR_DEGENERATE,
+    LINE,
     POINT,
     GeometricState,
     Move,
     MoveError,
+    Obj,
+    incident,
     same_geometry,
+    tangent,
 )
 
 Given = dict[str, tuple[float, float]]
+
+# ---------------------------------------------------------------------------
+# Goals (AC-10). A goal is what makes an answer correct:
+#   coincide  — the answer coincides with the reference target (default);
+#   incident  — the answer is a point lying on two named curves (either of
+#               the two intersections is right);
+#   tangent   — the answer is a line through a named point tangent to a named
+#               circle (either tangent is right).
+# The curves are expressions over the given points, so a goal moves with the
+# figure under a similarity and with the labels under a relabelling.
+# ---------------------------------------------------------------------------
+
+GOAL_COINCIDE = "coincide"
+GOAL_INCIDENT = "incident"
+GOAL_TANGENT = "tangent"
+COINCIDE_GOAL: dict[str, Any] = {"kind": GOAL_COINCIDE}
+
+
+def goal_description(goal: dict[str, Any], expr: Expr) -> str:
+    if goal["kind"] == GOAL_INCIDENT:
+        c1, c2 = goal["curves"]
+        return f"a point lying on both {describe(c1)} and {describe(c2)}"
+    if goal["kind"] == GOAL_TANGENT:
+        return f"a line through {goal['through']} tangent to {describe(goal['circle'])}"
+    return describe(expr)
+
+
+def relabel_goal(goal: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+    if goal["kind"] == GOAL_INCIDENT:
+        return {
+            "kind": GOAL_INCIDENT,
+            "curves": [relabel_expr(c, mapping) for c in goal["curves"]],
+        }
+    if goal["kind"] == GOAL_TANGENT:
+        return {
+            "kind": GOAL_TANGENT,
+            "through": mapping.get(goal["through"], goal["through"]),
+            "circle": relabel_expr(goal["circle"], mapping),
+        }
+    return dict(goal)
+
+
+def goal_references(
+    goal: dict[str, Any], given: Given, tol: ToleranceSpec = TOL
+) -> list[Obj]:
+    """The objects a predicate goal refers to, rebuilt from the given points."""
+    state = GeometricState.from_given(given, tol)
+    builder = Builder(state)
+    if goal["kind"] == GOAL_INCIDENT:
+        return [state.get(expand(builder, c)) for c in goal["curves"]]
+    if goal["kind"] == GOAL_TANGENT:
+        return [state.get(goal["through"]), state.get(expand(builder, goal["circle"]))]
+    return []
+
+
+def goal_holds(
+    problem: Problem, state: GeometricState, obj: Obj, tol: ToleranceSpec = TOL
+) -> bool:
+    """Does `obj` (an object of `state`) solve the problem?"""
+    goal = problem.goal
+    if goal["kind"] == GOAL_INCIDENT:
+        if obj.kind != POINT:
+            return False
+        curves = goal_references(goal, problem.given, tol)
+        return all(incident(obj, c, state.scale, tol.incidence) for c in curves)
+    if goal["kind"] == GOAL_TANGENT:
+        if obj.kind != LINE:
+            return False
+        through, circle = goal_references(goal, problem.given, tol)
+        return incident(through, obj, state.scale, tol.incidence) and tangent(
+            obj, circle, state.scale, tol.tangency
+        )
+    target = object_from_params(problem.target_kind, problem.target_params)
+    return same_geometry(obj, target, state.scale, tol.coincidence)
 
 
 @dataclass
@@ -69,6 +150,7 @@ class Problem:
     bucket: str
     source: str = "synthetic"
     meta: dict[str, Any] = field(default_factory=dict)
+    goal: dict[str, Any] = field(default_factory=lambda: dict(COINCIDE_GOAL))
 
     @property
     def labels(self) -> list[str]:
@@ -92,6 +174,7 @@ class Problem:
             "bucket": self.bucket,
             "source": self.source,
             "meta": self.meta,
+            "goal": self.goal,
         }
 
     @classmethod
@@ -110,6 +193,7 @@ class Problem:
             bucket=d["bucket"],
             source=d.get("source", "synthetic"),
             meta=dict(d.get("meta", {})),
+            goal=dict(d.get("goal", COINCIDE_GOAL)),
         )
 
 
@@ -161,13 +245,15 @@ def build_problem(
     source: str = "synthetic",
     meta: dict[str, Any] | None = None,
     max_extent: float | None = None,
+    goal: dict[str, Any] | None = None,
 ) -> Problem:
     """Expand `expr` on the given points; raises MoveError if degenerate.
 
     Guarantees AC-7: the target is produced by the trajectory's last move and
-    no object that exists before that move coincides with it, so the goal
+    no object that exists before that move satisfies the goal, so the goal
     predicate is false on every earlier state.
     """
+    goal = dict(goal or COINCIDE_GOAL)
     validate_expr(expr)
     scratch = GeometricState.from_given(given, tol)
     builder = Builder(scratch)
@@ -183,10 +269,24 @@ def build_problem(
     last = len(moves) - 1
     if target.move_index != last:
         raise MoveError(ERR_DEGENERATE, "target existed before the last move")
+    problem_view = Problem(
+        id=problem_id,
+        seed=seed,
+        given=dict(given),
+        expr=expr,
+        description="",
+        target_kind=target.kind,
+        target_params=tuple(target.params()),
+        trajectory=moves,
+        answer=answer,
+        n_moves=len(moves),
+        bucket=bucket_of(len(moves)),
+        goal=goal,
+    )
+    if not goal_holds(problem_view, state, target, tol):
+        raise MoveError(ERR_DEGENERATE, "reference answer does not satisfy the goal")
     for o in state.objects:
-        if o.move_index < last and same_geometry(
-            o, target, state.scale, tol.coincidence
-        ):
+        if o.move_index < last and goal_holds(problem_view, state, o, tol):
             raise MoveError(ERR_DEGENERATE, "target existed before the last move")
     if max_extent is not None:
         cx = sum(x for x, _ in given.values()) / len(given)
@@ -200,7 +300,7 @@ def build_problem(
         seed=seed,
         given=dict(given),
         expr=expr,
-        description=describe(expr),
+        description=goal_description(goal, expr),
         target_kind=target.kind,
         target_params=tuple(target.params()),
         trajectory=moves,
@@ -209,6 +309,7 @@ def build_problem(
         bucket=bucket_of(len(moves)),
         source=source,
         meta=dict(meta or {}),
+        goal=goal,
     )
 
 
@@ -248,7 +349,7 @@ def sample_expr(
 ) -> Expr:
     """A random expression with at most `spec.max_macros` macro nodes."""
     budget = [spec.max_macros] if budget is None else budget
-    names = list(MACROS) if depth == 0 else list(POINT_MACROS)
+    names = list(TOP_MACROS) if depth == 0 else list(POINT_MACROS)
     names = [n for n in names if MACROS[n].arity <= len(labels)]
     name = rng.choice(names)
     macro = MACROS[name]
@@ -262,6 +363,31 @@ def sample_expr(
         ):
             args[i] = sample_expr(rng, spec, labels, depth + 1, budget)
     return [name, *args]
+
+
+def sample_curve(rng: random.Random, labels: list[str]) -> Expr:
+    a, b = rng.sample(labels, 2)
+    return [rng.choice(("line_through", "circle_centred")), a, b]
+
+
+def sample_goal(
+    rng: random.Random, spec: GeneratorSpec, labels: list[str]
+) -> tuple[Expr, dict[str, Any]]:
+    """A (reference expression, goal) pair: a predicate goal with the configured
+    probability, otherwise a coincidence target."""
+    if rng.random() < spec.predicate_goal_prob:
+        if rng.random() < 0.6:
+            c1, c2 = sample_curve(rng, labels), sample_curve(rng, labels)
+            if c1 == c2:
+                raise MoveError(ERR_DEGENERATE, "identical curves")
+            return ["first_meet", c1, c2], {"kind": GOAL_INCIDENT, "curves": [c1, c2]}
+        p, o, r = rng.sample(labels, 3)
+        return ["tangent_line", p, o, r], {
+            "kind": GOAL_TANGENT,
+            "through": p,
+            "circle": ["circle_centred", o, r],
+        }
+    return sample_expr(rng, spec, labels), dict(COINCIDE_GOAL)
 
 
 @dataclass
@@ -307,7 +433,7 @@ def generate_with_stats(
         n = rng.randint(spec.n_given_min, spec.n_given_max)
         try:
             given = sample_given(rng, spec, n)
-            expr = sample_expr(rng, spec, list(given))
+            expr, goal = sample_goal(rng, spec, list(given))
             problem = build_problem(
                 f"{prefix}-{seed}-{stats.attempts:06d}",
                 seed,
@@ -315,6 +441,7 @@ def generate_with_stats(
                 expr,
                 tol,
                 max_extent=tol.max_extent,
+                goal=goal,
             )
         except (MoveError, ValueError) as exc:
             stats.reject(_reason(exc))

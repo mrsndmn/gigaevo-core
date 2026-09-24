@@ -57,6 +57,11 @@ and both kill gates live in `configs.py`; nothing is repeated here.
   expansion *is* the target and the reference trajectory.
 - `generator.py` — seeded construction problems per length bucket; moves the
   target does not depend on are pruned, and rejection counts are reported.
+  Goals are coincidence with a constructed target, or — for a configured
+  share of problems — a predicate with several valid answers: a point lying
+  on two named curves (either intersection) or a line through a named point
+  tangent to a named circle (either tangent); `goal_holds` is the single
+  success check for E0 and V1.
 - `aux.py` — NoReGeo point stems as construction problems (`--check`
   validates every non-degenerate row against its golden point and exits
   non-zero on a mismatch).
@@ -232,12 +237,13 @@ taken across buckets, so long constructions are included) to check the
 prompt, then the full grid. The H0 verdict is read from `--summary` of the
 gated config against the gate in `configs.py`.
 
-Deviations from the interview spec, recorded rather than hidden: goals are
-coincidence with a constructed target only — incidence and tangency exist as
-kernel predicates but not yet as goal statements (AC-10); no `geostate`
-extra was needed because the kernel is numpy-only and analytic geometry, not
-kingdon, is the test oracle (AC-4); the auxiliary text config covers every
-valid row while the auxiliary figure config samples per stem (AC-11); the
+Deviations from the interview spec, recorded rather than hidden: no
+`geostate` extra was needed because the kernel is numpy-only and analytic
+geometry, not kingdon, is the test oracle (AC-4); the auxiliary text config
+covers every valid row while the auxiliary figure config samples per stem
+(AC-11); incidence and tangency goals exist since the last commit (AC-10) but
+the E0 and V1 runs launched before it use coincidence goals only — a
+problem set with predicate goals is a new protocol hash, not a resume; the
 gated models are no longer the spec's Qwen3.8-27B / Qwen3.5-27B / Qwen3-Next
 but whatever open text models the endpoint serves — today Qwen3-8B and
 Gpt-oss-120b — because the endpoint removed the others (E0 constraints).
@@ -270,6 +276,10 @@ package into its own repository as the first post-go task (ADR 0004).
   also archives interrupted requests and never re-archives; the run
   fingerprint covers generator and tolerance settings; a macro node that adds
   no move is rejected so no description restates a sub-result. 96 tests.
+- 2026-09-24 — predicate goals (AC-10): incidence and tangency goals with
+  several valid answers, one `goal_holds` for E0 and V1, protocol hashes
+  cover the problem-generating code, launcher dedup keys on the protocol.
+  125 tests.
 - 2026-09-24 — V1 implemented (features, sequences, encoder, LoRA model,
   training, constrained rollouts, launcher, report), smoked on the local GPU
   and submitted as four MLS jobs; E0 auxiliary set submitted. 116 tests.
