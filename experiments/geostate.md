@@ -200,6 +200,20 @@ python -m experiments.geostate.v1_report [--root DIR]
   table s2 `lm-mpi-job-dca181b8-a744-48ea-b151-97d00a569297`.
   The first job to start generates the shared data (~50k train, 900 eval)
   under a file lock; the others wait for it. No numbers yet.
+- Review of the V1 commit (nothing that crashes these jobs or invalidates
+  their comparison on a clean first run) led to protocol B, resubmitted as
+  four more jobs: the LoRA init is now seeded before the model is built (in
+  protocol A each run's init was unseeded, so the arms of one seed do not
+  share it); a resubmitted job reuses `adapters.pt` instead of retraining
+  into an old `eval.jsonl`; the keep set is decided on the table arm's
+  lengths for both arms; gradients are clipped per parameter group; the
+  protocol hash covers every module on the path and the report only reads
+  runs of one protocol, withholds the verdict on missing or incomplete runs
+  and carries bootstrap CIs per bucket; and — the substantive change — the
+  encoder's pair features now carry the partner's relative index, so a state
+  token can say *which* existing object it lies on, not only that it lies on
+  one. Protocol A's verdict, if any, is a verdict on the index-free pooled
+  encoder; protocol B is the one the plan's H1 reads.
 - E0 auxiliary set launched too: `lm-mpi-job-75c1ee3d-1ea2-4fd0-a9c8-731458205e7e`
   (`e0-aux-text-7db7de275f91`).
 

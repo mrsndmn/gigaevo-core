@@ -37,16 +37,46 @@ from .run_e0_jobs import JOB_ID, git, mls, normalized
 
 
 def protocol_hash_v1(cfg: V1Config) -> str:
-    """Everything that shapes a run except arm and seed."""
+    """Everything that shapes a run except arm and seed.
+
+    The config plus the source of every module on the path from problem to
+    episode — kernel, generator, features, sequences, encoder, model, training
+    and rollout — so that any code change gives a new run directory and never
+    resumes or reports against episodes of an older protocol.
+    """
     import inspect
 
-    from . import features, sequence
+    from . import (
+        cga,
+        encoder,
+        features,
+        generator,
+        macros,
+        prompts,
+        rollout,
+        sequence,
+        state,
+        train_v1,
+        v1_model,
+    )
 
+    modules = (
+        cga,
+        state,
+        macros,
+        generator,
+        prompts,
+        features,
+        sequence,
+        encoder,
+        v1_model,
+        train_v1,
+        rollout,
+    )
     material = json.dumps(
         {
             "config": asdict(cfg),
-            "sequence": inspect.getsource(sequence),
-            "features": inspect.getsource(features),
+            "code": {m.__name__: inspect.getsource(m) for m in modules},
         },
         sort_keys=True,
     )

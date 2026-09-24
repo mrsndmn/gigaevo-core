@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .client import read_json, write_json
 from .configs import (
+    ARM_TABLE,
     ARM_TOKENS,
     ARTIFACT_ROOT,
     GENERATOR,
@@ -50,8 +51,14 @@ from .sequence import build_sequence
 
 
 def data_key(cfg: V1Config, smoke: bool = False) -> str:
+    """The data depends on the generator and kernel code as much as on seeds."""
+    import inspect
+
+    from . import cga, generator, macros, state
+
     material = json.dumps(
         {
+            "code": [inspect.getsource(m) for m in (cga, state, macros, generator)],
             "train_seed": cfg.train_seed,
             "train_per_bucket": cfg.smoke_train_per_bucket
             if smoke
@@ -92,12 +99,13 @@ def prepare_data(
     """Generate (once) the train and eval problem files; concurrent jobs share them."""
     d = data_dir(cfg, root, smoke)
     train_path, eval_path = d / "train.jsonl", d / "eval.jsonl"
-    if train_path.exists() and eval_path.exists():
+    manifest = d / "data.json"  # written last: its presence means "complete"
+    if manifest.exists():
         return train_path, eval_path
     d.mkdir(parents=True, exist_ok=True)
     with (d / "prepare.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if train_path.exists() and eval_path.exists():
+        if manifest.exists():
             return train_path, eval_path
         per_train = cfg.smoke_train_per_bucket if smoke else cfg.train_per_bucket
         per_eval = cfg.smoke_eval_per_bucket if smoke else cfg.eval_per_bucket
@@ -143,7 +151,10 @@ class TrajectoryDataset(Dataset):
         self.tok = tok
         self.cfg = cfg
         self.tol = tol
-        texts = [build_sequence(p, arm)[0].text for p in problems]
+        # The keep set is decided on the *table* arm's lengths (the longer of
+        # the two) for both arms, so both train on the same problems in the
+        # same order whatever the arm (AC-16).
+        texts = [build_sequence(p, ARM_TABLE)[0].text for p in problems]
         lengths = [
             len(ids) for ids in tok(texts, add_special_tokens=False)["input_ids"]
         ]
@@ -164,8 +175,10 @@ class TrajectoryDataset(Dataset):
         feats = []
         if self.arm == ARM_TOKENS:
             for h in seq.state_handles:
-                s, p = object_features(state, h)
-                feats.append((torch.from_numpy(s), torch.from_numpy(p)))
+                s, p, r = object_features(state, h)
+                feats.append(
+                    (torch.from_numpy(s), torch.from_numpy(p), torch.from_numpy(r))
+                )
         return {"input_ids": ids, "labels": labels, "features": feats}
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -184,7 +197,7 @@ def collate(batch: list[dict[str, Any]], pad_id: int) -> dict[str, torch.Tensor]
         labels[i, :m] = torch.tensor(b["labels"])
         attention[i, :m] = 1
         feats.extend(b["features"])
-    self_feats, pair_feats, pair_mask = pad_features(feats)
+    self_feats, pair_feats, pair_mask, pair_index = pad_features(feats)
     return {
         "input_ids": input_ids,
         "attention_mask": attention,
@@ -192,6 +205,7 @@ def collate(batch: list[dict[str, Any]], pad_id: int) -> dict[str, torch.Tensor]
         "self_feats": self_feats,
         "pair_feats": pair_feats,
         "pair_mask": pair_mask,
+        "pair_index": pair_index,
     }
 
 
@@ -228,6 +242,10 @@ def train(
 ) -> dict[str, Any]:
     seed_everything(seed)
     out.mkdir(parents=True, exist_ok=True)
+    stale = out / "eval.jsonl"
+    if stale.exists():
+        # episodes of a previous model must never be resumed under a new one
+        stale.rename(out / f"eval.stale-{int(time.time())}.jsonl")
     dataset = TrajectoryDataset(problems, model.arm, model.tok, cfg)
     gen = torch.Generator().manual_seed(seed)
     loader = DataLoader(
@@ -268,10 +286,10 @@ def train(
             running += float(loss.item())
             micro += 1
             if micro % cfg.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for g in model.param_groups() for p in g["params"]],
-                    cfg.max_grad_norm,
-                )
+                # clip each group on its own: the LoRA step must not depend on
+                # the encoder's gradient norm (the table arm has no encoder)
+                for group in model.param_groups():
+                    torch.nn.utils.clip_grad_norm_(group["params"], cfg.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -326,18 +344,45 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--data-root", type=Path, default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--retrain",
+        action="store_true",
+        help="train even if adapters.pt already exists (default: reuse them)",
+    )
     args = ap.parse_args(argv)
     cfg = V1
     from .v1_model import V1Model
 
+    # Seed before the model is built: LoRA A and the encoder are initialised
+    # there, and both arms of one seed should share the LoRA init.
+    seed_everything(args.seed)
     train_path, eval_path = prepare_data(cfg, args.data_root, args.smoke)
-    print(
-        f"data: {train_path.parent} ({read_json(train_path.parent / 'data.json')['n_train']} train)",
-        flush=True,
-    )
+    data_manifest = read_json(train_path.parent / "data.json")
+    print(f"data: {train_path.parent} ({data_manifest['n_train']} train)", flush=True)
     model = V1Model(cfg, args.arm, device=args.device)
     out = args.out
-    if args.train:
+    out.mkdir(parents=True, exist_ok=True)
+    adapters = out / "adapters.pt"
+    trained_before = adapters.exists() and (out / "train.json").exists()
+    write_json(
+        out / "run.json",
+        {
+            "arm": args.arm,
+            "seed": args.seed,
+            "data_dir": str(train_path.parent),
+            "data_key": data_manifest["key"],
+            "n_train": data_manifest["n_train"],
+            "n_eval": data_manifest["n_eval"],
+            "smoke": args.smoke,
+        },
+    )
+    if args.train and trained_before and not args.retrain:
+        print(
+            f"adapters exist at {adapters}; reusing them (pass --retrain to train again)",
+            flush=True,
+        )
+        model.load_adapters(adapters)
+    elif args.train:
         train(
             model,
             load_problems(train_path),
@@ -350,7 +395,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.eval:
         from .rollout import evaluate
 
-        adapters = out / "adapters.pt"
         if not args.train:
             model.load_adapters(adapters)
         problems = load_problems(eval_path)

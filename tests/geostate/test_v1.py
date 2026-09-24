@@ -33,11 +33,12 @@ def test_features_are_invariant_under_similarities(seed):
     problem = generate(seed=30 + seed, per_bucket=2)[-1]
     _, state = sequence.build_sequence(problem, ARM_TOKENS)
     moved = state.transform(_similarity(rng))
-    for h in state.handles():
-        s1, p1 = features.object_features(state, h)
-        s2, p2 = features.object_features(moved, h)
+    for i, h in enumerate(state.handles()):
+        s1, p1, r1 = features.object_features(state, h)
+        s2, p2, r2 = features.object_features(moved, h)
         assert np.abs(s1 - s2).max() < 1e-9
         assert np.abs(p1 - p2).max() < 1e-9
+        assert (r1 == r2).all() and r1[-1] == 0 and len(r1) == i + 1
         assert p1.shape[1] == features.PAIR_DIM and s1.shape == (features.SELF_DIM,)
 
 
@@ -45,8 +46,8 @@ def test_features_change_under_a_reflection_only_where_orientation_matters():
     st = GeometricState.from_given({"A": (0.0, 0.0), "B": (4.0, 0.0), "C": (1.0, 3.0)})
     st.apply(Move("line", ("A", "B")))
     refl = st.transform(cga.Similarity(reflect=True))
-    _, p1 = features.object_features(st, "h1")
-    _, p2 = features.object_features(refl, "h1")
+    _, p1, _ = features.object_features(st, "h1")
+    _, p2, _ = features.object_features(refl, "h1")
     # the signed point-line distance of C flips sign under a reflection
     assert p1[2, 6] == pytest.approx(-p2[2, 6])
     assert abs(p1[2, 6]) == pytest.approx(3.0 / st.scale)
@@ -126,8 +127,16 @@ def test_encoder_output_is_invariant_and_batched():
     assert out.shape == (len(items), 8)
     assert torch.allclose(out, out_m, atol=1e-5)
     assert torch.norm(out, dim=1).mean() < 1.0  # starts small next to token embeddings
+    # the partner index distinguishes "on object #1" from "on object #2"
+    s0, p0, r0 = items[-1]
+    swapped = (s0, p0, torch.flip(r0, [0]))
+    out_s = enc(*pad_features([swapped]))
+    assert not torch.allclose(out[-1:], out_s, atol=1e-6)
+    empty = pad_features([])
+    assert empty[0].shape == (0, features.SELF_DIM) and empty[3].dtype == torch.long
 
 
+@pytest.mark.timeout(300)
 def test_tiny_model_trains_both_arms_and_rolls_out(tmp_path):
     from experiments.geostate.rollout import MoveVocabulary, rollout
     from experiments.geostate.train_v1 import TrajectoryDataset, collate
@@ -152,20 +161,28 @@ def test_tiny_model_trains_both_arms_and_rolls_out(tmp_path):
         path = model.save_adapters(tmp_path / f"{arm}.pt")
         other = _tiny_model(arm)
         other.load_adapters(path)
-        with pytest.raises(ValueError, match="arm"):
-            _tiny_model(ARM_TABLE if arm == ARM_TOKENS else ARM_TOKENS).load_adapters(
-                path
-            )
         # a constrained rollout always ends with a legal outcome
         model.eval()
         ep = rollout(model, problems[0], V1, MoveVocabulary(model.tok))
         assert ep.error_kind in (None, "degenerate", "budget")
-        assert ep.answered == (ep.error_kind is None)
+        if ep.error_kind == "budget":
+            assert ep.answered  # the last turn is answers-only
+        else:
+            assert ep.answered == (ep.error_kind is None)
         assert ep.tokens_generated > 0 and ep.tokens_processed > ep.tokens_generated
         for move in ep.moves:
             assert move.split("(")[0] in ("line", "circle", "meet")
 
 
+@pytest.mark.timeout(120)
+def test_adapters_refuse_the_other_arm(tmp_path):
+    model = _tiny_model(ARM_TABLE)
+    path = model.save_adapters(tmp_path / "table.pt")
+    with pytest.raises(ValueError, match="arm"):
+        _tiny_model(ARM_TOKENS).load_adapters(path)
+
+
+@pytest.mark.timeout(120)
 def test_state_token_count_mismatch_is_an_error():
     model = _tiny_model(ARM_TOKENS)
     ids = torch.tensor([[1, model.st_id, 2, model.st_id]])
@@ -173,47 +190,71 @@ def test_state_token_count_mismatch_is_an_error():
         model.embed(ids, torch.zeros(1, model.lm.get_input_embeddings().embedding_dim))
 
 
-def _fake_run(root, arm, seed, success_by_bucket):
-    d = root / f"{arm}-s{seed}"
+def _fake_run(root, arm, seed, success_by_bucket, n=40, complete=True, protocol=None):
+    name = f"{arm}-s{seed}" + (f"-{protocol}" if protocol else "")
+    d = root / name
     d.mkdir(parents=True)
     (d / "train.json").write_text(json.dumps({"arm": arm, "seed": seed}))
+    (d / "run.json").write_text(json.dumps({"arm": arm, "seed": seed, "n_eval": n}))
+    episodes = []
+    for i in range(n if complete else n - 5):
+        bucket = ["1-3", "4-9", "10+"][i % 3]
+        n_ref = {"1-3": 2, "4-9": 6, "10+": 12}[bucket]
+        ok = (i * 7 + seed) % 10 < success_by_bucket[bucket] * 10
+        episodes.append(
+            {
+                "problem_id": f"eval-{i}",
+                "bucket": bucket,
+                "n_moves_reference": n_ref,
+                "success": ok,
+                "target_reached": ok,
+                "answered": True,
+                "selection_error": False,
+                "error_kind": None if ok else "budget",
+                "n_moves": n_ref,
+                "tokens_processed": 300 if arm == ARM_TOKENS else 500,
+                "tokens_generated": 40,
+            }
+        )
     with (d / "eval.jsonl").open("w") as fh:
-        for i in range(40):
-            bucket = ["1-3", "4-9", "10+"][i % 3]
-            n_ref = {"1-3": 2, "4-9": 6, "10+": 12}[bucket]
-            ok = (i * 7 + seed) % 10 < success_by_bucket[bucket] * 10
-            fh.write(
-                json.dumps(
-                    {
-                        "problem_id": f"eval-{i}",
-                        "bucket": bucket,
-                        "n_moves_reference": n_ref,
-                        "success": ok,
-                        "target_reached": ok,
-                        "answered": True,
-                        "selection_error": False,
-                        "error_kind": None if ok else "budget",
-                        "n_moves": n_ref,
-                        "tokens_processed": 300 if arm == ARM_TOKENS else 500,
-                        "tokens_generated": 40,
-                    }
-                )
-                + "\n"
-            )
+        for e in episodes:
+            fh.write(json.dumps(e) + "\n")
+    (d / "metrics.json").write_text(
+        json.dumps(
+            {"arm": arm, "n": len(episodes), "n_expected": n, "complete": complete}
+        )
+    )
 
 
 def test_report_pairs_problems_and_reads_the_gate(tmp_path, monkeypatch):
+    import shutil
+
     from experiments.geostate import v1_report
 
+    monkeypatch.setattr(v1_report, "current_protocol", lambda cfg: "abcdef123456")
+    good = {"1-3": 0.9, "4-9": 0.8, "10+": 0.7}
+    poor = {"1-3": 0.9, "4-9": 0.5, "10+": 0.3}
     for seed in (1, 2):
-        _fake_run(tmp_path, ARM_TOKENS, seed, {"1-3": 0.9, "4-9": 0.8, "10+": 0.7})
-        _fake_run(tmp_path, ARM_TABLE, seed, {"1-3": 0.9, "4-9": 0.5, "10+": 0.3})
+        _fake_run(tmp_path, ARM_TOKENS, seed, good, protocol="abcdef123456")
+    _fake_run(tmp_path, ARM_TABLE, 1, poor, protocol="abcdef123456")
     payload, text = v1_report.report(tmp_path)
-    assert sorted(payload["runs"]) == ["table/s1", "table/s2", "tokens/s1", "tokens/s2"]
+    assert payload["gate"]["verdict"] == "withheld" and "missing runs: table/s2" in text
+    _fake_run(tmp_path, ARM_TABLE, 2, poor, protocol="abcdef123456", complete=False)
+    payload, text = v1_report.report(tmp_path)
+    assert payload["gate"]["verdict"] == "withheld"
+    assert "incomplete runs: table/s2 (35/40)" in text
+    assert payload["gate"]["delta_pts"] > 10  # the delta is still reported
+    # an older protocol's directory is ignored, not merged
+    _fake_run(tmp_path, ARM_TABLE, 2, good, protocol="000000000000")
+    payload, _ = v1_report.report(tmp_path)
+    assert "table/s2" in "".join(payload["gate"]["incomplete"])
+    # complete the run: 27 paired long problems < n_eval -> withheld for size
+    shutil.rmtree(tmp_path / "table-s2-abcdef123456")
+    _fake_run(tmp_path, ARM_TABLE, 2, poor, protocol="abcdef123456")
+    payload, text = v1_report.report(tmp_path)
+    assert payload["gate"]["verdict"] == "withheld" and "the gate needs" in text
     assert payload["summary"]["tokens/all"]["tokens_processed"] == 300
-    gate = payload["gate"]
-    assert gate["delta_pts"] > 10 and gate["ci_pts"][0] > 0
-    assert gate["verdict"] == "withheld"  # 27 paired problems < n_eval
+    assert "success_ci" in payload["summary"]["tokens/10+"]
     monkeypatch.setattr(
         v1_report,
         "V1_GATE",
@@ -221,7 +262,10 @@ def test_report_pairs_problems_and_reads_the_gate(tmp_path, monkeypatch):
     )
     payload, text = v1_report.report(tmp_path)
     assert payload["gate"]["verdict"] == "GO" and "GO" in text
-    assert "| tokens | 2 | >=5 moves |" in text
+    # two directories for one arm x seed under the same protocol is an error
+    _fake_run(tmp_path, ARM_TABLE, 2, poor)  # unversioned duplicate
+    with pytest.raises(RuntimeError, match="two runs"):
+        v1_report.report(tmp_path)
 
 
 def test_v1_launcher_payload():
@@ -241,3 +285,4 @@ def test_v1_launcher_payload():
     assert "/workspace-SR004.nfs2/" in job["script"] and "--data-root" in job["script"]
     assert L.run_dir(V1, ARM_TOKENS, 1).name.startswith("tokens-s1-")
     assert L.run_dir(V1, ARM_TOKENS, 1) != L.run_dir(V1, ARM_TABLE, 1)
+    assert len(L.protocol_hash_v1(V1)) == 12

@@ -106,14 +106,22 @@ def pair_features(a: Obj, b: Obj, scale: float, tol: ToleranceSpec = TOL) -> np.
     return f
 
 
+MAX_PARTNER_DISTANCE = 63  # relative index of a partner object, clamped
+
+
 def object_features(
     state: GeometricState, handle: str, context: list[str] | None = None
-) -> tuple[np.ndarray, np.ndarray]:
-    """Self vector of `handle` and the pair matrix against `context` handles.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Self vector of `handle`, the pair matrix and the partners' relative index.
 
     `context` defaults to every object that precedes `handle` in the state,
     plus the object itself, so that a token never depends on objects appended
-    later (append-only, KV-cache friendly).
+    later (append-only, KV-cache friendly). The relative index (how many
+    objects before this one the partner was appended; 0 = itself) is what lets
+    the token say *which* existing object it is incident with: it is the same
+    order in which the sequence lists the objects, invariant under the group
+    and consistent under relabelling because given points are listed in label
+    order in both.
     """
     obj = state.get(handle)
     if context is None:
@@ -124,11 +132,15 @@ def object_features(
                 break
         context = seen
     pairs = np.stack([pair_features(obj, state.get(h), state.scale) for h in context])
-    return self_features(obj, state.scale), pairs
+    n = len(context)
+    relative = np.array(
+        [min(MAX_PARTNER_DISTANCE, n - 1 - i) for i in range(n)], dtype=np.int64
+    )
+    return self_features(obj, state.scale), pairs, relative
 
 
 def state_token_inputs(
     state: GeometricState, handles: list[str]
-) -> list[tuple[np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Features for the state tokens of `handles`, in order."""
     return [object_features(state, h) for h in handles]

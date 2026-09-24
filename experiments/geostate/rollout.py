@@ -124,10 +124,14 @@ class Episode:
 
 def _features_for(state: GeometricState, handles: list[str]):
     items = [
-        (torch.from_numpy(s), torch.from_numpy(p))
-        for s, p in (object_features(state, h) for h in handles)
+        (torch.from_numpy(s), torch.from_numpy(p), torch.from_numpy(r))
+        for s, p, r in (object_features(state, h) for h in handles)
     ]
     return pad_features(items)
+
+
+def answer_moves(state: GeometricState) -> list[str]:
+    return [f"answer {o.handle}\n" for o in state.objects]
 
 
 @torch.no_grad()
@@ -165,8 +169,10 @@ def rollout(
     logits = feed(list(ids) + list(block), given)
     budget = move_budget(cfg, problem.n_moves)
 
+    must_answer = False  # budget spent: the model may still name an object
     while True:
-        trie = build_trie(vocab, legal_moves(state))
+        candidates = answer_moves(state) if must_answer else legal_moves(state)
+        trie = build_trie(vocab, candidates)
         prefix: list[int] = []
         pending: list[int] = []  # generated but not yet fed to the model
         for _ in range(cfg.max_move_tokens):
@@ -217,8 +223,10 @@ def rollout(
         block = tok(block_text, add_special_tokens=False)["input_ids"]
         ep.tokens_processed += len(block)
         if ep.n_moves >= budget:
+            # one last turn, answers only; a wrong or missing answer is still
+            # recorded under "budget" so the failure mode stays visible
+            must_answer = True
             ep.error_kind = "budget"
-            break
         # the move's last token and the new state block enter the cache together
         logits = feed(pending + list(block), [o.handle for o in produced])
     ep.target_reached = any(
@@ -272,9 +280,13 @@ def evaluate(
     done: dict[str, dict[str, Any]] = {}
     if path.exists():
         for line in path.read_text().splitlines():
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 rec = json.loads(line)
-                done[rec["problem_id"]] = rec
+            except json.JSONDecodeError:
+                continue  # a torn last line from an interrupted run
+            done[rec["problem_id"]] = rec
     vocab = MoveVocabulary(model.tok)
     model.eval()
     with path.open("a") as fh:
@@ -288,6 +300,12 @@ def evaluate(
             if i % 25 == 0 or i == len(problems):
                 print(f"  eval {i}/{len(problems)}", flush=True)
     episodes = [done[p.id] for p in problems if p.id in done]
-    metrics = {"arm": model.arm, "n": len(episodes), "buckets": metrics_from(episodes)}
+    metrics = {
+        "arm": model.arm,
+        "n": len(episodes),
+        "n_expected": len(problems),
+        "complete": len(episodes) == len(problems),
+        "buckets": metrics_from(episodes),
+    }
     write_json(out / "metrics.json", metrics)
     return metrics

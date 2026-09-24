@@ -105,12 +105,14 @@ class V1Model(nn.Module):
         self_feats: torch.Tensor,
         pair_feats: torch.Tensor,
         pair_mask: torch.Tensor,
+        pair_index: torch.Tensor,
     ) -> torch.Tensor:
         assert self.encoder is not None, "the table arm has no state tokens"
         out = self.encoder(
             self_feats.to(self.device),
             pair_feats.to(self.device),
             pair_mask.to(self.device),
+            pair_index.to(self.device),
         )
         return out.to(self.lm.get_input_embeddings().weight.dtype)
 
@@ -140,10 +142,13 @@ class V1Model(nn.Module):
         self_feats: torch.Tensor | None = None,
         pair_feats: torch.Tensor | None = None,
         pair_mask: torch.Tensor | None = None,
+        pair_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         st_embeds = None
         if self.encoder is not None and self_feats is not None and self_feats.shape[0]:
-            st_embeds = self.state_embeddings(self_feats, pair_feats, pair_mask)
+            st_embeds = self.state_embeddings(
+                self_feats, pair_feats, pair_mask, pair_index
+            )
         embeds = self.embed(input_ids, st_embeds)
         out = self.lm(
             inputs_embeds=embeds,
@@ -171,9 +176,12 @@ class V1Model(nn.Module):
             raise ValueError(
                 f"adapters are for arm {payload['arm']!r}, model is {self.arm!r}"
             )
-        missing, unexpected = self.lm.load_state_dict(payload["lora"], strict=False)
-        unexpected = [k for k in unexpected]
-        if unexpected:
-            raise ValueError(f"unexpected adapter keys: {unexpected[:3]}")
+        expected = set(lora_state_dict(self.lm))
+        got = set(payload["lora"])
+        if expected != got:
+            missing = sorted(expected - got)[:3]
+            extra = sorted(got - expected)[:3]
+            raise ValueError(f"adapter keys differ: missing {missing}, extra {extra}")
+        self.lm.load_state_dict(payload["lora"], strict=False)
         if self.encoder is not None:
             self.encoder.load_state_dict(payload["encoder"])

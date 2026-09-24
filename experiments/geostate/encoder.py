@@ -19,7 +19,7 @@ import math
 import torch
 from torch import nn
 
-from .features import PAIR_DIM, SELF_DIM
+from .features import MAX_PARTNER_DISTANCE, PAIR_DIM, SELF_DIM
 
 
 class LoRALinear(nn.Module):
@@ -76,6 +76,9 @@ class InvariantEncoder(nn.Module):
         super().__init__()
         self.self_mlp = _mlp(SELF_DIM, d_enc)
         self.pair_mlp = _mlp(PAIR_DIM, d_enc)
+        # which partner: its distance back in creation order (0 = the object
+        # itself), the same order the sequence lists objects in
+        self.partner = nn.Embedding(MAX_PARTNER_DISTANCE + 1, d_enc)
         self.pair_score = nn.Linear(d_enc, 1)
         self.blocks = nn.ModuleList(
             [
@@ -96,8 +99,11 @@ class InvariantEncoder(nn.Module):
         self_feats: torch.Tensor,  # [N, SELF_DIM]
         pair_feats: torch.Tensor,  # [N, M, PAIR_DIM]
         pair_mask: torch.Tensor,  # [N, M] bool, True where a pair exists
+        pair_index: torch.Tensor,  # [N, M] long, partner's relative index
     ) -> torch.Tensor:  # [N, d_model]
-        h_pairs = self.pair_mlp(pair_feats)
+        h_pairs = self.pair_mlp(pair_feats) + self.partner(
+            pair_index.clamp(0, MAX_PARTNER_DISTANCE)
+        )
         scores = self.pair_score(h_pairs).squeeze(-1)
         scores = scores.masked_fill(~pair_mask, float("-inf"))
         weights = torch.softmax(scores, dim=-1).unsqueeze(-1)
@@ -109,20 +115,23 @@ class InvariantEncoder(nn.Module):
 
 
 def pad_features(
-    items: list[tuple[torch.Tensor, torch.Tensor]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stack (self [S], pairs [M_i, P]) items into padded batch tensors."""
+    items: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stack (self [S], pairs [M_i, P], index [M_i]) items into padded tensors."""
     if not items:
         return (
             torch.zeros(0, SELF_DIM),
             torch.zeros(0, 1, PAIR_DIM),
             torch.zeros(0, 1, dtype=torch.bool),
+            torch.zeros(0, 1, dtype=torch.long),
         )
-    m_max = max(p.shape[0] for _, p in items)
-    self_feats = torch.stack([s for s, _ in items])
+    m_max = max(p.shape[0] for _, p, _ in items)
+    self_feats = torch.stack([s for s, _, _ in items])
     pairs = torch.zeros(len(items), m_max, PAIR_DIM)
     mask = torch.zeros(len(items), m_max, dtype=torch.bool)
-    for i, (_, p) in enumerate(items):
+    index = torch.zeros(len(items), m_max, dtype=torch.long)
+    for i, (_, p, r) in enumerate(items):
         pairs[i, : p.shape[0]] = p
         mask[i, : p.shape[0]] = True
-    return self_feats, pairs, mask
+        index[i, : r.shape[0]] = r
+    return self_feats, pairs, mask, index
