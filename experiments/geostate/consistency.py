@@ -460,8 +460,11 @@ def pairwise_agreement(
 class Clients:
     """One client per run, rebuilt when the token is about to expire."""
 
-    def __init__(self, cfg: E0Config, margin_s: float = 120.0):
+    def __init__(
+        self, cfg: E0Config, ca_dir: Path | None = None, margin_s: float = 120.0
+    ):
         self.cfg = cfg
+        self.ca_dir = ca_dir
         self.margin_s = margin_s
         self._client = None
         self._creds = None
@@ -471,7 +474,7 @@ class Clients:
         if self._client is None or (
             expires is not None and expires - time.time() < self.margin_s
         ):
-            self._client, self._creds = make_client(self.cfg)
+            self._client, self._creds = make_client(self.cfg, self.ca_dir)
         return self._client
 
     @property
@@ -528,6 +531,15 @@ def _acquire_lock(out: Path) -> Path:
     return lock
 
 
+def served_models(client) -> set[str] | None:
+    """Model ids the endpoint serves right now; None if the listing failed."""
+    try:
+        return {m.id for m in client.models.list().data}
+    except Exception as exc:  # noqa: BLE001 - a listing failure is not fatal
+        print(f"  ! could not list models: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
 def run(
     cfg: E0Config,
     out: Path,
@@ -538,13 +550,30 @@ def run(
     prepared = stratified(prepare(cfg, out, tol), limit)
     lock = _acquire_lock(out)
     try:
-        clients = Clients(cfg)
+        clients = Clients(cfg, out)
+        # The roster changes: a model can be unloaded between runs (or during
+        # one). Skip the absent ones instead of caching a 404 per copy; a later
+        # run picks them up when they are back.
+        served = served_models(clients.get())
+        models = list(cfg.models)
+        if served is not None:
+            absent = [m for m in models if m not in served]
+            models = [m for m in models if m in served]
+            if absent:
+                print(
+                    f"[{cfg.name}] not served now, skipped: {', '.join(absent)}",
+                    flush=True,
+                )
+            write_json(
+                out / "run.json",
+                {"served": sorted(served), "skipped": absent, "started": time.time()},
+            )
         print(
             f"[{cfg.name}] credentials from {clients.source}; {len(prepared)} problems "
-            f"x {cfg.copies} copies x {len(cfg.models)} models",
+            f"x {cfg.copies} copies x {len(models)} models",
             flush=True,
         )
-        jobs = [(m, p, c) for m in cfg.models for p, copies in prepared for c in copies]
+        jobs = [(m, p, c) for m in models for p, copies in prepared for c in copies]
         failures = 0
         with ThreadPoolExecutor(max_workers=workers or cfg.workers) as pool:
             futures = {

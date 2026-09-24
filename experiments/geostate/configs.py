@@ -18,11 +18,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-OUT_DIR = REPO_ROOT / "run" / "geostate"
+OUT_DIR = REPO_ROOT / "run" / "geostate"  # local runs and smoke tests
+# MLS jobs write outside the staged workdir, on the shared NFS artifacts root
+# (`run_e0_jobs.py` rewrites it to the worker's mount).
+ARTIFACT_ROOT = "/mnt/virtual_ai0001053-00054_SR004-nfs2/d.tarasov/gigaevo-artifacts/results/geostate"
 
 # Same endpoint as noregeo_synth; credentials are resolved at runtime by
 # `experiments.noregeo_synth.credentials`.
 DEFAULT_BASE_URL = "https://inference.airi.net/v1"
+
+# The endpoint omits its intermediate certificate, so the default CA store
+# fails with CERTIFICATE_VERIFY_FAILED. The public, CA-issued GlobalSign
+# intermediate is appended to certifi's roots at runtime (`client.ca_bundle`),
+# keeping normal root and hostname validation. Provenance:
+# https://secure.globalsign.com/cacert/gsgccr3dvtlsca2020.crt (same file as
+# noregeo_synth/certs, copied so the package stays self-contained).
+INTERMEDIATE_CERT = (
+    Path(__file__).resolve().parent / "certs" / "globalsign-gcc-r3-dv-tls-ca-2020.pem"
+)
+TLS_BUNDLE_NAME = "tls-ca-bundle.pem"
 
 # ---------------------------------------------------------------------------
 # Symmetry group (ADR 0005)
@@ -186,11 +200,20 @@ ARMS: tuple[str, ...] = (ARM_TEXT, ARM_FIGURE)
 SET_SYNTHETIC = "synthetic"
 SET_AUX = "aux"
 
-MODEL_QWEN38 = "Qwen/Qwen3.8-27B"
-MODEL_QWEN35 = "Qwen/Qwen3.5-27B"
-MODEL_QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+# The roster the endpoint serves changes without notice: on 2026-09-25 the
+# smoke run watched Qwen3.8-27B disappear mid-run, and Qwen3.5-27B / Qwen3-Next
+# were already gone; what remained was Qwen3-8B, Gpt-oss-120b (open-weight,
+# text-only) and the two Medgemmas. `consistency.run` lists the served models
+# at start and skips absent ones, so a config may name a model that is not
+# there today and pick it up on a later run.
+MODEL_QWEN38 = "Qwen/Qwen3.8-27B"  # the only figure-reading VLM; absent now
+MODEL_QWEN3_8B = "Qwen/Qwen3-8B"
+MODEL_GPTOSS = "Openai/Gpt-oss-120b"  # text-only: a blind control on the figure arm
+MODEL_QWEN35 = "Qwen/Qwen3.5-27B"  # absent since 2026-09-25
+MODEL_QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"  # absent since 2026-09-25
 # Google/Medgemma-27b-it is excluded from the figure arm: `noregeo-vlm-eval.md`
 # established that it cannot read the rendered figure.
+TEXT_MODELS: tuple[str, ...] = (MODEL_QWEN3_8B, MODEL_GPTOSS, MODEL_QWEN38)
 
 
 @dataclass(frozen=True)
@@ -214,8 +237,11 @@ class E0Config:
     request_timeout: float = 300.0
     max_transport_retries: int = 6
     retry_backoff_cap: float = 60.0
-    workers: int = 2
+    workers: int = 4  # the live smoke ran 4 in flight without a 429
     bootstrap: int = 1000
+    # MLS instance for the inference-only job; the allocation is GPU-only and
+    # this is the type noregeo's inference jobs use.
+    instance_type: str = "a100.1gpu"
     # Only a gated config's summary prints the H0 verdict (AC-14): the figure
     # arm and the auxiliary set are reported, not judged.
     gated: bool = False
@@ -224,14 +250,14 @@ class E0Config:
 experiment_configs: list[E0Config] = [
     E0Config(
         name="e0-synthetic-text",
-        models=(MODEL_QWEN38, MODEL_QWEN35, MODEL_QWEN3_NEXT),
+        models=TEXT_MODELS,
         arm=ARM_TEXT,
         problem_set=SET_SYNTHETIC,
         gated=True,
     ),
     E0Config(
         name="e0-aux-text",
-        models=(MODEL_QWEN38, MODEL_QWEN35, MODEL_QWEN3_NEXT),
+        models=TEXT_MODELS,
         arm=ARM_TEXT,
         problem_set=SET_AUX,
         per_stem=100,  # every valid row of the seven stems

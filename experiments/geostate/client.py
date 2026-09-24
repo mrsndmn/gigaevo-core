@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
 
 from experiments.noregeo_synth import credentials as _credentials
 
-from .configs import E0Config
+from .configs import INTERMEDIATE_CERT, OUT_DIR, TLS_BUNDLE_NAME, E0Config
 
 
 def read_json(path: str | Path) -> Any:
@@ -64,15 +65,41 @@ def is_retryable(exc: Exception) -> bool:
     )
 
 
-def make_client(cfg: E0Config):
+def ca_bundle(directory: str | Path | None = None) -> Path:
+    """certifi's roots plus the endpoint's missing intermediate, written once."""
+    import certifi
+
+    target = Path(directory or OUT_DIR) / TLS_BUNDLE_NAME
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(
+            Path(certifi.where()).read_text() + "\n" + INTERMEDIATE_CERT.read_text()
+        )
+        tmp.replace(target)
+    return target
+
+
+def make_client(cfg: E0Config, ca_dir: str | Path | None = None):
+    """OpenAI client for the endpoint; verifies TLS against the bundle.
+
+    `SSL_CERT_FILE`, when set (the MLS launchers set it), wins over the bundle
+    written next to the run.
+    """
+    import ssl
+
+    import httpx
     from openai import OpenAI
 
     creds = _credentials.resolve(expected_base_url=cfg.base_url)
+    cafile = os.environ.get("SSL_CERT_FILE") or str(ca_bundle(ca_dir))
+    context = ssl.create_default_context(cafile=cafile)
     client = OpenAI(
         base_url=creds.base_url,
         api_key=creds.api_key,
         timeout=cfg.request_timeout,
         max_retries=0,  # the loop below owns every retry
+        http_client=httpx.Client(verify=context, timeout=cfg.request_timeout),
     )
     return client, creds
 

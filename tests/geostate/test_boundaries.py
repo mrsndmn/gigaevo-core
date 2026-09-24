@@ -12,6 +12,14 @@ PACKAGE = Path(__file__).resolve().parents[2] / "experiments" / "geostate"
 # guard/subprocess machinery in particular — must be copied, not imported.
 NOREGEO_ALLOWLIST = {"credentials", "dataset", "configs", "figures", "verify"}
 
+# The MLS launcher alone may reuse the shared job plumbing (path rewriting,
+# staging, image and env constants) of the vocab-factorization launchers.
+LAUNCHER = "run_e0_jobs.py"
+LAUNCHER_ALLOWLIST = {
+    "experiments.vocab_factorization.jobs",
+    "experiments.vocab_factorization.run_train_jobs",
+}
+
 
 def _imports(path: Path) -> list[str]:
     tree = ast.parse(path.read_text())
@@ -38,9 +46,11 @@ def test_no_import_from_gigaevo_and_only_allowlisted_noregeo_modules():
             if name.startswith("experiments.noregeo_synth"):
                 leaf = name.split(".")[2] if name.count(".") >= 2 else ""
                 assert leaf in NOREGEO_ALLOWLIST, f"{path.name} imports {name}"
-            assert not name.startswith("experiments.vocab_factorization"), (
-                f"{path.name} imports {name}"
-            )
+            if name.startswith("experiments.vocab_factorization"):
+                module = ".".join(name.split(".")[:3])
+                assert path.name == LAUNCHER and module in LAUNCHER_ALLOWLIST, (
+                    f"{path.name} imports {name}"
+                )
 
 
 def test_configs_is_standard_library_only():

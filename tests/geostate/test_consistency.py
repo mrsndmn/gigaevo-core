@@ -465,3 +465,36 @@ def test_fingerprint_covers_tolerances(tmp_path):
     C.prepare(cfg, out)
     with pytest.raises(RuntimeError, match="different config"):
         C.prepare(cfg, out, tol=ToleranceSpec(agreement=0.05))
+
+
+def test_client_verifies_tls_with_the_intermediate_bundle(tmp_path, monkeypatch):
+    from experiments.geostate import client as CL
+    from experiments.geostate.configs import INTERMEDIATE_CERT
+
+    bundle = CL.ca_bundle(tmp_path)
+    text = bundle.read_text()
+    assert INTERMEDIATE_CERT.read_text().strip() in text
+    assert text.count("BEGIN CERTIFICATE") > 10  # certifi roots are in front
+    assert CL.ca_bundle(tmp_path) == bundle  # written once
+
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    class Creds:
+        base_url = CFG.base_url
+        api_key = "token"
+        source = "test"
+        expires_at = None
+
+    monkeypatch.setattr(CL._credentials, "resolve", lambda expected_base_url: Creds())
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    CL.make_client(CFG, tmp_path)
+    assert captured["max_retries"] == 0
+    assert captured["http_client"]._transport._pool._ssl_context is not None
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    CL.make_client(CFG, tmp_path / "other")
+    assert not (tmp_path / "other" / "tls-ca-bundle.pem").exists()

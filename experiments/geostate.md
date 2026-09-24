@@ -76,8 +76,14 @@ python -m experiments.geostate.consistency --config e0-synthetic-text --dry
 python -m experiments.geostate.consistency --config e0-synthetic-text --run
 python -m experiments.geostate.consistency --config e0-synthetic-text --summary
 python -m experiments.geostate.consistency --config e0-synthetic-text --recover-errors
+python -m experiments.geostate.run_e0_jobs --config e0-synthetic-text [--limit 12] [--dry]
 python -m pytest tests/geostate -q
 ```
+
+Full grids run as MLS jobs (`run_e0_jobs.py`, one config per job, outputs under
+`configs.ARTIFACT_ROOT`); local `--run` is for smokes. The endpoint omits its
+intermediate TLS certificate, so the client verifies against a bundle that
+adds the public GlobalSign intermediate (`certs/`).
 
 Outputs land in `run/geostate/<config>/` (gitignored): frozen
 `problems.jsonl` and `copies.jsonl` with a config fingerprint, one directory
