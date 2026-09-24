@@ -152,6 +152,17 @@ and ADR 0006 so that they cannot drift once the numbers exist.
   exhausted a 6144-token cap once. The selection rule now carries a worked
   example in the prompt and the cap is 16k (`configs.py`).
 
+2026-09-24, E0 launched on MLS:
+
+- `e0-synthetic-text` (gated config; models Qwen3-8B, Gpt-oss-120b, and
+  Qwen3.8-27B if it returns): job `lm-mpi-job-83381a84-a9f7-4598-be37-a63d91b8ced7`,
+  staged commit `0e575d89967a1dd3e595754e44d6da05feba4b5e`, artifacts
+  `/mnt/virtual_ai0001053-00054_SR004-nfs2/d.tarasov/gigaevo-artifacts/results/geostate/e0-synthetic-text-7db7de275f91`
+  (the suffix is the protocol hash). 7200 requests at concurrency 4; the
+  endpoint token expires ~15 h after launch, so a resubmission after renewal
+  is expected — the job script archives failed requests at the end and the
+  launcher's dedup makes resubmission idempotent. No numbers yet.
+
 ## Conclusions
 
 The environment and the E0 harness are ready to run against the endpoint; the
