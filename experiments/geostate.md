@@ -95,9 +95,32 @@ Reflection is the out-of-distribution condition of ADR 0005: the
 copies whose target is the reflection of the original target, which excludes
 orientation-dependent constructions (quarter turns) by construction.
 
-H1 (the V1 arm, its matched baseline, the MLS launcher and the training loop)
-is **not implemented yet**; its gates and protocol are fixed in `configs.py`
-and ADR 0006 so that they cannot drift once the numbers exist.
+H1 — the V1 arm against its matched-training baseline (ADR 0006):
+
+- `features.py` — exact invariant features of a new object against every
+  existing one (kinds, scale-free distances, signed point-line offsets, line
+  angles, incidence/tangency flags); no coordinate enters, so a state token is
+  invariant by construction.
+- `sequence.py` — one teacher-forced format for both arms: prompt, then the
+  model's moves (the only positions with loss) alternating with
+  environment-written state blocks; the `tokens` arm puts one `<st>` per
+  object, the `table` arm the object's parameters as text.
+- `encoder.py` / `v1_model.py` — the invariant-feature encoder whose output
+  replaces the `<st>` embeddings, and a frozen Qwen3-1.7B with a hand-rolled
+  LoRA applied identically in both arms.
+- `train_v1.py` — generator trajectories held out by seed, LoRA-SFT, then
+  the rollout evaluation; `rollout.py` — greedy decoding constrained to the
+  legal moves of the current state (a reference to a missing object is
+  impossible in either arm), kernel execution after every move, success /
+  target-reached / wrong-selection / tokens per episode.
+- `run_v1_jobs.py` — 2 arms × 2 seeds on MLS; `v1_report.py` — the table and
+  the H1 gate (paired Δsuccess on the long bucket with bootstrap CI).
+
+```bash
+python -m experiments.geostate.train_v1 --arm tokens --seed 1 --out DIR --train --eval [--smoke]
+python -m experiments.geostate.run_v1_jobs [--dry] [--arm tokens] [--seed 1]
+python -m experiments.geostate.v1_report [--root DIR]
+```
 
 ## Results
 
@@ -132,7 +155,7 @@ and ADR 0006 so that they cannot drift once the numbers exist.
   per-transform breakdown, verdicts on ungated configs and dead moves in
   trajectories. All fixed and covered by tests.
 
-2026-09-25, first live requests (smoke, 2 synthetic problems, local run):
+2026-09-24, first live requests (smoke, 2 synthetic problems, local run):
 
 - Every request failed with `APIConnectionError` until the client verified
   TLS against a bundle with the endpoint's missing GlobalSign intermediate;
@@ -162,6 +185,23 @@ and ADR 0006 so that they cannot drift once the numbers exist.
   endpoint token expires ~15 h after launch, so a resubmission after renewal
   is expected — the job script archives failed requests at the end and the
   launcher's dedup makes resubmission idempotent. No numbers yet.
+
+2026-09-24, H1 built and launched:
+
+- Local GPU smoke (20 optimiser steps on 36 trajectories, 6 rollouts per
+  arm): both arms train (loss 1.19 → 0.07) and roll out end to end; the
+  tokens arm solved 3 of 6, the table arm 2 of 6 with one wrong selection —
+  numbers from a smoke, not results.
+- MLS jobs (staged commit `c9c65aec75923414d6d044343bbb6818078c9e3f`, artifacts
+  under `.../gigaevo-artifacts/results/geostate/v1/<arm>-s<seed>-f6181a88e7c2`):
+  tokens s1 `lm-mpi-job-86aea567-79d3-4a62-a4fa-e86b37235cf4`,
+  tokens s2 `lm-mpi-job-13fe2584-2650-49e4-9007-b49b6cad4c70`,
+  table s1 `lm-mpi-job-fe162024-04b5-4a8d-b50c-f385635f2ddc`,
+  table s2 `lm-mpi-job-dca181b8-a744-48ea-b151-97d00a569297`.
+  The first job to start generates the shared data (~50k train, 900 eval)
+  under a file lock; the others wait for it. No numbers yet.
+- E0 auxiliary set launched too: `lm-mpi-job-75c1ee3d-1ea2-4fd0-a9c8-731458205e7e`
+  (`e0-aux-text-7db7de275f91`).
 
 ## Conclusions
 
@@ -209,7 +249,10 @@ package into its own repository as the first post-go task (ADR 0004).
   also archives interrupted requests and never re-archives; the run
   fingerprint covers generator and tolerance settings; a macro node that adds
   no move is rejected so no description restates a sub-result. 96 tests.
-- 2026-09-25 — first live smoke: TLS bundle with the GlobalSign intermediate,
+- 2026-09-24 — V1 implemented (features, sequences, encoder, LoRA model,
+  training, constrained rollouts, launcher, report), smoked on the local GPU
+  and submitted as four MLS jobs; E0 auxiliary set submitted. 116 tests.
+- 2026-09-24 — first live smoke: TLS bundle with the GlobalSign intermediate,
   MLS launcher `run_e0_jobs.py`, served-model check at run start, roster
   switched to Qwen3-8B + Gpt-oss-120b (+ Qwen3.8-27B when present), prompt
   example for pair selection, 16k token cap, concurrency 4. 100 tests.
