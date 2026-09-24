@@ -235,13 +235,47 @@ python -m experiments.geostate.v1_report [--root DIR]
 - E0 auxiliary set launched too: `lm-mpi-job-75c1ee3d-1ea2-4fd0-a9c8-731458205e7e`
   (`e0-aux-text-7db7de275f91`).
 
+2026-09-24 14:40, **V1 finished** (all eight jobs completed; training
+1.3 h per tokens run and 1.7 h per table run, 900 rollouts each). Read with
+`v1_report --protocol 89abc7561426` (B) and `--protocol f6181a88e7c2` (A);
+reports in `run/geostate/v1-reports/`.
+
+| protocol | arm | success 1-3 | success 4-9 | success 10+ | success ≥5 moves | wrong selection ≥5 | tokens/episode ≥5 |
+|---|---|---|---|---|---|---|---|
+| B | tokens | 0.828 | 0.805 | 0.637 | 0.709 [0.671, 0.742] | 0.032 | 388 |
+| B | table | 0.947 | 0.940 | 0.873 | 0.903 [0.881, 0.926] | 0.008 | 627 |
+| A | tokens | 0.883 | 0.880 | 0.745 | 0.806 [0.780, 0.831] | 0.013 | 396 |
+| A | table | 0.947 | 0.940 | 0.888 | 0.913 [0.890, 0.934] | 0.006 | 627 |
+
+Paired Δsuccess tokens − table on the ≥5-move bucket (544 problems, 2 seeds):
+protocol B **−19.4 pts, CI95 [−22.8, −16.0] → KILL**; protocol A −10.7 pts,
+CI95 [−13.1, −8.3] (the report withholds A's verdict only because its runs
+predate `run.json`; all four are complete at 900/900). The state-token arm
+loses to the same LoRA reading the same state as text on every bucket, in
+both encoders, and the gap widens with construction length; its
+wrong-selection rate on short problems (0.13 in B) says the token does not
+convey *which* intersection is which as well as two rounded coordinates do.
+Protocol B's partner-index encoder is worse than A's index-free one
+(0.709 vs 0.806, CIs disjoint). What does hold is H3: the tokens arm
+processes 38% fewer tokens per episode (388 vs 627) — at that accuracy cost.
+
 ## Conclusions
 
-The environment and the E0 harness are ready to run against the endpoint; the
-first live measurement is `e0-synthetic-text --run --limit 12` (the limit is
-taken across buckets, so long constructions are included) to check the
-prompt, then the full grid. The H0 verdict is read from `--summary` of the
-gated config against the gate in `configs.py`.
+**H1 is killed under the pre-registered gate (ADR 0006):** with identical
+data, LoRA, optimiser and constrained decoding, invariant state tokens are
+10–19 points *behind* the textual state table on long constructions, not 10
+ahead. Two readings, both to be checked before the idea is buried: (1) the
+probe's encoder is a small invariant-feature MLP trained from scratch in one
+epoch next to a frozen LM — a richer or pretrained encoder, more epochs, or a
+learned (CGENN-style) encoder could close part of the gap, which the spec
+listed as E2 ablations; (2) the text table carries exact rounded coordinates
+and the tokens carry only relative invariants, so on the *in-distribution*
+poses this probe tests, coordinates are simply more information. The spec's
+remaining argument for tokens is out-of-distribution poses (H4) and token
+economy (H3) — H3 is confirmed (−38% tokens), H4 is untested here.
+
+E0 (H0) is still running; its verdict is read from `--summary` of the gated
+config against the gate in `configs.py`.
 
 Deviations from the interview spec, recorded rather than hidden: no
 `geostate` extra was needed because the kernel is numpy-only and analytic
@@ -282,6 +316,9 @@ package into its own repository as the first post-go task (ADR 0004).
   also archives interrupted requests and never re-archives; the run
   fingerprint covers generator and tolerance settings; a macro node that adds
   no move is rejected so no description restates a sub-result. 96 tests.
+- 2026-09-24 — V1 results: all eight runs complete; H1 KILL under the
+  pre-registered gate (protocol B −19.4 pts, A −10.7 pts on ≥5 moves); H3
+  (token economy) confirmed.
 - 2026-09-24 — predicate goals (AC-10): incidence and tangency goals with
   several valid answers, one `goal_holds` for E0 and V1, protocol hashes
   cover the problem-generating code, launcher dedup keys on the protocol.
