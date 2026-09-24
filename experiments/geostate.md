@@ -259,6 +259,32 @@ Protocol B's partner-index encoder is worse than A's index-free one
 (0.709 vs 0.806, CIs disjoint). What does hold is H3: the tokens arm
 processes 38% fewer tokens per episode (388 vs 627) — at that accuracy cost.
 
+2026-09-24 15:30, **E0 partial read** (both jobs still running, Qwen3-8B
+only; the other two models have not started). A first look showed a
+measurement artefact: the DSL parser rejected unambiguous programs models
+write unprompted — `meet(l, line(A, B))`, `answer meet(l1, l2)`,
+`meet(c, l)[0]` — as syntax errors (35% of aux copies). The parser now
+desugars them and `consistency --rescore` re-evaluates cached outputs offline
+(the model side is untouched). After rescoring:
+
+| set | bucket | problems | answered | success identity | success transformed | consistency [CI95] |
+|---|---|---|---|---|---|---|
+| synthetic | 1-3 (complete) | 100 | 0.834 | 0.596 | 0.563 | 0.628 [0.571, 0.679] |
+| synthetic | ≥5 moves | 5 of 187 | — | — | — | (no data yet) |
+| aux | 1-3 | 91 of 242 | 0.990 | 0.989 | 0.991 | 1.000 |
+| aux | 4-9 (all ≥5 moves) | 128 of 442 | 0.890 | 0.787 | 0.793 | 0.834 [0.772, 0.890] |
+
+What the partial data already says: Qwen3-8B is measurably inconsistent —
+37% of answered copy pairs disagree on 3-move synthetic problems, 17% on
+9-move NoReGeo constructions — and it cannot reach the 0.95 kill level on
+the remaining aux problems even if every one of them were perfectly
+consistent (the bound is 0.952 and the remaining stems are the harder
+incircle/circumcircle ones). Its remaining failure mode is genuine: 12–14%
+of synthetic copies exhaust the 16k-token budget while thinking (`empty`).
+What it cannot say: the gate reads the *best* open model, and Qwen3.8-27B
+(7 of 8 copies right in the smoke) and Gpt-oss-120b have not been measured
+at scale — the E0 verdict waits for Qwen3.8-27B.
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
@@ -316,6 +342,9 @@ package into its own repository as the first post-go task (ADR 0004).
   also archives interrupted requests and never re-archives; the run
   fingerprint covers generator and tolerance settings; a macro node that adds
   no move is rejected so no description restates a sub-result. 96 tests.
+- 2026-09-24 — DSL parser desugars nested calls, `answer <expr>` and
+  `[k]` selection; `consistency --rescore [--force]` re-evaluates cached
+  outputs; partial E0 rescored (aux ≥5-move answered 0.38 → 0.89). 130 tests.
 - 2026-09-24 — V1 results: all eight runs complete; H1 KILL under the
   pre-registered gate (protocol B −19.4 pts, A −10.7 pts on ≥5 moves); H3
   (token economy) confirmed.

@@ -13,6 +13,12 @@ that does not exist fails with `undefined_reference` — the failure class
 GeoBuildBench found most common — instead of being silently invented. Nothing
 here is evaluated as Python: a statement either matches the grammar or is a
 syntax error.
+
+Sugar that models write unprompted is desugared, not rejected, because it is
+unambiguous and rejecting it would measure our parser, not the model:
+nested calls (`meet(l, line(A, B))`) are hoisted into temporaries in
+evaluation order, `answer meet(l1, l2)` / `answer = X` / `answer: X` are
+accepted, and `meet(...)[0]` / `[1]` select one point of a pair.
 """
 
 from __future__ import annotations
@@ -42,12 +48,13 @@ ERROR_KINDS = (
     ERR_EMPTY,
 )
 
+OPS = ("line", "circle", "meet")
 _NAME = r"[A-Za-z_][A-Za-z0-9_']*"
-STATEMENT_RE = re.compile(
-    rf"^\s*({_NAME})\s*(?:,\s*({_NAME}))?\s*=\s*(line|circle|meet)\s*\(\s*({_NAME})\s*,\s*({_NAME})\s*\)\s*$"
-)
-ANSWER_RE = re.compile(rf"^\s*answer\s*[:=]?\s*({_NAME})\s*$", re.IGNORECASE)
+NAME_RE = re.compile(rf"^{_NAME}$")
 FENCE_RE = re.compile(r"```[A-Za-z_-]*[ \t]*\n(.*?)```", re.DOTALL)
+ANSWER_RE = re.compile(r"^\s*answer\s*[:=]?\s*(.+?)\s*$", re.IGNORECASE)
+ASSIGN_RE = re.compile(rf"^\s*({_NAME})\s*(?:,\s*({_NAME}))?\s*=\s*(.+?)\s*$")
+TEMP_PREFIX = "_t"
 
 
 class ParseError(ValueError):
@@ -60,9 +67,11 @@ class Statement:
     op: str
     args: tuple[str, str]
     line_no: int
+    select: int | None = None  # `meet(...)[k]`: bind the k-th point only
 
     def text(self) -> str:
-        return f"{', '.join(self.names)} = {self.op}({self.args[0]}, {self.args[1]})"
+        suffix = "" if self.select is None else f"[{self.select}]"
+        return f"{', '.join(self.names)} = {self.op}({self.args[0]}, {self.args[1]}){suffix}"
 
 
 @dataclass
@@ -84,6 +93,72 @@ def extract_block(text: str) -> str:
     return blocks[-1] if blocks else text
 
 
+# ---------------------------------------------------------------------------
+# Expressions: NAME | op(arg, arg)[k]
+# ---------------------------------------------------------------------------
+
+
+class _Expr:
+    def __init__(self, text: str, line_no: int):
+        self.text = text
+        self.pos = 0
+        self.line_no = line_no
+
+    def _skip(self) -> None:
+        while self.pos < len(self.text) and self.text[self.pos].isspace():
+            self.pos += 1
+
+    def _fail(self, what: str) -> ParseError:
+        return ParseError(
+            f"line {self.line_no}: cannot parse {self.text.strip()!r} ({what})"
+        )
+
+    def _name(self) -> str:
+        self._skip()
+        m = re.match(_NAME, self.text[self.pos :])
+        if not m:
+            raise self._fail("expected a name")
+        self.pos += m.end()
+        return m.group(0)
+
+    def _expect(self, ch: str) -> None:
+        self._skip()
+        if self.pos >= len(self.text) or self.text[self.pos] != ch:
+            raise self._fail(f"expected {ch!r}")
+        self.pos += 1
+
+    def parse(self, hoisted: list[tuple[str, str, tuple[str, str], int | None]]) -> str:
+        """Parse one expression; nested calls are appended to `hoisted` as
+        (temp name, op, args, select) in evaluation order. Returns the name
+        the expression's value is bound to."""
+        name = self._name()
+        self._skip()
+        if self.pos < len(self.text) and self.text[self.pos] == "(":
+            if name not in OPS:
+                raise self._fail(f"unknown primitive {name!r}")
+            self.pos += 1
+            a = self.parse(hoisted)
+            self._expect(",")
+            b = self.parse(hoisted)
+            self._expect(")")
+            select = None
+            self._skip()
+            if self.text[self.pos : self.pos + 1] == "[":
+                m = re.match(r"\[\s*([01])\s*\]", self.text[self.pos :])
+                if not m:
+                    raise self._fail("index must be [0] or [1]")
+                select = int(m.group(1))
+                self.pos += m.end()
+            temp = f"{TEMP_PREFIX}{len(hoisted) + 1}"
+            hoisted.append((temp, name, (a, b), select))
+            return temp
+        return name
+
+    def done(self) -> bool:
+        self._skip()
+        return self.pos == len(self.text)
+
+
 def parse(text: str) -> Program:
     """Parse a program. Lines that are blank or comments are skipped."""
     source = extract_block(text)
@@ -95,15 +170,33 @@ def parse(text: str) -> Program:
             continue
         m = ANSWER_RE.match(stripped)
         if m:
-            answer = m.group(1)
+            expr = _Expr(m.group(1), line_no)
+            hoisted: list = []
+            name = expr.parse(hoisted)
+            if not expr.done():
+                raise ParseError(f"line {line_no}: cannot parse {stripped!r}")
+            for temp, op, args, select in hoisted:
+                statements.append(Statement((temp,), op, args, line_no, select))
+            answer = name
             continue
-        m = STATEMENT_RE.match(stripped)
+        m = ASSIGN_RE.match(stripped)
         if not m:
             raise ParseError(f"line {line_no}: cannot parse {stripped!r}")
         names = (m.group(1),) if m.group(2) is None else (m.group(1), m.group(2))
-        statements.append(
-            Statement(names, m.group(3), (m.group(4), m.group(5)), line_no)
-        )
+        expr = _Expr(m.group(3), line_no)
+        hoisted = []
+        value = expr.parse(hoisted)
+        if not expr.done():
+            raise ParseError(f"line {line_no}: cannot parse {stripped!r}")
+        if not hoisted:
+            # `X = Y`: a plain alias
+            statements.append(Statement(names, "alias", (value, value), line_no))
+            continue
+        # the outermost call binds the statement's names; inner calls keep temps
+        *inner, (_, op, args, select) = hoisted
+        for temp, iop, iargs, isel in inner:
+            statements.append(Statement((temp,), iop, iargs, line_no, isel))
+        statements.append(Statement(names, op, args, line_no, select))
     if not statements and answer is None:
         raise ParseError("empty program")
     return Program(statements, answer, source)
@@ -136,6 +229,10 @@ def execute(program: Program, state: GeometricState) -> Execution:
                 if a not in bindings:
                     raise MoveError(ERR_UNDEFINED, f"unknown object {a!r}")
                 args.append(bindings[a])
+            if stmt.op == "alias":
+                for name in stmt.names:
+                    bindings[name] = args[0]
+                continue
             produced = st.apply(Move(stmt.op, (args[0], args[1])))
         except MoveError as exc:
             ex.error = f"line {stmt.line_no}: {exc}"
@@ -144,6 +241,14 @@ def execute(program: Program, state: GeometricState) -> Execution:
             ex.bindings = bindings
             return ex
         ex.n_moves += 1
+        if stmt.select is not None:
+            if stmt.select >= len(produced):
+                ex.error = f"line {stmt.line_no}: [{stmt.select}] on a single point"
+                ex.error_kind = ERR_TYPE
+                ex.failed_statement = stmt
+                ex.bindings = bindings
+                return ex
+            produced = [produced[stmt.select]]
         for name, obj in zip(stmt.names, produced, strict=False):
             bindings[name] = obj.handle
     ex.bindings = bindings

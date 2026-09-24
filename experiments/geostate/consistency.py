@@ -739,6 +739,60 @@ def run(
 COPY_DIR_RE = re.compile(r"c\d+")
 
 
+def rescore(
+    cfg: E0Config, out: Path, tol: ToleranceSpec = TOL, force: bool = False
+) -> int:
+    """Re-evaluate every cached model output with the current parser/scorer.
+
+    The model side (prompt, sampling) is untouched: only the offline scoring
+    of the cached `result.json` changes, so this is legitimate on a frozen
+    run of any protocol — the case that motivated it is a stricter parser
+    having counted unambiguous programs as syntax errors. Refuses a live run.
+    """
+    if lock_is_held(out) and not force:
+        # Safe in principle (every write is atomic and the worker never
+        # rewrites an existing eval.json), but say so explicitly.
+        raise RuntimeError(
+            f"{out / LOCK_NAME} is held: pass --force to rescore a live run"
+        )
+    prepared = prepare(cfg, out, tol, strict=False)
+    n = 0
+    for model in cfg.models:
+        for problem, copies in prepared:
+            for copy in copies:
+                directory = job_dir(out, model, problem, copy)
+                result_path = directory / "result.json"
+                if not result_path.exists():
+                    continue
+                result = read_json(result_path)
+                if result.get("error"):
+                    continue
+                old = (
+                    read_json(directory / "eval.json")
+                    if (directory / "eval.json").exists()
+                    else {}
+                )
+                record = evaluate(copy, result.get("content"), tol)
+                record.update(
+                    {
+                        "model": model,
+                        "problem_id": problem.id,
+                        "copy": copy.id,
+                        "kind": copy.kind,
+                        "bucket": problem.bucket,
+                        "n_moves_reference": problem.n_moves,
+                        "usage": result.get("usage", {}),
+                        "rescored": True,
+                    }
+                )
+                if old.get("error_kind") != record.get("error_kind") or old.get(
+                    "success"
+                ) != record.get("success"):
+                    n += 1
+                write_json(directory / "eval.json", record)
+    return n
+
+
 def recover_errors(out: Path) -> list[Path]:
     """Archive request directories that must be re-issued.
 
@@ -1092,6 +1146,14 @@ def main(argv: list[str] | None = None) -> int:
         help="archive request directories whose result is an error",
     )
     ap.add_argument(
+        "--rescore",
+        action="store_true",
+        help="re-evaluate cached model outputs with the current scorer (offline)",
+    )
+    ap.add_argument(
+        "--force", action="store_true", help="rescore even while a run is live"
+    )
+    ap.add_argument(
         "--limit", type=int, default=None, help="only N problems, taken across buckets"
     )
     ap.add_argument("--workers", type=int, default=None)
@@ -1116,6 +1178,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.recover_errors:
         archived = recover_errors(out)
         print(f"[{cfg.name}] archived {len(archived)} failed request directories")
+    if args.rescore:
+        changed = rescore(cfg, out, force=args.force)
+        print(f"[{cfg.name}] rescored cached outputs; {changed} evaluations changed")
     if args.run:
         code = run(cfg, out, limit=args.limit, workers=args.workers)
     if args.summary:
@@ -1123,7 +1188,9 @@ def main(argv: list[str] | None = None) -> int:
         write_json(out / "summary.json", payload)
         (out / "summary.md").write_text(text)
         sys.stdout.write(text)
-    if not (args.dry or args.run or args.summary or args.recover_errors):
+    if not (
+        args.dry or args.run or args.summary or args.recover_errors or args.rescore
+    ):
         ap.print_help()
     return code
 

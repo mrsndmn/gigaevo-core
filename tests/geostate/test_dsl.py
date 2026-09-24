@@ -96,3 +96,31 @@ def test_single_name_for_a_pair_binds_the_first():
         GeometricState.from_given(TRI),
     )
     assert ex.ok and ex.answer is not None and ex.answer.handle == "h3"
+
+
+def test_sugar_is_desugared_not_rejected():
+    from experiments.geostate import dsl as D
+
+    st = GeometricState.from_given(TRI)
+    ref = D.run_text(
+        "c1 = circle(A, B)\nc2 = circle(B, A)\np, q = meet(c1, c2)\nl = line(p, q)\n"
+        "m = meet(l, line(A, B))\nanswer m",
+        st,
+    )
+    assert ref.ok and ref.answer.xy() == pytest.approx((4.0, 0.0))
+    assert ref.n_moves == 6  # the nested line(A, B) became a move of its own
+    inline = D.run_text("answer meet(line(A, B), line(A, C))", st)
+    assert inline.ok and inline.answer.xy() == pytest.approx((0.0, 0.0))
+    eq = D.run_text("l1 = line(A, B)\nl2 = line(A, C)\nanswer = meet(l1, l2)", st)
+    assert eq.ok and eq.answer.xy() == pytest.approx((0.0, 0.0))
+    idx = D.run_text(
+        "c = circle(A, B)\nl = line(A, B)\nx = meet(c, l)[1]\nanswer x", st
+    )
+    assert idx.ok and idx.answer.xy() == pytest.approx((8.0, 0.0))
+    alias = D.run_text("l = line(A, B)\nk = l\nanswer k", st)
+    assert alias.ok and alias.answer.kind == "line"
+    bad = D.run_text("x = meet(line(A, B), line(A, C))[1]\nanswer x", st)
+    assert bad.error_kind == ERR_TYPE  # [1] on a single point
+    assert D.run_text("x = frob(A, B)\nanswer x", st).error_kind == D.ERR_SYNTAX
+    assert D.run_text("x = meet(c, l)[2]\nanswer x", st).error_kind == D.ERR_SYNTAX
+    assert D.run_text("x = line(A, B) extra\nanswer x", st).error_kind == D.ERR_SYNTAX
