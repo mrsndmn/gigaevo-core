@@ -14,7 +14,7 @@ NOREGEO_ALLOWLIST = {"credentials", "dataset", "configs", "figures", "verify"}
 
 # The MLS launchers alone may reuse the shared job plumbing (path rewriting,
 # staging, image and env constants) of the vocab-factorization launchers.
-LAUNCHERS = {"run_e0_jobs.py", "run_v1_jobs.py"}
+LAUNCHERS = {"run_e0_jobs.py", "run_v1_jobs.py", "run_v1_ood_jobs.py"}
 LAUNCHER_ALLOWLIST = {
     "experiments.vocab_factorization.jobs",
     "experiments.vocab_factorization.run_train_jobs",

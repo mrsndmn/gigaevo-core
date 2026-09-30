@@ -32,6 +32,16 @@ gates are constants in `configs.py`):
   table, by at least the go margin on the long-construction bucket. If the
   text table closes the gap, the contribution narrows to token economy and
   out-of-distribution poses (ADR 0006).
+- **H4 (poses outside the training range).** Added 2026-09-30 after the H1
+  kill, before any OOD episode existed. The *same* trained V1 adapters, with
+  no retraining, on the frozen V1 evaluation set moved far outside the
+  training range (translated by 100, scaled ×10 or ×0.2): the text table's
+  coordinates leave the range the LoRA saw, and the state tokens do not move.
+  H4 holds if on some far condition tokens beat the table by at least the go
+  margin with CI above zero; it is dead if every far condition is at/below
+  the kill margin (`configs.H4_GATE`, the same margins as H1). Even a GO only
+  argues against a *raw-coordinate* table: a table in a canonical frame would
+  be invariant too, and that is the baseline a GO would have to face next.
 
 The unit of work is a **construction problem**: labelled given points, a
 target described as a nested classical construction (midpoint, circumcentre,
@@ -131,6 +141,20 @@ H1 — the V1 arm against its matched-training baseline (ADR 0006):
 python -m experiments.geostate.train_v1 --arm tokens --seed 1 --out DIR --train --eval [--smoke]
 python -m experiments.geostate.run_v1_jobs [--dry] [--arm tokens] [--seed 1]
 python -m experiments.geostate.v1_report [--root DIR]
+```
+
+H4 — `v1_ood.py` re-rolls the protocol-B adapters on each pose condition
+(`configs.POSE_CONDITIONS`; poses built by E0's `transformed_problem`, ids
+kept so episodes pair across arms, seeds and conditions); `identity` must
+reproduce the saved V1 episodes, `rotate` separates "coordinates stop being
+integers" from "coordinates leave the range", `reflect` is ADR 0005's OOD
+condition, where the tokens are not invariant either. `run_v1_ood_jobs.py`
+freezes the conditions and submits 2 arms × 2 seeds (evaluation only).
+
+```bash
+python -m experiments.geostate.v1_ood --prepare --eval --arm tokens --seed 1 --smoke
+python -m experiments.geostate.run_v1_ood_jobs [--dry]
+python -m experiments.geostate.v1_ood --report
 ```
 
 ## Results
@@ -303,6 +327,26 @@ protocol (`7db7de275f91`, coincidence goals) is no longer the current code's
 (`65b7e70ea8ab`, predicate goals): a resubmission after token renewal starts a
 new protocol directory rather than resuming this one.
 
+2026-09-30, **E0 relaunched** under protocol `65b7e70ea8ab` (predicate goals)
+with a token valid to 2026-10-30. The 2026-09-24 runs queued Qwen3-8B first
+and never reached another model, so the roster is now ordered by what decides
+the gate: Qwen3.8-27B, Gpt-oss-120b, Google/Gemma-4-31B-it (an open model the
+endpoint began serving), Qwen3-8B last. Local smoke (one 3-move incidence
+problem, 8 copies): Qwen3.8-27B, Gpt-oss-120b and Gemma-4 8/8 correct,
+~51 s / 3 s / 5 s per request. Jobs (staged commit `d28040a4`):
+`e0-synthetic-text` `lm-mpi-job-d498cf6a-08d8-4f5b-8131-fb1e23515d3a`,
+`e0-aux-text` `lm-mpi-job-1b289181-1179-460d-86a7-26cc644916f2`; artifacts
+`e0-{synthetic,aux}-text-65b7e70ea8ab` under `configs.ARTIFACT_ROOT`.
+
+2026-09-30, **H4 smoke** (2 problems per bucket, tokens and table seed 1,
+real protocol-B adapters, local GPU): all six conditions build and roll out;
+the identity condition reproduces the saved V1 episodes move for move (6/6
+per arm), so the adapters load correctly under the current code (only the
+goal check changed since V1, and it is equivalent for coincidence goals).
+Of the 900 frozen problems, 11 no longer build under the generator's newer
+guards (10 name an unneeded construction, 1 is a one-move shortcut) and drop
+out of every condition.
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
@@ -348,6 +392,9 @@ H4 (out-of-distribution poses) or a stronger encoder.
 
 - 2026-09-30 — E0 read after the jobs ended: truncated at token expiry,
   Qwen3-8B only, rescored; H0 verdict withheld.
+- 2026-09-30 — token renewed; E0 relaunched with the decisive models first
+  (+ Gemma-4-31B-it); H4 added: `v1_ood.py` re-evaluates the V1 adapters
+  under six pose conditions, `run_v1_ood_jobs.py`, gate `H4_GATE`. 139 tests.
 
 - 2026-09-24 — deep interview (11 rounds, unattended after round 1) fixed the
   scope: construction problems as the unit, `experiments/geostate/` as the

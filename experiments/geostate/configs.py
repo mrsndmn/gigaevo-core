@@ -333,6 +333,80 @@ class V1Config:
 
 V1 = V1Config()
 
+# ---------------------------------------------------------------------------
+# H4: the trained V1 adapters under poses outside the training range
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PoseCondition:
+    """One family of poses applied to every frozen V1 evaluation problem.
+
+    The map is x -> scale * R(theta) (F x) + t: theta uniform when `rotate`,
+    F the x-axis reflection when `reflect`, t of length `translation` in a
+    uniform direction. Given coordinates are then rounded to two decimals and
+    the reference re-derived, exactly as E0 builds its copies.
+    """
+
+    name: str
+    rotate: bool = False
+    scale: float = 1.0
+    translation: float = 0.0
+    reflect: bool = False
+    # Outside the training range (given points on the integer grid in
+    # [-10, 10]): the conditions the H4 gate is read on.
+    far: bool = False
+
+
+POSE_CONDITIONS: tuple[PoseCondition, ...] = (
+    # control: must reproduce the saved V1 episodes (adapter loading check)
+    PoseCondition("identity"),
+    # in the group, near the training range; coordinates stop being integers
+    PoseCondition("rotate", rotate=True),
+    PoseCondition("translate-far", translation=100.0, far=True),  # ~10x the box
+    PoseCondition("scale-up", scale=10.0, far=True),
+    PoseCondition("scale-down", scale=0.2, far=True),
+    # ADR 0005's out-of-distribution condition: orientation flips, so the
+    # tokens' signed features change too — neither arm is invariant here
+    PoseCondition("reflect", rotate=True, reflect=True),
+)
+
+
+@dataclass(frozen=True)
+class H4Gate:
+    """Paired Δsuccess tokens − table on the long bucket, per far condition.
+
+    GO if any far condition shows a gain at/above `go_delta_pts` with its
+    bootstrap CI above zero; KILL if every far condition is at/below
+    `kill_delta_pts`; RECONSIDER otherwise. Same margins as H1, fixed before
+    the evaluation runs.
+    """
+
+    min_moves: int = 5
+    n_min: int = 300  # paired long problems per far condition, as H1's n_eval
+    go_delta_pts: float = 10.0
+    kill_delta_pts: float = 3.0
+
+
+H4_GATE = H4Gate()
+
+
+@dataclass(frozen=True)
+class V1OODConfig:
+    name: str = "v1-ood"
+    # The runs whose adapters are evaluated — V1 protocol B, the one H1 read —
+    # and the frozen evaluation set they were rolled out on.
+    source_protocol: str = "89abc7561426"
+    data_key: str = "0493e3e860"
+    conditions: tuple[PoseCondition, ...] = POSE_CONDITIONS
+    seed: int = 4000  # poses; per problem and condition, independent of order
+    max_attempts: int = 20  # re-draws of a random pose a problem rejects
+    smoke_per_bucket: int = 2
+    instance_type: str = "a100.1gpu"
+
+
+V1_OOD = V1OODConfig()
+
 experiment_configs: list[E0Config] = [
     E0Config(
         name="e0-synthetic-text",
