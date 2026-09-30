@@ -369,6 +369,17 @@ tolerances, buckets and rounding; identity must reproduce the saved V1
 episodes (≥ 0.95 same success per run) or the verdict is withheld; a torn
 `eval.jsonl` line no longer swallows the next record on resume.
 
+2026-09-30, **H4 launched** (ood hash `3fb8e5f67028`, staged commit
+`2466c314`; artifacts `v1-ood-3fb8e5f67028` under `configs.ARTIFACT_ROOT`).
+Conditions kept / rejected of 900: identity 889/11, rotate 883/17,
+translate-far 889/11, scale-up 889/11, scale-down 889/11, reflect 705/195.
+Jobs: tokens s1 `lm-mpi-job-ba36e901-1179-4fdf-8184-678714241d17`,
+tokens s2 `lm-mpi-job-ba349eee-f31d-4d6d-bd87-498e9af2ad97`,
+table s1 `lm-mpi-job-9614ef8e-502d-4624-b2bf-f96ca1576c44`,
+table s2 `lm-mpi-job-622ce9d6-f190-424e-8815-49727232976f`.
+Expected ~5 h each (~0.86 h per 900 rollouts in V1). Read with
+`python -m experiments.geostate.v1_ood --report`.
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
