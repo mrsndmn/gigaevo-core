@@ -109,6 +109,34 @@ def test_unbuildable_pose_is_rejected_not_kept(tmp_path):
     assert info["conditions"]["tiny"]["kept"] == 0
 
 
+def test_a_pose_that_changes_the_construction_is_rejected(monkeypatch):
+    from experiments.geostate import consistency
+
+    problem = next(p for p in generate(seed=7, per_bucket=2) if p.n_moves >= 3)
+    rotate = PoseCondition("r", rotate=True)
+    reflect = PoseCondition("f", rotate=True, reflect=True)
+    real = consistency.transformed_problem
+    assert v1_ood.pose_problem(problem, rotate, CFG) is not None
+
+    # rounding broke a coincidence: the reference is now longer
+    def longer(p, g, perm, tol, index):
+        return replace(real(p, g, perm, tol, index), n_moves=p.n_moves + 1)
+
+    monkeypatch.setattr(consistency, "transformed_problem", longer)
+    assert v1_ood.pose_problem(problem, rotate, CFG) is None
+    assert v1_ood.pose_problem(problem, reflect, CFG) is None
+
+    # same length, other moves: rejected unless the pose reflects (a
+    # reflection swaps which point of an intersection pair a move names)
+    def reordered(p, g, perm, tol, index):
+        copy = real(p, g, perm, tol, index)
+        return replace(copy, trajectory=list(reversed(copy.trajectory)))
+
+    monkeypatch.setattr(consistency, "transformed_problem", reordered)
+    assert v1_ood.pose_problem(problem, rotate, CFG) is None
+    assert v1_ood.pose_problem(problem, reflect, CFG) is not None
+
+
 @pytest.mark.timeout(300)
 def test_tiny_model_evaluates_every_condition_and_resumes(tmp_path):
     torch = pytest.importorskip("torch")
@@ -188,7 +216,7 @@ def _fake(out, cfg, success, n=40, incomplete=(), source=None):
                     (saved / "eval.jsonl").write_text((d / "eval.jsonl").read_text())
 
 
-def test_report_gates_on_robustness_not_on_the_absolute_gap(tmp_path, monkeypatch):
+def test_report_gates_on_retention_not_on_the_gap_or_raw_drops(tmp_path, monkeypatch):
     monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10))
     arms = (ARM_TOKENS, ARM_TABLE)
     src = tmp_path / "v1"
@@ -197,7 +225,7 @@ def test_report_gates_on_robustness_not_on_the_absolute_gap(tmp_path, monkeypatc
         _fake(tmp_path / name, CFG, success, source=src / name, **kw)
         return v1_ood.report(CFG, tmp_path / name, src / name, seeds=(1, 2))
 
-    # H1's situation: the table leads at identity; both arms equally robust
+    # H1's situation: the table leads at identity; nothing moves under poses
     gap = {
         (c.name, a): 0.9 if a == ARM_TABLE else 0.7
         for c in CFG.conditions
@@ -206,18 +234,34 @@ def test_report_gates_on_robustness_not_on_the_absolute_gap(tmp_path, monkeypatc
     payload, text = run("gap", gap)
     assert payload["gate"]["far"] == ["translate-far", "scale-up"]
     assert payload["deltas"]["identity"]["delta_pts"] < -15  # absolute gap reported
-    assert payload["robustness"]["scale-up"]["delta_pts"] == pytest.approx(0.0)
+    r = payload["robustness"]["scale-up"]
+    assert r["retention_tokens"] == r["retention_table"] == 1.0
+    assert r["delta_pts"] == pytest.approx(0.0)
     assert payload["gate"]["verdict"] == "KILL"
-    # the table drops to the tokens' level on a far pose, the tokens do not
-    # move: the absolute gap closes to zero, robustness is +20 -> GO
+    # the tokens hold, the table loses problems both used to solve -> GO
     drop = dict(gap)
-    drop[("translate-far", ARM_TABLE)] = 0.7
+    drop[("translate-far", ARM_TABLE)] = 0.4
     payload, text = run("drop", drop)
-    assert payload["deltas"]["translate-far"]["delta_pts"] == pytest.approx(0.0)
-    assert payload["robustness"]["translate-far"]["delta_pts"] > 10
-    assert payload["robustness"]["translate-far"]["ci_pts"][0] > 0
+    r = payload["robustness"]["translate-far"]
+    assert r["retention_tokens"] == 1.0 and r["retention_table"] < 0.7
+    assert r["delta_pts"] > 10 and r["ci_pts"][0] > 0
     assert payload["gate"]["verdict"] == "GO" and "translate-far" in text
-    assert payload["rows"]["translate-far/table"]["vs_identity"]["delta_pts"] < -15
+    # the table drops only on problems the tokens never solved: no GO
+    closes = dict(gap)
+    closes[("translate-far", ARM_TABLE)] = 0.7
+    payload, _ = run("closes", closes)
+    assert payload["deltas"]["translate-far"]["delta_pts"] == pytest.approx(0.0)
+    assert payload["robustness"]["translate-far"]["delta_pts"] == pytest.approx(0.0)
+    assert payload["gate"]["verdict"] == "KILL"
+    # both arms collapse (proportionally, or to zero): raw point drops would
+    # read a tokens win because the gap narrows; retention does not
+    for name, tok, tab in (("prop", 0.3, 0.4), ("zero", 0.0, 0.0)):
+        both = dict(gap)
+        both[("scale-up", ARM_TOKENS)] = tok
+        both[("scale-up", ARM_TABLE)] = tab
+        payload, _ = run(name, both)
+        assert payload["robustness"]["scale-up"]["delta_pts"] <= 0, name
+        assert payload["gate"]["verdict"] == "KILL", name
     # a drop on a reported-only condition (scale-down: print precision) or on
     # reflect does not count
     near = dict(gap)
@@ -227,21 +271,21 @@ def test_report_gates_on_robustness_not_on_the_absolute_gap(tmp_path, monkeypatc
     assert payload["robustness"]["scale-down"]["delta_pts"] > 10
     assert payload["gate"]["verdict"] == "KILL"
     # tokens more robust, but between the margins -> RECONSIDER (the fake's
-    # rates step by 10 pts, so the go margin is raised to leave room)
+    # rates are coarse, so the go margin is raised to leave room)
     mid = dict(gap)
-    mid[("scale-up", ARM_TABLE)] = 0.8
+    mid[("scale-up", ARM_TABLE)] = 0.6
     monkeypatch.setattr(
-        v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10, go_delta_pts=15.0)
+        v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10, go_delta_pts=30.0)
     )
     payload, _ = run("mid", mid)
-    assert payload["robustness"]["scale-up"]["delta_pts"] == pytest.approx(10.0)
+    assert 3 < payload["robustness"]["scale-up"]["delta_pts"] < 30
     assert payload["gate"]["verdict"] == "RECONSIDER"
     monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10))
     # an incomplete run withholds the verdict but keeps the numbers
     payload, text = run("part", drop, incomplete={(ARM_TABLE, 2, "rotate")})
     assert payload["gate"]["verdict"] == "withheld" and "table/s2/rotate" in text
     assert payload["robustness"]["translate-far"]["delta_pts"] > 10
-    # too few paired long problems withholds too
+    # too few commonly solved long problems withholds too
     monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=1000))
     payload, text = v1_ood.report(CFG, tmp_path / "drop", src / "drop", seeds=(1, 2))
     assert payload["gate"]["verdict"] == "withheld" and "fewer than 1000" in text
@@ -276,6 +320,13 @@ def test_identity_must_reproduce_the_saved_v1_episodes(tmp_path, monkeypatch):
     payload, text = v1_ood.report(CFG, tmp_path / "out", root, seeds=(1, 2))
     assert payload["gate"]["verdict"] == "withheld"
     assert payload["gate"]["unreproduced"] == ["tokens/s1"] and "reproduce" in text
+    # a truncated saved file agrees on what it holds, but covers too little
+    saved_path.write_text("".join(json.dumps(e) + "\n" for e in episodes[3:13]))
+    payload, text = v1_ood.report(CFG, tmp_path / "out", root, seeds=(1, 2))
+    r = payload["reproduction"]["tokens/s1"]
+    assert r["n"] == 10 and r["n_fresh"] == 40 and r["same_success"] == 1.0
+    assert payload["gate"]["unreproduced"] == ["tokens/s1"]
+    assert payload["gate"]["verdict"] == "withheld"
     # no saved episodes at all (or no source root) withholds as well
     payload, _ = v1_ood.report(CFG, tmp_path / "out", None, seeds=(1, 2))
     assert payload["gate"]["verdict"] == "withheld"

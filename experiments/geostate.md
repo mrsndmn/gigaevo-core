@@ -38,9 +38,12 @@ gates are constants in `configs.py`):
   moved outside the training range (translated by 100, scaled ×10): in both
   arms the prompt's given coordinates leave the range the LoRA saw; in the
   table arm every state row does too, while the tokens arm's state blocks do
-  not move. The statistic is robustness, paired per problem: the tokens
-  arm's drop from identity minus the table arm's drop — not the absolute gap,
-  which starts ~19 pts in the table's favour. H4 holds if on some far
+  not move. The statistic is retention on a common solved set, paired per
+  problem: of the long problems both arms solve at identity in every seed,
+  the share the tokens arm still solves under the pose minus the share the
+  table arm does — not the absolute gap (it starts ~19 pts in the table's
+  favour) and not raw point drops (they credit the tokens whenever the gap
+  narrows, including when both arms collapse). H4 holds if on some far
   condition the tokens are more robust by at least the go margin with CI
   above zero; it is dead if every far condition is at/below the kill margin
   (`configs.H4_GATE`, the same margins as H1); withheld if identity does not
@@ -153,8 +156,10 @@ python -m experiments.geostate.v1_report [--root DIR]
 H4 — `v1_ood.py` re-rolls the protocol-B adapters on each pose condition
 (`configs.POSE_CONDITIONS`; poses built by E0's `transformed_problem`, ids
 kept so episodes pair across arms, seeds and conditions); `identity` must
-reproduce the saved V1 episodes, `rotate` separates "coordinates stop being
-integers" from "coordinates leave the range", `scale-down` keeps the given
+reproduce the saved V1 episodes, `rotate` makes coordinates non-integer at
+about the training magnitude (458 of 883 rotated problems have a given point
+just outside [-10, 10], up to ±14.1 — a near control, not a clean in-range
+one), `scale-down` keeps the given
 points inside the box (reported, not gated: the table's fixed 2-decimal
 print loses precision there), `reflect` is ADR 0005's OOD condition, where
 the tokens are not invariant either. A posed problem that is no longer the
@@ -364,7 +369,9 @@ read KILL even with the tokens untouched and the table losing 20 pts, since
 the table leads by ~19 at identity — the gate now reads paired robustness;
 scale-down moved out of the gate (inside the box, print-precision confound);
 13 rotated and 5 reflected problems became different constructions after
-rounding (e.g. 3 → 20 moves) and are now rejected; the ood hash covers the
+rounding (e.g. 3 → 20 moves) — posed problems must now be the same
+construction; retries re-pose 6 and 2 of them, so rotate ends 6 problems
+short of identity (3 long) and reflect 2 more; the ood hash covers the
 tolerances, buckets and rounding; identity must reproduce the saved V1
 episodes (≥ 0.95 same success per run) or the verdict is withheld; a torn
 `eval.jsonl` line no longer swallows the next record on resume.
@@ -379,6 +386,17 @@ table s1 `lm-mpi-job-9614ef8e-502d-4624-b2bf-f96ca1576c44`,
 table s2 `lm-mpi-job-622ce9d6-f190-424e-8815-49727232976f`.
 Expected ~5 h each (~0.86 h per 900 rollouts in V1). Read with
 `python -m experiments.geostate.v1_ood --report`.
+
+2026-09-30, **H4 gate, second review pass** (report-only; the running jobs,
+their frozen conditions and the ood hash are unchanged, and only identity
+episodes existed — about 330 per run, all reproducing V1 move for move): the
+first fix gated on raw drops, (tokens − tokens@identity) − (table −
+table@identity), which is the far gap minus the identity gap — so any pose
+that narrows the gap reads as tokens robustness, including both arms
+collapsing (equal 52% proportional losses would read GO). The gate now reads
+retention on the 327 long problems both arms solve at identity in every seed
+(`H4_GATE` docstring). Identity reproduction also requires every fresh
+episode to have a saved counterpart.
 
 ## Conclusions
 
@@ -429,7 +447,8 @@ H4 (out-of-distribution poses) or a stronger encoder.
   (+ Gemma-4-31B-it); H4 added: `v1_ood.py` re-evaluates the V1 adapters
   under six pose conditions, `run_v1_ood_jobs.py`, gate `H4_GATE`; review
   pass before launch: robustness gate, same-construction check, reproduction
-  gate, hash coverage, torn-line resume. 139 tests.
+  gate, hash coverage, torn-line resume; second pass: retention on the common
+  solved set instead of raw drops, reproduction coverage. 140 tests.
 
 - 2026-09-24 — deep interview (11 rounds, unattended after round 1) fixed the
   scope: construction problems as the unit, `experiments/geostate/` as the

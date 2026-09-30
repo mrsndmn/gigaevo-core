@@ -17,7 +17,9 @@ What moves under a far pose: in *both* arms the prompt's given coordinates
 arm's state blocks are invariant (features match to float precision). H4 is
 therefore about robustness: the gate reads the paired per-problem *drop* of
 each arm from identity to a far condition, tokens drop minus table drop, not
-the absolute gap (which starts ~19 pts in the table's favour).
+the absolute gap (which starts ~19 pts in the table's favour): on the long
+problems both arms solve at identity in every seed, the share each still
+solves under the pose, tokens − table.
 
 Each condition keeps the original problem ids, so episodes pair across arms,
 seeds and conditions by id. A problem a condition cannot build (a pose the
@@ -428,6 +430,7 @@ def reproduction(
         return None
     return {
         "n": len(ids),
+        "n_fresh": len(fresh),
         "same_moves": float(
             np.mean([saved[i]["moves"] == fresh[i]["moves"] for i in ids])
         ),
@@ -527,34 +530,39 @@ def report(
             )
         else:
             lines.append(f"- {cond.name}{tag}: no paired episodes")
-    # Robustness, what the gate reads: per problem, how much less the tokens
-    # arm drops from identity than the table arm does (positive = tokens more
-    # robust). Paired over problems present in all four cells.
+    # Robustness, what the gate reads: on the long problems *both* arms solve
+    # at identity in every seed, the share each arm still solves under the
+    # pose — tokens − table, paired per problem. A common solved set makes the
+    # two drops comparable: raw point drops would credit the tokens whenever
+    # the gap narrows, including when both arms collapse (the table starts
+    # ~19 pts ahead, so equal proportional losses would read as a tokens win).
+    tok_id = per_problem.get(("identity", ARM_TOKENS), {})
+    tab_id = per_problem.get(("identity", ARM_TABLE), {})
+    solved = {i for i in set(tok_id) & set(tab_id) if tok_id[i] == tab_id[i] == 1.0}
     lines.append("")
     lines.append(
-        f"Robustness on {long_name}: (tokens − tokens@identity) − "
-        "(table − table@identity), paired per problem:"
+        f"Robustness on {long_name}: of the {len(solved)} long problems both arms "
+        "solve at identity in every seed, the share still solved under the pose "
+        "(retention), tokens − table, paired per problem:"
     )
     lines.append("")
     robust: dict[str, Any] = {}
-    tok_id = per_problem.get(("identity", ARM_TOKENS), {})
-    tab_id = per_problem.get(("identity", ARM_TABLE), {})
     for cond in cfg.conditions:
         if cond.name == "identity":
             continue
         tok = per_problem.get((cond.name, ARM_TOKENS), {})
         tab = per_problem.get((cond.name, ARM_TABLE), {})
-        ids = set(tok) & set(tab) & set(tok_id) & set(tab_id)
-        r = _paired_delta(
-            {i: tok[i] - tok_id[i] for i in ids},
-            {i: tab[i] - tab_id[i] for i in ids},
-            rng,
-        )
+        ids = solved & set(tok) & set(tab)
+        r = _paired_delta({i: tok[i] for i in ids}, {i: tab[i] for i in ids}, rng)
+        if r:
+            r["retention_tokens"] = float(np.mean([tok[i] for i in ids]))
+            r["retention_table"] = float(np.mean([tab[i] for i in ids]))
         robust[cond.name] = r
         tag = " (far, gated)" if cond.far else ""
         if r:
             lines.append(
-                f"- {cond.name}{tag}: {r['delta_pts']:+.1f} pts, CI95 "
+                f"- {cond.name}{tag}: retention tokens {r['retention_tokens']:.3f}, "
+                f"table {r['retention_table']:.3f}; {r['delta_pts']:+.1f} pts, CI95 "
                 f"[{r['ci_pts'][0]:+.1f}, {r['ci_pts'][1]:+.1f}] ({r['n']} problems)"
             )
         else:
@@ -573,16 +581,21 @@ def report(
             repro[f"{arm}/s{s}"] = r
             if r:
                 lines.append(
-                    f"- {arm}/s{s}: {r['n']} problems, same moves {r['same_moves']:.3f}, "
+                    f"- {arm}/s{s}: {r['n']} of {r['n_fresh']} problems, "
+                    f"same moves {r['same_moves']:.3f}, "
                     f"same success {r['same_success']:.3f} (success saved "
                     f"{r['success_saved']:.3f}, now {r['success_fresh']:.3f})"
                 )
             else:
                 lines.append(f"- {arm}/s{s}: no saved or no fresh identity episodes")
+    # every fresh identity episode must have a saved counterpart: a truncated
+    # saved file would otherwise pass on the few episodes it still holds
     unreproduced = [
         k
         for k, r in repro.items()
-        if r is None or r["same_success"] < H4_GATE.min_reproduction
+        if r is None
+        or r["n"] < r["n_fresh"]
+        or r["same_success"] < H4_GATE.min_reproduction
     ]
     # gate
     missing = [

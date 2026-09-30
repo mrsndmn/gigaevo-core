@@ -379,16 +379,19 @@ POSE_CONDITIONS: tuple[PoseCondition, ...] = (
 class H4Gate:
     """Robustness on the long bucket, per far condition, paired per problem.
 
-    The statistic is (tokens − tokens at identity) − (table − table at
-    identity): how much less the tokens arm drops than the table arm when the
-    pose leaves the training range. Not the absolute tokens − table gap — at
-    identity the table already leads by ~19 pts (H1), so a gate on the gap
-    would read KILL even if the table collapsed and the tokens did not move.
+    The statistic is retention on a common solved set: over the long problems
+    both arms solve at identity in every seed, the share the tokens arm still
+    solves under the pose minus the share the table arm does. Not the
+    absolute tokens − table gap — the table leads by ~19 pts at identity (H1),
+    so that gate would read KILL even if the table collapsed and the tokens
+    did not move — and not raw point drops, which credit the tokens whenever
+    the gap narrows, including when both arms collapse proportionally.
     GO if any far condition shows at least `go_delta_pts` with its bootstrap
     CI above zero; KILL if every far condition is at/below `kill_delta_pts`;
-    RECONSIDER otherwise. Same margins as H1. Withheld unless every run is
-    complete and identity reproduces the saved V1 episodes. Fixed before any
-    out-of-distribution episode exists (2026-09-30).
+    RECONSIDER otherwise. Same margins as H1; `n_min` counts the common solved
+    set (327 long problems in V1 protocol B). Withheld unless every run is
+    complete and identity reproduces every saved V1 episode. Fixed 2026-09-30
+    while only identity episodes existed (two review passes).
     """
 
     min_moves: int = 5
