@@ -213,14 +213,25 @@ SET_AUX = "aux"
 # text-only) and the two Medgemmas. `consistency.run` lists the served models
 # at start and skips absent ones, so a config may name a model that is not
 # there today and pick it up on a later run.
-MODEL_QWEN38 = "Qwen/Qwen3.8-27B"  # the only figure-reading VLM; absent now
+MODEL_QWEN38 = "Qwen/Qwen3.8-27B"  # figure-reading VLM; served again 2026-09-30
 MODEL_QWEN3_8B = "Qwen/Qwen3-8B"
 MODEL_GPTOSS = "Openai/Gpt-oss-120b"  # text-only: a blind control on the figure arm
+MODEL_GEMMA4 = "Google/Gemma-4-31B-it"  # open-weight, first served 2026-09-30
 MODEL_QWEN35 = "Qwen/Qwen3.5-27B"  # absent since 2026-09-24
 MODEL_QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"  # absent since 2026-09-24
 # Google/Medgemma-27b-it is excluded from the figure arm: `noregeo-vlm-eval.md`
 # established that it cannot read the rendered figure.
-TEXT_MODELS: tuple[str, ...] = (MODEL_QWEN3_8B, MODEL_GPTOSS, MODEL_QWEN38)
+# Order is the request order: `consistency.run` queues every copy of the first
+# model before the second. The H0 gate reads the best open model, so the
+# likely strongest go first and Qwen3-8B (16k-token thinking, ~6x slower) goes
+# last — in the 2026-09-24 runs it went first and the token expired before any
+# other model was reached.
+TEXT_MODELS: tuple[str, ...] = (
+    MODEL_QWEN38,
+    MODEL_GPTOSS,
+    MODEL_GEMMA4,
+    MODEL_QWEN3_8B,
+)
 
 
 @dataclass(frozen=True)
