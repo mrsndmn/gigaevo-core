@@ -411,6 +411,38 @@ incircle/circumcircle stems (median 10k completion tokens, ~12 min per
 request — per-request decoding halves at 32 in flight, total throughput per
 job roughly doubles).
 
+2026-10-01 00:17, **H4 finished — KILL.** All four eval-only jobs completed
+(5144 rollouts each). Identity reproduces the saved V1 episodes on 889 of 889
+problems per run, move for move, so these are H1's models. Report:
+`v1_ood --report` → `v1-ood-3fb8e5f67028/report.md`.
+
+| condition | tokens success ≥5 | table success ≥5 | tokens − table (abs) | retention tokens | retention table | robustness [CI95] |
+|---|---|---|---|---|---|---|
+| identity | 0.708 | 0.902 | −19.4 | — | — | — |
+| rotate | 0.710 | 0.910 | −20.0 | 0.988 | 0.998 | −1.1 [−2.0, −0.3] |
+| translate-far (gated) | 0.706 | 0.898 | −19.2 | 0.991 | 0.995 | −0.5 [−1.4, +0.3] |
+| scale-up (gated) | 0.710 | 0.908 | −19.8 | 0.992 | 0.998 | −0.6 [−1.4, +0.0] |
+| scale-down | 0.708 | 0.907 | −19.9 | 0.986 | 0.998 | −1.2 [−2.3, −0.3] |
+| reflect | 0.682 | 0.915 | −23.3 | 0.880 | 1.000 | −12.0 [−16.1, −7.9] |
+
+Retention is over the 327 long problems both arms solve at identity in every
+seed (208 for reflect). The premise of H4 does not hold: the raw-coordinate
+table does *not* break when the figure is moved 100 units away or scaled ×10
+— it keeps 99.5–99.8% of what it solved — so there is no fragility for the
+invariant state to fix. Neither arm moves under similarities (all Δ vs
+identity within ±1 pt). Under reflection, the one transform that changes the
+tokens (signed features flip), the tokens arm loses 12% of its solved
+problems and the table loses none: the text coordinates carry orientation
+through a mirror better than the learned encoder does.
+
+2026-10-01 00:20, **E0 interim** (Qwen3.8-27B only so far, 16 workers, no
+request errors; read in memory, the job's files untouched): synthetic 914 of
+2393 copies — 1-3 moves consistency 0.989 [0.978, 0.998] (Qwen3-8B had
+0.627), ≥5 moves only 12 problems yet (answered 0.72: long problems often
+exhaust the 16k budget, which would withhold the gate on the applicability
+condition); aux ≥5 moves (130 of 442 problems) consistency 0.957 [0.935,
+0.977], above the 0.95 kill level on the auxiliary set (not gated).
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
@@ -426,11 +458,21 @@ poses this probe tests, coordinates are simply more information. The spec's
 remaining argument for tokens is out-of-distribution poses (H4) and token
 economy (H3) — H3 is confirmed (−38% tokens), H4 is untested here.
 
-E0 (H0) has no verdict: the runs stopped at token expiry with Qwen3-8B only.
-What the partial data does show — Qwen3-8B disagrees with itself on 37% of
-copy pairs of 1-3-move problems and 20% on long NoReGeo constructions —
-supports the motivation, but the gate reads the best open model, which is
-unmeasured.
+**H4 is killed too (2026-10-01):** the trained text-table baseline is
+already pose-robust — moved 100 units or scaled ×10 it keeps 99.5–99.8% of
+its solved long problems, the tokens arm 99.1–99.2% — so the out-of-range
+fragility the invariant state was meant to remove does not exist for a
+LoRA-tuned Qwen3-1.7B reading 2-decimal coordinates; under reflection the
+tokens are the fragile arm (−12% retention vs 0%). With H1 and H4 both
+negative, the state-token design has no measured advantage left except token
+economy (H3, −38%), bought at −19 pts of success.
+
+E0 (H0) is still running. Qwen3-8B (2026-09-24) was inconsistent — 37% of copy
+pairs disagree on 1-3-move problems — but the stronger Qwen3.8-27B is
+consistent at 0.989 on short synthetic problems and 0.957 on long NoReGeo
+constructions so far, which points towards H0 being killed by the best open
+model once its long synthetic bucket completes (or withheld, if too many long
+copies exhaust the token budget).
 
 Deviations from the interview spec, recorded rather than hidden: no
 `geostate` extra was needed because the kernel is numpy-only and analytic
@@ -444,18 +486,21 @@ but whatever open text models the endpoint serves — today Qwen3-8B and
 Gpt-oss-120b — because the endpoint removed the others (E0 constraints).
 While Qwen3.8-27B is absent the figure arm cannot run at all.
 
-Next: (1) after token renewal, rerun E0 (new protocol) on Qwen3.8-27B and
-Gpt-oss-120b first — only the best open model decides H0; (2) apply the
-go/no-go rule from the interview spec — both probes negative ⇒ stop; either
-positive ⇒ extract the package into its own repository as the first post-go
-task (ADR 0004). With H1 killed, H0 alone can only justify the motivation,
-not the state-token design; the design survives only through the untested
-H4 (out-of-distribution poses) or a stronger encoder.
+Next: (1) let E0 finish and read the gate (`consistency --summary` on the
+`-65b7e70ea8ab` directories); (2) apply the go/no-go rule from the interview
+spec — with H1 and H4 negative, only a positive H0 keeps anything alive, and
+H0 alone justifies the motivation, not the state-token design. The one
+untested rescue is a stronger encoder (E2 ablations: more epochs, pretrained
+or CGENN-style), which would now have to beat a baseline that is both more
+accurate and already pose-robust.
 
 ## Changelog
 
 - 2026-09-30 — E0 read after the jobs ended: truncated at token expiry,
   Qwen3-8B only, rescored; H0 verdict withheld.
+- 2026-10-01 — H4 KILL: the text table is pose-robust (retention ≥ 99.5% under
+  translate ×100 / scale ×10), tokens lose 12% under reflection; E0 interim:
+  Qwen3.8-27B consistency 0.989 (short synthetic), 0.957 (long aux).
 - 2026-09-30 — token renewed; E0 relaunched with the decisive models first
   (+ Gemma-4-31B-it); H4 added: `v1_ood.py` re-evaluates the V1 adapters
   under six pose conditions, `run_v1_ood_jobs.py`, gate `H4_GATE`; review
