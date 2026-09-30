@@ -353,7 +353,7 @@ class PoseCondition:
     scale: float = 1.0
     translation: float = 0.0
     reflect: bool = False
-    # Outside the training range (given points on the integer grid in
+    # Given coordinates outside the training range (integer grid in
     # [-10, 10]): the conditions the H4 gate is read on.
     far: bool = False
 
@@ -365,7 +365,10 @@ POSE_CONDITIONS: tuple[PoseCondition, ...] = (
     PoseCondition("rotate", rotate=True),
     PoseCondition("translate-far", translation=100.0, far=True),  # ~10x the box
     PoseCondition("scale-up", scale=10.0, far=True),
-    PoseCondition("scale-down", scale=0.2, far=True),
+    # Reported, not gated: the given points stay inside the box, only the
+    # figure shrinks — and the table prints at a fixed two decimals, so a drop
+    # here partly measures print precision, not pose.
+    PoseCondition("scale-down", scale=0.2),
     # ADR 0005's out-of-distribution condition: orientation flips, so the
     # tokens' signed features change too — neither arm is invariant here
     PoseCondition("reflect", rotate=True, reflect=True),
@@ -374,18 +377,26 @@ POSE_CONDITIONS: tuple[PoseCondition, ...] = (
 
 @dataclass(frozen=True)
 class H4Gate:
-    """Paired Δsuccess tokens − table on the long bucket, per far condition.
+    """Robustness on the long bucket, per far condition, paired per problem.
 
-    GO if any far condition shows a gain at/above `go_delta_pts` with its
-    bootstrap CI above zero; KILL if every far condition is at/below
-    `kill_delta_pts`; RECONSIDER otherwise. Same margins as H1, fixed before
-    the evaluation runs.
+    The statistic is (tokens − tokens at identity) − (table − table at
+    identity): how much less the tokens arm drops than the table arm when the
+    pose leaves the training range. Not the absolute tokens − table gap — at
+    identity the table already leads by ~19 pts (H1), so a gate on the gap
+    would read KILL even if the table collapsed and the tokens did not move.
+    GO if any far condition shows at least `go_delta_pts` with its bootstrap
+    CI above zero; KILL if every far condition is at/below `kill_delta_pts`;
+    RECONSIDER otherwise. Same margins as H1. Withheld unless every run is
+    complete and identity reproduces the saved V1 episodes. Fixed before any
+    out-of-distribution episode exists (2026-09-30).
     """
 
     min_moves: int = 5
     n_min: int = 300  # paired long problems per far condition, as H1's n_eval
     go_delta_pts: float = 10.0
     kill_delta_pts: float = 3.0
+    # identity episodes whose success matches the saved V1 episode, per run
+    min_reproduction: float = 0.95
 
 
 H4_GATE = H4Gate()

@@ -49,10 +49,15 @@ def test_conditions_keep_ids_and_apply_their_pose(tmp_path):
         counts = info["conditions"][name]
         assert counts["kept"] == len(posed)
         assert counts["kept"] + counts["rejected"] == len(problems)
+        reflect = next(c for c in CFG.conditions if c.name == name).reflect
         for p in posed:
             original = by_id[p.id]  # ids are the originals: episodes pair by id
             assert p.meta["condition"] == name
             assert p.n_moves == original.n_moves and p.bucket == original.bucket
+            if not reflect:  # the same construction, not an easier/harder one
+                assert [m.to_dict() for m in p.trajectory] == [
+                    m.to_dict() for m in original.trajectory
+                ]
     # identity rebuilds the frozen problems exactly
     for p in loaded["identity"]:
         a, b = p.to_dict(), by_id[p.id].to_dict()
@@ -126,14 +131,25 @@ def test_tiny_model_evaluates_every_condition_and_resumes(tmp_path):
         assert len(lines) == result["conditions"][name]["n"] > 0
     # a second call resumes: no episode is appended twice
     v1_ood.evaluate_run(cfg, ARM_TOKENS, 1, out, root, model=model)
-    lines = (out / "tokens-s1" / "identity" / "eval.jsonl").read_text().splitlines()
+    path = out / "tokens-s1" / "identity" / "eval.jsonl"
+    lines = path.read_text().splitlines()
     assert len(lines) == result["conditions"]["identity"]["n"]
+    # a job killed mid-write leaves a torn last line: the rerun re-rolls that
+    # episode on a fresh line instead of gluing it onto the fragment
+    path.write_text("\n".join(lines[:-1]) + "\n" + lines[-1][:20])
+    v1_ood.evaluate_run(cfg, ARM_TOKENS, 1, out, root, model=model)
+    episodes = v1_ood._read_episodes(path)
+    assert len({e["problem_id"] for e in episodes}) == len(lines)
     with pytest.raises(ValueError, match="arm"):
         v1_ood.evaluate_run(cfg, ARM_TABLE, 1, out, root, model=model)
 
 
-def _fake(out, cfg, success, n=40, incomplete=()):
-    """success[(cond, arm)] -> rate on long problems; short ones always succeed."""
+def _fake(out, cfg, success, n=40, incomplete=(), source=None):
+    """success[(cond, arm)] -> rate on long problems; short ones always succeed.
+
+    With `source`, the identity episodes are also written as the saved V1
+    episodes of each arm x seed, so identity reproduces them exactly.
+    """
     conds = {
         c.name: {"kept": n, "rejected": 0, "rejected_ids": []} for c in cfg.conditions
     }
@@ -166,58 +182,103 @@ def _fake(out, cfg, success, n=40, incomplete=()):
                             + "\n"
                         )
                 (d / "metrics.json").write_text("{}")
+                if source is not None and c.name == "identity":
+                    saved = v1_ood.source_dir(cfg, source, arm, seed)
+                    saved.mkdir(parents=True, exist_ok=True)
+                    (saved / "eval.jsonl").write_text((d / "eval.jsonl").read_text())
 
 
-def test_report_reads_the_gate_on_far_conditions(tmp_path, monkeypatch):
+def test_report_gates_on_robustness_not_on_the_absolute_gap(tmp_path, monkeypatch):
     monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10))
     arms = (ARM_TOKENS, ARM_TABLE)
-    flat = {(c.name, a): 0.8 for c in CFG.conditions for a in arms}
-    _fake(tmp_path / "flat", CFG, flat)
-    payload, text = v1_ood.report(CFG, tmp_path / "flat", seeds=(1, 2))
+    src = tmp_path / "v1"
+
+    def run(name, success, **kw):
+        _fake(tmp_path / name, CFG, success, source=src / name, **kw)
+        return v1_ood.report(CFG, tmp_path / name, src / name, seeds=(1, 2))
+
+    # H1's situation: the table leads at identity; both arms equally robust
+    gap = {
+        (c.name, a): 0.9 if a == ARM_TABLE else 0.7
+        for c in CFG.conditions
+        for a in arms
+    }
+    payload, text = run("gap", gap)
+    assert payload["gate"]["far"] == ["translate-far", "scale-up"]
+    assert payload["deltas"]["identity"]["delta_pts"] < -15  # absolute gap reported
+    assert payload["robustness"]["scale-up"]["delta_pts"] == pytest.approx(0.0)
     assert payload["gate"]["verdict"] == "KILL"
-    assert payload["gate"]["far"] == ["translate-far", "scale-up", "scale-down"]
-    assert payload["deltas"]["scale-up"]["delta_pts"] == pytest.approx(0.0)
-    # the table collapses on one far condition only: tokens win there -> GO
-    broken = dict(flat)
-    broken[("scale-up", ARM_TABLE)] = 0.2
-    _fake(tmp_path / "go", CFG, broken)
-    payload, text = v1_ood.report(CFG, tmp_path / "go", seeds=(1, 2))
-    assert payload["gate"]["verdict"] == "GO" and "scale-up" in text
-    assert payload["rows"]["scale-up/table"]["vs_identity"]["delta_pts"] < -40
-    assert payload["rows"]["scale-up/tokens"]["vs_identity"]["delta_pts"] == 0
-    # a gain on a non-far condition does not count
-    near = dict(flat)
+    # the table drops to the tokens' level on a far pose, the tokens do not
+    # move: the absolute gap closes to zero, robustness is +20 -> GO
+    drop = dict(gap)
+    drop[("translate-far", ARM_TABLE)] = 0.7
+    payload, text = run("drop", drop)
+    assert payload["deltas"]["translate-far"]["delta_pts"] == pytest.approx(0.0)
+    assert payload["robustness"]["translate-far"]["delta_pts"] > 10
+    assert payload["robustness"]["translate-far"]["ci_pts"][0] > 0
+    assert payload["gate"]["verdict"] == "GO" and "translate-far" in text
+    assert payload["rows"]["translate-far/table"]["vs_identity"]["delta_pts"] < -15
+    # a drop on a reported-only condition (scale-down: print precision) or on
+    # reflect does not count
+    near = dict(gap)
+    near[("scale-down", ARM_TABLE)] = 0.2
     near[("reflect", ARM_TABLE)] = 0.2
-    _fake(tmp_path / "near", CFG, near)
-    payload, _ = v1_ood.report(CFG, tmp_path / "near", seeds=(1, 2))
+    payload, _ = run("near", near)
+    assert payload["robustness"]["scale-down"]["delta_pts"] > 10
     assert payload["gate"]["verdict"] == "KILL"
+    # tokens more robust, but between the margins -> RECONSIDER (the fake's
+    # rates step by 10 pts, so the go margin is raised to leave room)
+    mid = dict(gap)
+    mid[("scale-up", ARM_TABLE)] = 0.8
+    monkeypatch.setattr(
+        v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10, go_delta_pts=15.0)
+    )
+    payload, _ = run("mid", mid)
+    assert payload["robustness"]["scale-up"]["delta_pts"] == pytest.approx(10.0)
+    assert payload["gate"]["verdict"] == "RECONSIDER"
+    monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10))
     # an incomplete run withholds the verdict but keeps the numbers
-    _fake(tmp_path / "part", CFG, broken, incomplete={(ARM_TABLE, 2, "rotate")})
-    payload, text = v1_ood.report(CFG, tmp_path / "part", seeds=(1, 2))
+    payload, text = run("part", drop, incomplete={(ARM_TABLE, 2, "rotate")})
     assert payload["gate"]["verdict"] == "withheld" and "table/s2/rotate" in text
-    assert payload["deltas"]["scale-up"]["delta_pts"] > 10
+    assert payload["robustness"]["translate-far"]["delta_pts"] > 10
     # too few paired long problems withholds too
     monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=1000))
-    payload, text = v1_ood.report(CFG, tmp_path / "go", seeds=(1, 2))
+    payload, text = v1_ood.report(CFG, tmp_path / "drop", src / "drop", seeds=(1, 2))
     assert payload["gate"]["verdict"] == "withheld" and "fewer than 1000" in text
 
 
-def test_report_compares_identity_with_the_saved_v1_episodes(tmp_path):
+def test_identity_must_reproduce_the_saved_v1_episodes(tmp_path, monkeypatch):
+    monkeypatch.setattr(v1_ood, "H4_GATE", type(v1_ood.H4_GATE)(n_min=10))
     arms = (ARM_TOKENS, ARM_TABLE)
-    _fake(
-        tmp_path / "out", CFG, {(c.name, a): 0.8 for c in CFG.conditions for a in arms}
-    )
     root = tmp_path / "v1"
-    saved = v1_ood.source_dir(CFG, root, ARM_TOKENS, 1)
-    saved.mkdir(parents=True)
-    fresh = (tmp_path / "out" / "tokens-s1" / "identity" / "eval.jsonl").read_text()
-    episodes = [json.loads(line) for line in fresh.splitlines()]
+    _fake(
+        tmp_path / "out",
+        CFG,
+        {(c.name, a): 0.8 for c in CFG.conditions for a in arms},
+        source=root,
+    )
+    payload, _ = v1_ood.report(CFG, tmp_path / "out", root, seeds=(1, 2))
+    assert payload["reproduction"]["tokens/s1"]["same_moves"] == 1.0
+    assert payload["gate"]["verdict"] == "KILL"
+    # one saved episode took other moves (same outcome): reported, not fatal
+    saved_path = v1_ood.source_dir(CFG, root, ARM_TOKENS, 1) / "eval.jsonl"
+    episodes = [json.loads(line) for line in saved_path.read_text().splitlines()]
     episodes[1]["moves"] = ["line(A, B)"]
-    (saved / "eval.jsonl").write_text("".join(json.dumps(e) + "\n" for e in episodes))
-    payload, text = v1_ood.report(CFG, tmp_path / "out", root, seeds=(1, 2))
+    saved_path.write_text("".join(json.dumps(e) + "\n" for e in episodes))
+    payload, _ = v1_ood.report(CFG, tmp_path / "out", root, seeds=(1, 2))
     r = payload["reproduction"]["tokens/s1"]
     assert r["n"] == 40 and r["same_moves"] == pytest.approx(39 / 40)
-    assert r["same_success"] == 1.0 and payload["reproduction"]["table/s1"] is None
+    assert r["same_success"] == 1.0 and payload["gate"]["verdict"] == "KILL"
+    # 3 of 40 outcomes differ (< 0.95 agree): these are not H1's adapters
+    for e in episodes[:3]:
+        e["success"] = not e["success"]
+    saved_path.write_text("".join(json.dumps(e) + "\n" for e in episodes))
+    payload, text = v1_ood.report(CFG, tmp_path / "out", root, seeds=(1, 2))
+    assert payload["gate"]["verdict"] == "withheld"
+    assert payload["gate"]["unreproduced"] == ["tokens/s1"] and "reproduce" in text
+    # no saved episodes at all (or no source root) withholds as well
+    payload, _ = v1_ood.report(CFG, tmp_path / "out", None, seeds=(1, 2))
+    assert payload["gate"]["verdict"] == "withheld"
 
 
 def test_ood_launcher_payload(tmp_path):

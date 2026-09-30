@@ -32,16 +32,23 @@ gates are constants in `configs.py`):
   table, by at least the go margin on the long-construction bucket. If the
   text table closes the gap, the contribution narrows to token economy and
   out-of-distribution poses (ADR 0006).
-- **H4 (poses outside the training range).** Added 2026-09-30 after the H1
-  kill, before any OOD episode existed. The *same* trained V1 adapters, with
-  no retraining, on the frozen V1 evaluation set moved far outside the
-  training range (translated by 100, scaled ×10 or ×0.2): the text table's
-  coordinates leave the range the LoRA saw, and the state tokens do not move.
-  H4 holds if on some far condition tokens beat the table by at least the go
-  margin with CI above zero; it is dead if every far condition is at/below
-  the kill margin (`configs.H4_GATE`, the same margins as H1). Even a GO only
-  argues against a *raw-coordinate* table: a table in a canonical frame would
-  be invariant too, and that is the baseline a GO would have to face next.
+- **H4 (robustness to poses outside the training range).** Added
+  2026-09-30 after the H1 kill, before any OOD episode existed. The *same*
+  trained V1 adapters, with no retraining, on the frozen V1 evaluation set
+  moved outside the training range (translated by 100, scaled ×10): in both
+  arms the prompt's given coordinates leave the range the LoRA saw; in the
+  table arm every state row does too, while the tokens arm's state blocks do
+  not move. The statistic is robustness, paired per problem: the tokens
+  arm's drop from identity minus the table arm's drop — not the absolute gap,
+  which starts ~19 pts in the table's favour. H4 holds if on some far
+  condition the tokens are more robust by at least the go margin with CI
+  above zero; it is dead if every far condition is at/below the kill margin
+  (`configs.H4_GATE`, the same margins as H1); withheld if identity does not
+  reproduce the saved V1 episodes. Even a GO only argues against a
+  *raw-coordinate* table: a table in a canonical frame would be invariant
+  too, and that is the baseline a GO would have to face next; and a GO on
+  robustness makes the tokens better in absolute terms only where the
+  absolute gap also turns positive (both are reported).
 
 The unit of work is a **construction problem**: labelled given points, a
 target described as a nested classical construction (midpoint, circumcentre,
@@ -147,9 +154,13 @@ H4 — `v1_ood.py` re-rolls the protocol-B adapters on each pose condition
 (`configs.POSE_CONDITIONS`; poses built by E0's `transformed_problem`, ids
 kept so episodes pair across arms, seeds and conditions); `identity` must
 reproduce the saved V1 episodes, `rotate` separates "coordinates stop being
-integers" from "coordinates leave the range", `reflect` is ADR 0005's OOD
-condition, where the tokens are not invariant either. `run_v1_ood_jobs.py`
-freezes the conditions and submits 2 arms × 2 seeds (evaluation only).
+integers" from "coordinates leave the range", `scale-down` keeps the given
+points inside the box (reported, not gated: the table's fixed 2-decimal
+print loses precision there), `reflect` is ADR 0005's OOD condition, where
+the tokens are not invariant either. A posed problem that is no longer the
+same construction (other reference length; other trajectory without
+reflection) is dropped. `run_v1_ood_jobs.py` freezes the conditions and
+submits 2 arms × 2 seeds (evaluation only).
 
 ```bash
 python -m experiments.geostate.v1_ood --prepare --eval --arm tokens --seed 1 --smoke
@@ -347,6 +358,17 @@ Of the 900 frozen problems, 11 no longer build under the generator's newer
 guards (10 name an unneeded construction, 1 is a one-move shortcut) and drop
 out of every condition.
 
+2026-09-30, **H4 review before launch** (adversarial review; no OOD episode
+existed yet): the first gate compared tokens − table directly and would have
+read KILL even with the tokens untouched and the table losing 20 pts, since
+the table leads by ~19 at identity — the gate now reads paired robustness;
+scale-down moved out of the gate (inside the box, print-precision confound);
+13 rotated and 5 reflected problems became different constructions after
+rounding (e.g. 3 → 20 moves) and are now rejected; the ood hash covers the
+tolerances, buckets and rounding; identity must reproduce the saved V1
+episodes (≥ 0.95 same success per run) or the verdict is withheld; a torn
+`eval.jsonl` line no longer swallows the next record on resume.
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
@@ -394,7 +416,9 @@ H4 (out-of-distribution poses) or a stronger encoder.
   Qwen3-8B only, rescored; H0 verdict withheld.
 - 2026-09-30 — token renewed; E0 relaunched with the decisive models first
   (+ Gemma-4-31B-it); H4 added: `v1_ood.py` re-evaluates the V1 adapters
-  under six pose conditions, `run_v1_ood_jobs.py`, gate `H4_GATE`. 139 tests.
+  under six pose conditions, `run_v1_ood_jobs.py`, gate `H4_GATE`; review
+  pass before launch: robustness gate, same-construction check, reproduction
+  gate, hash coverage, torn-line resume. 139 tests.
 
 - 2026-09-24 — deep interview (11 rounds, unattended after round 1) fixed the
   scope: construction problems as the unit, `experiments/geostate/` as the

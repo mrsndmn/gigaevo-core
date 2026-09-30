@@ -6,19 +6,27 @@
 
 H1 compared the arms on poses drawn like the training ones (integer given
 points in [-10, 10]); there the text table's coordinates are simply more
-information. The remaining argument for invariant state tokens is that they do
-not move when the figure does. This module re-evaluates the V1 adapters of
-the protocol H1 read (`V1_OOD.source_protocol`) — no training — on the frozen
-V1 evaluation set mapped through each `PoseCondition` in `configs.py`, and
-reads the H4 gate on the far conditions.
+information. The remaining argument for invariant state tokens is that the
+state blocks do not move when the figure does. This module re-evaluates the V1
+adapters of the protocol H1 read (`V1_OOD.source_protocol`) — no training —
+on the frozen V1 evaluation set mapped through each `PoseCondition` in
+`configs.py`, and reads the H4 gate on the far conditions.
+
+What moves under a far pose: in *both* arms the prompt's given coordinates
+(`sequence.prompt_text`); in the table arm also every state row. The tokens
+arm's state blocks are invariant (features match to float precision). H4 is
+therefore about robustness: the gate reads the paired per-problem *drop* of
+each arm from identity to a far condition, tokens drop minus table drop, not
+the absolute gap (which starts ~19 pts in the table's favour).
 
 Each condition keeps the original problem ids, so episodes pair across arms,
 seeds and conditions by id. A problem a condition cannot build (a pose the
 kernel finds degenerate, a target that drifts under rounding, an
-orientation-dependent target under a reflection, or the generator's newer
-guards) is dropped from that condition only and counted in `prepare.json`.
-The identity condition must reproduce the saved V1 episodes; the report says
-how closely it does.
+orientation-dependent target under a reflection, the generator's newer
+guards) or builds as a *different* construction (rounding breaks an exact
+integer-grid coincidence and the reference changes length) is dropped from
+that condition only and counted in `prepare.json`. The identity condition
+must reproduce the saved V1 episodes; the verdict is withheld otherwise.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ from .configs import (
     ARM_TOKENS,
     ARTIFACT_ROOT,
     H4_GATE,
+    LENGTH_BUCKETS,
     OUT_DIR,
     TOL,
     V1,
@@ -90,16 +99,29 @@ def pose_problem(
     cfg: V1OODConfig = V1_OOD,
     tol: ToleranceSpec = TOL,
 ) -> Problem | None:
-    """The problem under one pose of `cond`, keeping its id; None if unbuildable."""
+    """The problem under one pose of `cond`, keeping its id; None if unbuildable.
+
+    The posed problem must be the same construction: the same reference length
+    always, and the same trajectory under an orientation-preserving pose (a
+    reflection legitimately swaps which point of an intersection pair a move
+    names). Rounding a rotated integer grid can break an exact coincidence the
+    original reference relied on — a 3-move problem then needs 20 — and such
+    a copy would pair problems of different difficulty.
+    """
     from .consistency import transformed_problem
 
     rng = _rng(cfg, cond, problem.id)
     identity = {label: label for label in problem.given}
+    original = [m.to_dict() for m in problem.trajectory]
     for _ in range(cfg.max_attempts if _is_random(cond) else 1):
         g = pose_similarity(cond, rng)
         try:
             copy = transformed_problem(problem, g, identity, tol, 0)
         except (MoveError, ValueError):
+            continue
+        if copy.n_moves != problem.n_moves:
+            continue
+        if not cond.reflect and [m.to_dict() for m in copy.trajectory] != original:
             continue
         return replace(
             copy,
@@ -110,7 +132,12 @@ def pose_problem(
 
 
 def ood_hash(cfg: V1OODConfig = V1_OOD, v1: V1Config = V1) -> str:
-    """Config plus every module on the path from a frozen problem to an episode."""
+    """Config plus every input on the path from a frozen problem to an episode.
+
+    Whole modules, as `run_v1_jobs.protocol_hash_v1` does: an unrelated edit to
+    `generator` or `rollout` also yields a new directory, never a silent
+    resume under changed code. Report code is outside it.
+    """
     from . import (
         cga,
         consistency,
@@ -141,6 +168,8 @@ def ood_hash(cfg: V1OODConfig = V1_OOD, v1: V1Config = V1) -> str:
         {
             "config": asdict(cfg),
             "v1": asdict(v1),
+            "tolerances": asdict(TOL),
+            "buckets": LENGTH_BUCKETS,
             "code": {m.__name__: inspect.getsource(m) for m in modules},
             "poses": [
                 inspect.getsource(f)
@@ -149,6 +178,7 @@ def ood_hash(cfg: V1OODConfig = V1_OOD, v1: V1Config = V1) -> str:
                     _rng,
                     pose_problem,
                     consistency.transformed_problem,
+                    consistency._round2,
                 )
             ],
         },
@@ -291,8 +321,9 @@ def evaluate_run(
         from .train_v1 import seed_everything
         from .v1_model import V1Model
 
-        # the V1 run seeded before building the model; parameters the adapters
-        # do not carry (the resized <st> row) get the same init as there
+        # as the V1 run did; the adapters carry every trained parameter and
+        # the <st> row is never read (its embedding is the encoder's output),
+        # so this only keeps any stray randomness identical to that run
         seed_everything(seed)
         model = V1Model(V1, arm, device=device)
     if model.arm != arm:
@@ -477,7 +508,7 @@ def report(
                 f"{vs_text} |"
             )
     lines.append("")
-    lines.append(f"Paired Δsuccess tokens − table on {long_name}, per condition:")
+    lines.append(f"Paired Δsuccess tokens − table on {long_name} (absolute gap):")
     lines.append("")
     deltas: dict[str, Any] = {}
     for cond in cfg.conditions:
@@ -496,6 +527,63 @@ def report(
             )
         else:
             lines.append(f"- {cond.name}{tag}: no paired episodes")
+    # Robustness, what the gate reads: per problem, how much less the tokens
+    # arm drops from identity than the table arm does (positive = tokens more
+    # robust). Paired over problems present in all four cells.
+    lines.append("")
+    lines.append(
+        f"Robustness on {long_name}: (tokens − tokens@identity) − "
+        "(table − table@identity), paired per problem:"
+    )
+    lines.append("")
+    robust: dict[str, Any] = {}
+    tok_id = per_problem.get(("identity", ARM_TOKENS), {})
+    tab_id = per_problem.get(("identity", ARM_TABLE), {})
+    for cond in cfg.conditions:
+        if cond.name == "identity":
+            continue
+        tok = per_problem.get((cond.name, ARM_TOKENS), {})
+        tab = per_problem.get((cond.name, ARM_TABLE), {})
+        ids = set(tok) & set(tab) & set(tok_id) & set(tab_id)
+        r = _paired_delta(
+            {i: tok[i] - tok_id[i] for i in ids},
+            {i: tab[i] - tab_id[i] for i in ids},
+            rng,
+        )
+        robust[cond.name] = r
+        tag = " (far, gated)" if cond.far else ""
+        if r:
+            lines.append(
+                f"- {cond.name}{tag}: {r['delta_pts']:+.1f} pts, CI95 "
+                f"[{r['ci_pts'][0]:+.1f}, {r['ci_pts'][1]:+.1f}] ({r['n']} problems)"
+            )
+        else:
+            lines.append(f"- {cond.name}{tag}: no paired episodes")
+    # identity must reproduce the saved V1 episodes, or nothing here is H1's model
+    repro: dict[str, Any] = {}
+    lines.append("")
+    lines.append("Identity vs saved V1 episodes (same problems):")
+    for arm in arms:
+        for s in seeds:
+            r = (
+                reproduction(cfg, out, source_root, arm, s)
+                if source_root is not None
+                else None
+            )
+            repro[f"{arm}/s{s}"] = r
+            if r:
+                lines.append(
+                    f"- {arm}/s{s}: {r['n']} problems, same moves {r['same_moves']:.3f}, "
+                    f"same success {r['same_success']:.3f} (success saved "
+                    f"{r['success_saved']:.3f}, now {r['success_fresh']:.3f})"
+                )
+            else:
+                lines.append(f"- {arm}/s{s}: no saved or no fresh identity episodes")
+    unreproduced = [
+        k
+        for k, r in repro.items()
+        if r is None or r["same_success"] < H4_GATE.min_reproduction
+    ]
     # gate
     missing = [
         f"{a}/s{s}/{c} ({len(r['episodes'])}/{r['n_expected']})"
@@ -503,13 +591,26 @@ def report(
         if not r["complete"]
     ]
     far = [c.name for c in cfg.conditions if c.far]
-    gate: dict[str, Any] = {"verdict": None, "incomplete": missing, "far": far}
+    gate: dict[str, Any] = {
+        "verdict": None,
+        "incomplete": missing,
+        "unreproduced": unreproduced,
+        "far": far,
+    }
     lines.append("")
-    small = [c for c in far if not deltas[c] or deltas[c]["n"] < H4_GATE.n_min]
+    small = [c for c in far if not robust.get(c) or robust[c]["n"] < H4_GATE.n_min]
     if missing:
         gate["verdict"] = "withheld"
         lines.append(
             "H4 verdict: withheld — incomplete: " + ", ".join(missing[:6]) + "."
+        )
+    elif unreproduced:
+        gate["verdict"] = "withheld"
+        lines.append(
+            "H4 verdict: withheld — identity does not reproduce the saved V1 "
+            f"episodes (same success < {H4_GATE.min_reproduction}) for: "
+            + ", ".join(unreproduced)
+            + "."
         )
     elif small:
         gate["verdict"] = "withheld"
@@ -521,15 +622,15 @@ def report(
         wins = [
             c
             for c in far
-            if deltas[c]["delta_pts"] >= H4_GATE.go_delta_pts
-            and deltas[c]["ci_pts"][0] > 0
+            if robust[c]["delta_pts"] >= H4_GATE.go_delta_pts
+            and robust[c]["ci_pts"][0] > 0
         ]
         if wins:
             gate["verdict"], why = (
                 "GO",
-                "gain at/above the go margin on " + ", ".join(wins),
+                "tokens more robust by at least the go margin on " + ", ".join(wins),
             )
-        elif all(deltas[c]["delta_pts"] <= H4_GATE.kill_delta_pts for c in far):
+        elif all(robust[c]["delta_pts"] <= H4_GATE.kill_delta_pts for c in far):
             gate["verdict"], why = (
                 "KILL",
                 "every far condition at/below the kill margin",
@@ -537,30 +638,17 @@ def report(
         else:
             gate["verdict"], why = "RECONSIDER", "between the kill and go margins"
         lines.append(
-            f"H4 verdict: {gate['verdict']} ({why}; go ≥ {H4_GATE.go_delta_pts:.0f} pts "
-            f"with CI > 0 on any far condition, kill ≤ {H4_GATE.kill_delta_pts:.0f} "
-            "pts on all)."
+            f"H4 verdict: {gate['verdict']} ({why}; robustness go ≥ "
+            f"{H4_GATE.go_delta_pts:.0f} pts with CI > 0 on any far condition, "
+            f"kill ≤ {H4_GATE.kill_delta_pts:.0f} pts on all)."
         )
-    repro: dict[str, Any] = {}
-    if source_root is not None:
-        lines.append("")
-        lines.append("Identity vs saved V1 episodes (same problems):")
-        for arm in arms:
-            for s in seeds:
-                r = reproduction(cfg, out, source_root, arm, s)
-                repro[f"{arm}/s{s}"] = r
-                if r:
-                    lines.append(
-                        f"- {arm}/s{s}: {r['n']} problems, same moves {r['same_moves']:.3f}, "
-                        f"same success {r['same_success']:.3f} (success saved "
-                        f"{r['success_saved']:.3f}, now {r['success_fresh']:.3f})"
-                    )
     text = "\n".join(lines) + "\n"
     payload = {
         "out": str(out),
         "ood": info["fingerprint"]["ood"],
         "rows": rows,
         "deltas": deltas,
+        "robustness": robust,
         "gate": gate,
         "reproduction": repro,
         "prepare": {

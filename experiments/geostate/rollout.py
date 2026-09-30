@@ -285,6 +285,11 @@ def evaluate(
             done[rec["problem_id"]] = rec
     vocab = MoveVocabulary(model.tok)
     model.eval()
+    if path.exists() and path.stat().st_size and not path.read_bytes().endswith(b"\n"):
+        # a torn last line: end it, or the next record would be glued onto it
+        # and both become unreadable
+        with path.open("a") as fh:
+            fh.write("\n")
     with path.open("a") as fh:
         for i, problem in enumerate(problems, start=1):
             if problem.id in done:
