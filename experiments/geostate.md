@@ -398,6 +398,19 @@ retention on the 327 long problems both arms solve at identity in every seed
 (`H4_GATE` docstring). Identity reproduction also requires every fresh
 episode to have a saved counterpart.
 
+2026-09-30 ~21:15, **E0 resubmitted with 16 requests in flight per job**
+(was 4; commit `194c9e2b`; `workers` is outside the protocol hash and the
+fingerprint, so the same `-65b7e70ea8ab` directories resume). The first two
+jobs were killed after 2.7 h with 363 synthetic and 1533 aux answers cached;
+the 4 in-flight requests of each were archived by `--recover-errors` and
+re-issued. New jobs: `e0-synthetic-text`
+`lm-mpi-job-ac1d6bf5-33f5-438b-a849-70ac6954b1da`, `e0-aux-text`
+`lm-mpi-job-43e7a568-53cc-4d8a-a8de-0d6329e89831`. First 20 min, no request
+errors: synthetic ~6.8 answers/min (was ~2); aux is on the long
+incircle/circumcircle stems (median 10k completion tokens, ~12 min per
+request — per-request decoding halves at 32 in flight, total throughput per
+job roughly doubles).
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
