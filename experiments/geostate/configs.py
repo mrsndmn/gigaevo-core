@@ -258,7 +258,11 @@ class E0Config:
     request_timeout: float = 900.0
     max_transport_retries: int = 6
     retry_backoff_cap: float = 60.0
-    workers: int = 4  # the live smoke ran 4 in flight without a 429
+    # Requests in flight per job. 4 (the live smoke ran it without a 429) left
+    # Qwen3.8-27B at ~2 synthetic answers/min — 9-14k thinking tokens, ~7 min
+    # each on long problems — so 16 from 2026-09-30. Not part of the protocol
+    # hash or the fingerprint: a resubmission resumes the same directory.
+    workers: int = 16
     bootstrap: int = 1000
     # MLS instance for the inference-only job; the allocation is GPU-only and
     # this is the type noregeo's inference jobs use.
