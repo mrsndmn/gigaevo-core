@@ -289,6 +289,20 @@ What it cannot say: the gate reads the *best* open model, and Qwen3.8-27B
 (7 of 8 copies right in the smoke) and Gpt-oss-120b have not been measured
 at scale — the E0 verdict waits for Qwen3.8-27B.
 
+2026-09-30, **E0 final state: truncated, no verdict.** Both jobs ended
+"completed" on 2026-09-24 ~15:15Z — the minute the endpoint token expired
+(15:11Z); `run.json` counts 6317 of 7200 (synthetic) and 14609 of 16416 (aux)
+requests not made. Only Qwen3-8B was measured; Gpt-oss-120b and Qwen3.8-27B
+(listed as served at the end of both runs) have no data. Rescored with the
+current scorer (`a2ca14b0a803`) and summaries rebuilt: synthetic 1-3 moves
+unchanged (consistency 0.627 [0.571, 0.678]); synthetic ≥5 moves 11 of 187
+problems, answered 0.40, success(identity) 0.18 — below both applicability
+conditions, verdict withheld; aux ≥5 moves 135 of 442 problems, answered
+0.892, success(identity) 0.741, consistency 0.804 [0.743, 0.865]. The E0
+protocol (`7db7de275f91`, coincidence goals) is no longer the current code's
+(`65b7e70ea8ab`, predicate goals): a resubmission after token renewal starts a
+new protocol directory rather than resuming this one.
+
 ## Conclusions
 
 **H1 is killed under the pre-registered gate (ADR 0006):** with identical
@@ -304,8 +318,11 @@ poses this probe tests, coordinates are simply more information. The spec's
 remaining argument for tokens is out-of-distribution poses (H4) and token
 economy (H3) — H3 is confirmed (−38% tokens), H4 is untested here.
 
-E0 (H0) is still running; its verdict is read from `--summary` of the gated
-config against the gate in `configs.py`.
+E0 (H0) has no verdict: the runs stopped at token expiry with Qwen3-8B only.
+What the partial data does show — Qwen3-8B disagrees with itself on 37% of
+copy pairs of 1-3-move problems and 20% on long NoReGeo constructions —
+supports the motivation, but the gate reads the best open model, which is
+unmeasured.
 
 Deviations from the interview spec, recorded rather than hidden: no
 `geostate` extra was needed because the kernel is numpy-only and analytic
@@ -319,13 +336,18 @@ but whatever open text models the endpoint serves — today Qwen3-8B and
 Gpt-oss-120b — because the endpoint removed the others (E0 constraints).
 While Qwen3.8-27B is absent the figure arm cannot run at all.
 
-Next: (1) run E0 on the three open text models and the one figure model;
-(2) build the V1 arm and its matched baseline on Qwen3-1.7B with generator
-trajectories, as MLS `a100.1gpu` jobs; (3) apply the go/no-go rule from the
-interview spec — both probes negative ⇒ stop; either positive ⇒ extract the
-package into its own repository as the first post-go task (ADR 0004).
+Next: (1) after token renewal, rerun E0 (new protocol) on Qwen3.8-27B and
+Gpt-oss-120b first — only the best open model decides H0; (2) apply the
+go/no-go rule from the interview spec — both probes negative ⇒ stop; either
+positive ⇒ extract the package into its own repository as the first post-go
+task (ADR 0004). With H1 killed, H0 alone can only justify the motivation,
+not the state-token design; the design survives only through the untested
+H4 (out-of-distribution poses) or a stronger encoder.
 
 ## Changelog
+
+- 2026-09-30 — E0 read after the jobs ended: truncated at token expiry,
+  Qwen3-8B only, rescored; H0 verdict withheld.
 
 - 2026-09-24 — deep interview (11 rounds, unattended after round 1) fixed the
   scope: construction problems as the unit, `experiments/geostate/` as the
