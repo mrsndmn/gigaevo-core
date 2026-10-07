@@ -1,4 +1,4 @@
-"""Local API cohorts paired with frozen short text problems (no MLS submission).
+"""Local figure API cohorts paired with frozen text problems (no MLS submission).
 
     python -m experiments.geostate.run_figure_short50 --dry
     python -u -m experiments.geostate.run_figure_short50
@@ -14,36 +14,37 @@ from pathlib import Path
 from .client import write_json
 from .configs import (
     ARTIFACT_ROOT,
-    FIGURE_SHORT50_BUCKET,
-    FIGURE_SHORT50_N,
-    FIGURE_SHORT50_OFFSETS,
-    FIGURE_SHORT50_SOURCE,
+    FIGURE_COHORTS,
     config_named,
 )
 from .consistency import (
-    Copy, figure_for, fingerprint, job_dir, prepare, protocol_hash, run, summarize,
+    Copy, fingerprint, prepare, protocol_hash, run, summarize,
 )
 from .generator import load_problems, save_problems
 
 
 def freeze(out: Path, config_name: str = "e0-synthetic-figure-short50") -> None:
     cfg = config_named(config_name)
-    offset = FIGURE_SHORT50_OFFSETS[config_name]
-    source = Path(FIGURE_SHORT50_SOURCE)
+    cohort = FIGURE_COHORTS[config_name]
+    source = Path(cohort.source)
     problems = [
         p for p in load_problems(source / "problems.jsonl")
-        if p.bucket == FIGURE_SHORT50_BUCKET
-    ][offset:offset + FIGURE_SHORT50_N]
-    if len(problems) != FIGURE_SHORT50_N:
-        raise ValueError("not enough short problems in the frozen text source")
+        if cohort.bucket is None or p.bucket == cohort.bucket
+    ]
+    stop = None if cohort.count is None else cohort.offset + cohort.count
+    problems = problems[cohort.offset:stop]
+    if not problems or (cohort.count is not None and len(problems) != cohort.count):
+        raise ValueError("not enough problems in the frozen text source")
     ids = {p.id for p in problems}
     copies = [
         json.loads(line)
         for line in (source / "copies.jsonl").read_text().splitlines()
         if line.strip() and json.loads(line)["problem_id"] in ids
     ]
-    if any(sum(c["problem_id"] == p.id for c in copies) != cfg.copies for p in problems):
-        raise ValueError("each selected problem must have all eight frozen copies")
+    # Some frozen long problems have fewer copies after degeneracy rejection;
+    # preserve exactly the text cohort rather than inventing missing copies.
+    if any(not any(c["problem_id"] == p.id for c in copies) for p in problems):
+        raise ValueError("a selected problem has no frozen copies")
     if (out / "prepare.json").exists():
         manifest = json.loads((out / "prepare.json").read_text())
         if manifest.get("fingerprint") != fingerprint(cfg):
@@ -73,19 +74,22 @@ def freeze(out: Path, config_name: str = "e0-synthetic-figure-short50") -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry", action="store_true")
-    ap.add_argument("--config", choices=tuple(FIGURE_SHORT50_OFFSETS), default="e0-synthetic-figure-short50")
+    ap.add_argument("--config", choices=tuple(FIGURE_COHORTS), default="e0-synthetic-figure-short50")
     args = ap.parse_args()
     cfg = config_named(args.config)
     out = Path(ARTIFACT_ROOT) / f"{cfg.name}-{protocol_hash(cfg)}"
     freeze(out, cfg.name)
-    print(f"Pilot: {FIGURE_SHORT50_N} short problems, 400 requests, {cfg.workers} workers; {out}", flush=True)
+    prepared = prepare(cfg, out)
+    n_copies = sum(len(copies) for _, copies in prepared)
+    print(f"Cohort: {len(prepared)} problems, {n_copies} requests, {cfg.workers} workers; {out}", flush=True)
     if args.dry:
         return 0
-    # Matplotlib is not thread-safe; render before the concurrent API loop.
-    for problem, copies in prepare(cfg, out):
-        for copy in copies:
-            figure_for(copy, job_dir(out, cfg.models[0], problem, copy))
-    print("All 400 figures ready; starting API requests", flush=True)
+    return execute(cfg.name, out)
+
+
+def execute(config_name: str, out: Path) -> int:
+    cfg = config_named(config_name)
+    # Shared run() renders figures sequentially before starting API workers.
     code = run(cfg, out)
     payload, report = summarize(cfg, out)
     write_json(out / "summary.json", payload)

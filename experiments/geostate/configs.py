@@ -431,12 +431,36 @@ experiment_configs: list[E0Config] = [
         models=(MODEL_QWEN38,),
         arm=ARM_FIGURE,
         problem_set=SET_SYNTHETIC,
+        workers=8,
     ),
     E0Config(
         name="e0-synthetic-figure-short-next50",
         models=(MODEL_QWEN38,),
         arm=ARM_FIGURE,
         problem_set=SET_SYNTHETIC,
+        workers=8,
+    ),
+    E0Config(
+        name="e0-synthetic-figure-medium",
+        models=(MODEL_QWEN38,),
+        arm=ARM_FIGURE,
+        problem_set=SET_SYNTHETIC,
+        workers=8,
+    ),
+    E0Config(
+        name="e0-synthetic-figure-long",
+        models=(MODEL_QWEN38,),
+        arm=ARM_FIGURE,
+        problem_set=SET_SYNTHETIC,
+        workers=8,
+    ),
+    E0Config(
+        name="e0-aux-figure-paired",
+        models=(MODEL_QWEN38,),
+        arm=ARM_FIGURE,
+        problem_set=SET_AUX,
+        per_stem=100,
+        workers=8,
     ),
     E0Config(
         name="e0-synthetic-text",
@@ -485,6 +509,32 @@ FIGURE_SHORT50_OFFSETS = {
     "e0-synthetic-figure-short50": 0,
     "e0-synthetic-figure-short-next50": 50,
 }
+
+
+@dataclass(frozen=True)
+class FigureCohort:
+    source: str
+    bucket: str | None
+    offset: int = 0
+    count: int | None = None
+
+
+FIGURE_COHORTS = {
+    "e0-synthetic-figure-short50": FigureCohort(FIGURE_SHORT50_SOURCE, "1-3", count=50),
+    "e0-synthetic-figure-short-next50": FigureCohort(FIGURE_SHORT50_SOURCE, "1-3", offset=50, count=50),
+    "e0-synthetic-figure-medium": FigureCohort(FIGURE_SHORT50_SOURCE, "4-9", count=100),
+    "e0-synthetic-figure-long": FigureCohort(FIGURE_SHORT50_SOURCE, "10+", count=100),
+    "e0-aux-figure-paired": FigureCohort(f"{ARTIFACT_ROOT}/e0-aux-text-65b7e70ea8ab", None),
+}
+# One pass per cohort, continuing even if a cohort has failed API requests.
+# A later queue invocation retries failures and reuses every successful result.
+FIGURE_QUEUE = (
+    "e0-synthetic-figure-short-next50",
+    "e0-synthetic-figure-short50",
+    "e0-synthetic-figure-medium",
+    "e0-synthetic-figure-long",
+    "e0-aux-figure-paired",
+)
 
 
 def config_named(name: str) -> E0Config:

@@ -66,6 +66,9 @@ Local figure/text paired cohorts: `run_figure_short50.main` selects frozen
 text problems and their exact transformed copies; cohort selection and run
 settings live in `configs.py`. The second cohort covers the remaining short
 synthetic problems without overlapping the initial pilot.
+`run_figure_queue.main` serializes the paired cohorts, recovering interrupted
+or failed API requests before each cohort and keeping successful evaluations.
+Its persistent state reports which cohorts still need retries.
 
 Code: `experiments/geostate/` (ADR 0004: a self-contained package next to
 `noregeo_synth`, importing only its endpoint credentials, dataset, figure
@@ -500,6 +503,10 @@ or CGENN-style), which would now have to beat a baseline that is both more
 accurate and already pose-robust.
 
 ## Changelog
+
+- 2026-10-07 — extended local figure evaluation to medium/long synthetic and
+  the full auxiliary set; serialized tmux queue with reduced API concurrency
+  and cached-result recovery.
 
 - 2026-10-07 — added a second local paired figure cohort for the remaining
   short synthetic problems; separate artifacts and tmux execution.

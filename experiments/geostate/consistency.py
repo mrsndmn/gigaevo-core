@@ -58,7 +58,7 @@ from .configs import (
     ARM_TEXT,
     DEFAULT_CONFIG,
     E0_GATE,
-    FIGURE_SHORT50_OFFSETS,
+    FIGURE_COHORTS,
     GENERATOR,
     LENGTH_BUCKETS,
     OUT_DIR,
@@ -335,7 +335,7 @@ def prepare(
     refused; read-only consumers (the summary) pass `strict=False` and get the
     frozen inputs as they are, whatever the current code says.
     """
-    if cfg.name in FIGURE_SHORT50_OFFSETS and (
+    if cfg.name in FIGURE_COHORTS and (
         strict or not (out / "prepare.json").exists()
     ):
         # Every entry point (including the generic CLI/launcher) uses the

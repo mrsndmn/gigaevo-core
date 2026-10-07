@@ -106,7 +106,8 @@ hold on all of the arms it touches, not just the one that motivated it.
 | NoReGeo synthesis | `python -m experiments.noregeo_synth.generate --task <stem>:<qid>` | gigaevo-core |
 | NoReGeo VLM eval | `python -m experiments.noregeo_synth.eval_blind --config <c> --per-stem <n>` | gigaevo-core |
 | GeoState probe (E0) | `python -m experiments.geostate.consistency --config <c> --dry\|--run\|--summary` | gigaevo-core |
-| GeoState local paired figure cohorts | `python -m experiments.geostate.run_figure_short50 [--config e0-synthetic-figure-short50\|e0-synthetic-figure-short-next50] [--dry]` — freezes paired short text problems and their copies, then runs API evaluation locally; local-only configs reject MLS submission | Python with numpy/openai/matplotlib |
+| GeoState local paired figure cohorts | `python -m experiments.geostate.run_figure_short50 [--config <paired-config>] [--dry]` — freezes paired text problems and exact copies for short/medium/long/aux cohorts; local-only configs reject MLS submission | Python with numpy/openai/matplotlib |
+| GeoState local figure queue | `python -u -m experiments.geostate.run_figure_queue` — serialized cohorts from `configs.FIGURE_QUEUE`, recover failed requests before each pass, cache successes, persist `figure-queue-state.json`, singleton controller lock | Python with numpy/openai/matplotlib; detached tmux |
 | GeoState E0 jobs | `python -m experiments.geostate.run_e0_jobs --config <c> [--limit N] [--dry]` | gigaevo-core (calls arkhip `mls`) |
 | GeoState V1 train/eval | `python -m experiments.geostate.train_v1 --arm tokens\|table --seed N --out DIR --train --eval [--smoke]` | gigaevo-core (GPU) |
 | GeoState V1 jobs / report | `python -m experiments.geostate.run_v1_jobs [--dry]`, `python -m experiments.geostate.v1_report --protocol 89abc7561426 [--root DIR]` | gigaevo-core (calls arkhip `mls`) |
