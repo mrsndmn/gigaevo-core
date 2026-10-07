@@ -679,6 +679,12 @@ def run(
             return EXIT_ENDPOINT_UNAVAILABLE
         absent = [m for m in cfg.models if m not in served]
         models = [m for m in cfg.models if m in served]
+        if cfg.arm == ARM_FIGURE:
+            # Matplotlib must finish before any API worker renders/reads images.
+            for model in models:
+                for problem, copies in prepared:
+                    for copy in copies:
+                        figure_for(copy, job_dir(out, model, problem, copy))
         if absent:
             print(
                 f"[{cfg.name}] not served now, skipped: {', '.join(absent)}", flush=True
