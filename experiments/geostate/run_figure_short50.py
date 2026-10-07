@@ -19,7 +19,7 @@ from .configs import (
     config_named,
 )
 from .consistency import (
-    figure_for, fingerprint, job_dir, prepare, protocol_hash, run, summarize,
+    Copy, figure_for, fingerprint, job_dir, prepare, protocol_hash, run, summarize,
 )
 from .generator import load_problems, save_problems
 
@@ -42,7 +42,12 @@ def freeze(out: Path) -> None:
     if any(sum(c["problem_id"] == p.id for c in copies) != cfg.copies for p in problems):
         raise ValueError("each selected problem must have all eight frozen copies")
     if (out / "prepare.json").exists():
-        prepared = prepare(cfg, out)
+        manifest = json.loads((out / "prepare.json").read_text())
+        if manifest.get("fingerprint") != fingerprint(cfg):
+            raise ValueError("existing pilot has a different fingerprint")
+        frozen_problems = load_problems(out / "problems.jsonl")
+        frozen_copies = [json.loads(line) for line in (out / "copies.jsonl").read_text().splitlines() if line.strip()]
+        prepared = [(p, [Copy.from_dict(c["copy"]) for c in frozen_copies if c["problem_id"] == p.id]) for p in frozen_problems]
         expected = [(p.to_dict(), [c["copy"] for c in copies if c["problem_id"] == p.id]) for p in problems]
         actual = [(p.to_dict(), [c.to_dict() for c in cs]) for p, cs in prepared]
         if actual != expected:

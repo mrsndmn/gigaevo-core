@@ -16,6 +16,8 @@ def test_pilot_is_paired_idempotent_and_rejects_changed_source(tmp_path, monkeyp
     out = tmp_path / "pilot"
     pilot.freeze(out)
     prepared = c.prepare(config_named("e0-synthetic-figure-short50"), out)
+    generic = c.prepare(config_named("e0-synthetic-figure-short50"), tmp_path / "generic")
+    assert [(p.id, len(cs)) for p, cs in generic] == [(p.id, len(cs)) for p, cs in prepared]
     assert len(prepared) == 50
     assert all(p.bucket == "1-3" and len(cs) == 8 for p, cs in prepared)
     source_copies = [json.loads(x) for x in (source / "copies.jsonl").read_text().splitlines()]

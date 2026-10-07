@@ -334,6 +334,12 @@ def prepare(
     refused; read-only consumers (the summary) pass `strict=False` and get the
     frozen inputs as they are, whatever the current code says.
     """
+    if cfg.name == "e0-synthetic-figure-short50":
+        # Every entry point (including the generic CLI/launcher) uses the
+        # same paired subset, rather than regenerating a full synthetic grid.
+        from .run_figure_short50 import freeze
+
+        freeze(out)
     out.mkdir(parents=True, exist_ok=True)
     problems_path = out / "problems.jsonl"
     copies_path = out / "copies.jsonl"
