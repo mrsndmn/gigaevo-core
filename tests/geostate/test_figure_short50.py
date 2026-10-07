@@ -31,5 +31,15 @@ def test_pilot_is_paired_idempotent_and_rejects_changed_source(tmp_path, monkeyp
     first["copy"]["kind"] = "changed"
     rows[0] = json.dumps(first)
     (source / "copies.jsonl").write_text("\n".join(rows) + "\n")
+    # Read-only summaries must not depend on the current source or protocol.
+    assert len(c.prepare(config_named("e0-synthetic-figure-short50"), out, strict=False)) == 50
     with pytest.raises(ValueError, match="differs"):
         pilot.freeze(out)
+
+
+def test_pilot_rejects_mls_submission():
+    from experiments.geostate.run_e0_jobs import main
+
+    with pytest.raises(SystemExit) as error:
+        main(["--config", "e0-synthetic-figure-short50", "--dry"])
+    assert error.value.code == 2

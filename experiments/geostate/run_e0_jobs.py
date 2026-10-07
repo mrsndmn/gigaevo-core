@@ -165,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry", action="store_true")
     args = parser.parse_args(argv)
     cfg = config_named(args.config)
+    if cfg.name == "e0-synthetic-figure-short50":
+        parser.error("this pilot is local-only; use python -m experiments.geostate.run_figure_short50")
     commit = git("rev-parse", "HEAD")
     out = artifact_dir(cfg, args.limit)
     creds = resolve()
