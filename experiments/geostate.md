@@ -62,6 +62,11 @@ answers validate the kernel and never enter a prompt.
 
 ## Setup
 
+Local figure/text paired cohorts: `run_figure_short50.main` selects frozen
+text problems and their exact transformed copies; cohort selection and run
+settings live in `configs.py`. The second cohort covers the remaining short
+synthetic problems without overlapping the initial pilot.
+
 Code: `experiments/geostate/` (ADR 0004: a self-contained package next to
 `noregeo_synth`, importing only its endpoint credentials, dataset, figure
 renderer, scorer and config). The grid, the symmetry group, every tolerance
@@ -495,6 +500,9 @@ or CGENN-style), which would now have to beat a baseline that is both more
 accurate and already pose-robust.
 
 ## Changelog
+
+- 2026-10-07 — added a second local paired figure cohort for the remaining
+  short synthetic problems; separate artifacts and tmux execution.
 
 - 2026-09-30 — E0 read after the jobs ended: truncated at token expiry,
   Qwen3-8B only, rescored; H0 verdict withheld.

@@ -20,8 +20,15 @@ def test_pilot_is_paired_idempotent_and_rejects_changed_source(tmp_path, monkeyp
     assert [(p.id, len(cs)) for p, cs in generic] == [(p.id, len(cs)) for p, cs in prepared]
     assert len(prepared) == 50
     assert all(p.bucket == "1-3" and len(cs) == 8 for p, cs in prepared)
+    next_cohort = c.prepare(config_named("e0-synthetic-figure-short-next50"), tmp_path / "next")
+    next_ids = {p.id for p, _ in next_cohort}
+    assert len(next_cohort) == 50
+    assert all(p.bucket == "1-3" and len(cs) == 8 for p, cs in next_cohort)
+    assert not next_ids.intersection(p.id for p, _ in prepared)
     source_copies = [json.loads(x) for x in (source / "copies.jsonl").read_text().splitlines()]
     selected = {p.id for p, _ in prepared}
+    source_short_ids = [p.id for p, _ in c.prepare(config_named("e0-synthetic-text"), source) if p.bucket == "1-3"]
+    assert selected.union(next_ids) == set(source_short_ids)
     assert (out / "copies.jsonl").read_text().splitlines() == [
         json.dumps(x) for x in source_copies if x["problem_id"] in selected
     ]
@@ -37,9 +44,10 @@ def test_pilot_is_paired_idempotent_and_rejects_changed_source(tmp_path, monkeyp
         pilot.freeze(out)
 
 
-def test_pilot_rejects_mls_submission():
+@pytest.mark.parametrize("name", ["e0-synthetic-figure-short50", "e0-synthetic-figure-short-next50"])
+def test_pilot_rejects_mls_submission(name):
     from experiments.geostate.run_e0_jobs import main
 
     with pytest.raises(SystemExit) as error:
-        main(["--config", "e0-synthetic-figure-short50", "--dry"])
+        main(["--config", name, "--dry"])
     assert error.value.code == 2

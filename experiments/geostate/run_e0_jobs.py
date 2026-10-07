@@ -43,6 +43,7 @@ from .configs import (
     REPO_ROOT,
     TLS_BUNDLE_NAME,
     E0Config,
+    FIGURE_SHORT50_OFFSETS,
     config_named,
     experiment_configs,
 )
@@ -165,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry", action="store_true")
     args = parser.parse_args(argv)
     cfg = config_named(args.config)
-    if cfg.name == "e0-synthetic-figure-short50":
+    if cfg.name in FIGURE_SHORT50_OFFSETS:
         parser.error("this pilot is local-only; use python -m experiments.geostate.run_figure_short50")
     commit = git("rev-parse", "HEAD")
     out = artifact_dir(cfg, args.limit)

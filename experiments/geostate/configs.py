@@ -433,6 +433,12 @@ experiment_configs: list[E0Config] = [
         problem_set=SET_SYNTHETIC,
     ),
     E0Config(
+        name="e0-synthetic-figure-short-next50",
+        models=(MODEL_QWEN38,),
+        arm=ARM_FIGURE,
+        problem_set=SET_SYNTHETIC,
+    ),
+    E0Config(
         name="e0-synthetic-text",
         models=TEXT_MODELS,
         arm=ARM_TEXT,
@@ -475,6 +481,10 @@ DEFAULT_CONFIG = "e0-synthetic-text"
 FIGURE_SHORT50_SOURCE = f"{ARTIFACT_ROOT}/e0-synthetic-text-65b7e70ea8ab"
 FIGURE_SHORT50_BUCKET = "1-3"
 FIGURE_SHORT50_N = 50
+FIGURE_SHORT50_OFFSETS = {
+    "e0-synthetic-figure-short50": 0,
+    "e0-synthetic-figure-short-next50": 50,
+}
 
 
 def config_named(name: str) -> E0Config:

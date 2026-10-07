@@ -1,7 +1,8 @@
-"""Local API pilot paired with 50 frozen short text problems (no MLS submission).
+"""Local API cohorts paired with frozen short text problems (no MLS submission).
 
     python -m experiments.geostate.run_figure_short50 --dry
     python -u -m experiments.geostate.run_figure_short50
+    python -u -m experiments.geostate.run_figure_short50 --config e0-synthetic-figure-short-next50
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from .configs import (
     ARTIFACT_ROOT,
     FIGURE_SHORT50_BUCKET,
     FIGURE_SHORT50_N,
+    FIGURE_SHORT50_OFFSETS,
     FIGURE_SHORT50_SOURCE,
     config_named,
 )
@@ -24,13 +26,14 @@ from .consistency import (
 from .generator import load_problems, save_problems
 
 
-def freeze(out: Path) -> None:
-    cfg = config_named("e0-synthetic-figure-short50")
+def freeze(out: Path, config_name: str = "e0-synthetic-figure-short50") -> None:
+    cfg = config_named(config_name)
+    offset = FIGURE_SHORT50_OFFSETS[config_name]
     source = Path(FIGURE_SHORT50_SOURCE)
     problems = [
         p for p in load_problems(source / "problems.jsonl")
         if p.bucket == FIGURE_SHORT50_BUCKET
-    ][:FIGURE_SHORT50_N]
+    ][offset:offset + FIGURE_SHORT50_N]
     if len(problems) != FIGURE_SHORT50_N:
         raise ValueError("not enough short problems in the frozen text source")
     ids = {p.id for p in problems}
@@ -70,10 +73,11 @@ def freeze(out: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--config", choices=tuple(FIGURE_SHORT50_OFFSETS), default="e0-synthetic-figure-short50")
     args = ap.parse_args()
-    cfg = config_named("e0-synthetic-figure-short50")
+    cfg = config_named(args.config)
     out = Path(ARTIFACT_ROOT) / f"{cfg.name}-{protocol_hash(cfg)}"
-    freeze(out)
+    freeze(out, cfg.name)
     print(f"Pilot: {FIGURE_SHORT50_N} short problems, 400 requests, {cfg.workers} workers; {out}", flush=True)
     if args.dry:
         return 0
