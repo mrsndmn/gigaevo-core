@@ -40,3 +40,19 @@ def test_lock_detection(tmp_path):
     with (tmp_path / ".figure-queue.lock").open("a+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert watcher.queue_locked(tmp_path)
+
+
+def test_transport_failure_does_not_log_token(tmp_path, monkeypatch, caplog):
+    import agenttg.api
+    import requests
+    registry = tmp_path / "projects.yaml"
+    registry.write_text('projects:\n  project:\n    telegram_chat_id: "123"\n    telegram_thread_id: 42\n')
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "FAKE_SECRET_TOKEN")
+    def fail(*args, **kwargs):
+        raise requests.ConnectionError('/botFAKE_SECRET_TOKEN/sendMessage')
+    monkeypatch.setattr(agenttg.api, "_request_with_retry", fail)
+    previous = agenttg.api.logger.disabled
+    with pytest.raises(RuntimeError, match="acknowledge"):
+        watcher.send_notification(registry, "project", "hello")
+    assert "FAKE_SECRET_TOKEN" not in caplog.text
+    assert agenttg.api.logger.disabled == previous

@@ -49,14 +49,23 @@ def notification(state: dict, status: str) -> str:
 
 def send_notification(registry: Path, project: str, message: str) -> None:
     import agenttg
+    import agenttg.api
     import yaml
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]  # Never use the obsolete YAML token.
     route = yaml.safe_load(registry.read_text())["projects"][project]
-    responses = agenttg.send_reply(
-        token=token, chat_id=str(route["telegram_chat_id"]), text=message,
-        thread_id=route.get("telegram_thread_id", 0),
-    )
+    # agenttg logs raw HTTP exceptions, which may contain the token in the URL.
+    # This watcher is single-threaded; suppress transport logs only during send.
+    logger = agenttg.api.logger
+    was_disabled = logger.disabled
+    logger.disabled = True
+    try:
+        responses = agenttg.send_reply(
+            token=token, chat_id=str(route["telegram_chat_id"]), text=message,
+            thread_id=route.get("telegram_thread_id", 0),
+        )
+    finally:
+        logger.disabled = was_disabled
     if not responses or not all(response.json().get("ok") for response in responses):
         raise RuntimeError("Telegram did not acknowledge notification")
 
