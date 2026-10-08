@@ -56,3 +56,20 @@ def test_transport_failure_does_not_log_token(tmp_path, monkeypatch, caplog):
         watcher.send_notification(registry, "project", "hello")
     assert "FAKE_SECRET_TOKEN" not in caplog.text
     assert agenttg.api.logger.disabled == previous
+
+
+@pytest.mark.parametrize("status,start,expected", [
+    ("complete", 1, "complete"),
+    ("finished_with_errors", 1, "finished_with_errors"),
+    ("running", 2, "superseded"),
+])
+def test_observe_reads_state_after_lock_acquisition(tmp_path, monkeypatch, status, start, expected):
+    state_path = tmp_path / "figure-queue-state.json"
+    state_path.write_text(json.dumps({"started": 1, "status": "running"}))
+    flock = watcher.fcntl.flock
+    def finish_at_lock(handle, operation):
+        flock(handle, operation)
+        state_path.write_text(json.dumps({"started": start, "status": status}))
+    monkeypatch.setattr(watcher.fcntl, "flock", finish_at_lock)
+    _, actual = watcher.observe(tmp_path, 1)
+    assert actual == expected

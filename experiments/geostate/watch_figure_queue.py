@@ -33,6 +33,19 @@ def queue_locked(root: Path) -> bool:
         return False
 
 
+def observe(root: Path, run_start: float) -> tuple[dict, str | None]:
+    # Read after obtaining the controller lock (if free), keeping it until the
+    # snapshot is classified. Otherwise a normal finish can look interrupted.
+    with (root / ".figure-queue.lock").open("a+") as handle:
+        locked = False
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            locked = True
+        state = json.loads((root / "figure-queue-state.json").read_text())
+        return state, terminal_status(state, run_start, locked)
+
+
 def notification(state: dict, status: str) -> str:
     titles = {
         "complete": "GeoState: очередь картиночных задач завершена.",
@@ -81,8 +94,7 @@ def watch(root: Path, run_start: float, registry: Path, project: str,
             return
         while True:
             try:
-                state = json.loads((root / "figure-queue-state.json").read_text())
-                status = terminal_status(state, run_start, queue_locked(root))
+                state, status = observe(root, run_start)
                 if status:
                     send_notification(registry, project, notification(state, status))
                     write_json(marker, {"run_start": run_start, "status": status,
