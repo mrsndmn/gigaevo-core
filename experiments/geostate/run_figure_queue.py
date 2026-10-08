@@ -20,11 +20,24 @@ from .consistency import COPY_DIR_RE, protocol_hash, recover_errors
 from .run_figure_short50 import execute, freeze
 
 
+def acquire_controller_lock(lock, timeout: float = 5) -> None:
+    """Allow a brief observer snapshot, but still reject duplicate controllers."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def run_queue(root: Path) -> int:
     root.mkdir(parents=True, exist_ok=True)
     state_path = root / "figure-queue-state.json"
     with (root / ".figure-queue.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquire_controller_lock(lock)
         state = {"pid": os.getpid(), "started": time.time(), "status": "running",
                  "cohorts": {name: {"status": "pending"} for name in FIGURE_QUEUE}}
         write_json(state_path, state)

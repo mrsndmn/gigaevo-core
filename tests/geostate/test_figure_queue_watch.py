@@ -73,3 +73,17 @@ def test_observe_reads_state_after_lock_acquisition(tmp_path, monkeypatch, statu
     monkeypatch.setattr(watcher.fcntl, "flock", finish_at_lock)
     _, actual = watcher.observe(tmp_path, 1)
     assert actual == expected
+
+
+def test_controller_retries_observer_lock_but_rejects_duplicate(tmp_path, monkeypatch):
+    import fcntl
+    from experiments.geostate import run_figure_queue as queue
+    with (tmp_path / ".figure-queue.lock").open("a+") as observer:
+        with (tmp_path / ".figure-queue.lock").open("a+") as controller:
+            fcntl.flock(observer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(BlockingIOError):
+                queue.acquire_controller_lock(controller, timeout=0)
+            monkeypatch.setattr(queue.time, "sleep", lambda _: fcntl.flock(observer, fcntl.LOCK_UN))
+            queue.acquire_controller_lock(controller)
+            with pytest.raises(BlockingIOError):
+                queue.acquire_controller_lock(observer, timeout=0)
